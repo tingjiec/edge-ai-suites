@@ -1,8 +1,11 @@
 # Copyright (C) 2026 Intel Corporation
 # SPDX-License-Identifier: Apache-2.0
+import tempfile
 import unittest
+from pathlib import Path
 
 from components.llm.context_validation.validate_long_context import (
+    _fixed_state_cache_bytes,
     _theoretical_kv_bytes_per_token,
 )
 
@@ -77,6 +80,34 @@ class TestTheoreticalKvBytesPerToken(unittest.TestCase):
         self.assertEqual(
             _theoretical_kv_bytes_per_token(config, kv_cache_dtype_bytes=1), expected
         )
+
+    def test_compressed_cache_includes_scale_and_zero_point_per_row(self):
+        config = {
+            "num_hidden_layers": 8,
+            "num_key_value_heads": 4,
+            "head_dim": 256,
+        }
+        expected = 2 * 8 * 4 * (256 + 4)
+        self.assertEqual(
+            _theoretical_kv_bytes_per_token(
+                config, kv_cache_dtype_bytes=1, quantization_param_bytes=4
+            ),
+            expected,
+        )
+
+
+class TestFixedStateCacheBytes(unittest.TestCase):
+    def test_reads_fixed_conv_and_ssm_states_from_ir(self):
+        xml = """<net><layers><layer><data
+            variable_id="cache_params.past.conv.0cache_params.present.conv.0"
+            variable_type="f32" variable_shape="?,8,4" /></layer><layer><data
+            variable_id="cache_params.past.ssm.0cache_params.present.ssm.0"
+            variable_type="f32" variable_shape="?,2,4,4" /></layer><layer><data
+            variable_id="cache_params.past.key.0cache_params.present.key.0"
+            variable_type="f32" variable_shape="?,4,?,256" /></layer></layers></net>"""
+        with tempfile.TemporaryDirectory() as model_dir:
+            Path(model_dir, "openvino_model.xml").write_text(xml, encoding="utf-8")
+            self.assertEqual(_fixed_state_cache_bytes(model_dir), (8 * 4 + 2 * 4 * 4) * 4)
 
 
 if __name__ == "__main__":

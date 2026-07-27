@@ -392,7 +392,7 @@ result_queue.put(done)
 
 | 事件 | 时机 | 父进程用途 |
 |---|---|---|
-| `loaded` | tokenizer 和 pipeline 加载完成 | 立即读取一次系统内存，近似得到权重驻留快照。加载失败时不会发送。 |
+| `loaded` | tokenizer 和 pipeline 构造完成 | 立即读取一次系统内存，作为后续峰值增量的基准。加载失败时不会发送。 |
 | `done` | 生成成功、输出无效或捕获异常后 | 获取试验结果并结束轮询。 |
 
 ```mermaid
@@ -435,7 +435,7 @@ sequenceDiagram
 
 因此 `_run_trial_subprocess()` 在 `join()` 之后、判定崩溃之前，会在 `drain_timeout`（默认 5 秒）内继续把队列里剩余的消息读完。若补捞到 `done`，该结果照常返回，`timeout` 标记也随之撤销。
 
-补捞阶段读到的 `loaded` 事件只用于置 `load_ok=True`，**不会**再触发 `_read_mem()` 快照：子进程此时已经不存在，那一刻测到的内存与权重驻留量无关，宁可让 `weight_ram_gb` / `weight_gpu_gb` 留空，也不写入一个编造出来的数字。
+补捞阶段读到的 `loaded` 事件只用于置 `load_ok=True`，**不会**再触发 `_read_mem()` 快照：子进程此时已经不存在，那一刻测到的内存与模型驻留量无关，宁可让 post-load peak 字段留空，也不写入一个编造出来的数字。
 
 #### 8.3.2 崩溃退出码的可读化
 
@@ -468,7 +468,7 @@ $$
 
 分母是系统总 RAM，不是离散显卡 VRAM。这是该组件面向 Intel iGPU 共享内存场景的特定口径。
 
-### 9.2 权重与 KV-cache 差分
+### 9.2 Pipeline 构造后峰值增量
 
 记：
 
@@ -479,42 +479,40 @@ $$
 则实现采用：
 
 $$
-M_{weight}=\max(0, M_L-M_0)
+M_{load}=\max(0, M_L-M_0)
 $$
 
 $$
-M_{kv}=\max(0, M_P-M_L)
+M_{postload}=\max(0, M_P-M_L)
 $$
 
-同时记录 $M_P$ 为系统高水位。RAM 和 GPU 分别进行同样计算，结果保留两位小数。
+`post_load_peak_ram_gb` / `post_load_peak_gpu_gb` 对应 $M_{postload}$。它包含 lazy
+weights、persistent cache 和 prefill workspace，不再误标为 KV。$M_P$ 是系统高水位。
 
 磁盘权重 `weight_disk_gb` 则递归累加模型目录下所有 `.bin` 文件大小，它是稳定参考值，不依赖试验是否成功加载。
 
-### 9.2.1 理论 KV 大小与倍数诊断（`expected_kv_gpu_gb` / `kv_overhead_ratio`）
+### 9.2.1 理论 KV 大小（`expected_kv_gpu_gb`）
 
-`M_kv` 是系统级实测增量，包含真实 KV-cache 之外的一切 loaded-后增长（见 §9.4）。为了不必每次靠人工翻 `config.json` 才能判断“这个数字是否合理”，`_theoretical_kv_bytes_per_token()`（`validate_long_context.py`）从模型自身导出的 `config.json` 计算一个架构层面的理论参考值：
+loaded 后的系统级峰值增量包含 lazy weights 和 prefill workspace，不能当成 KV-cache。
+`_theoretical_kv_bytes_per_token()` 从模型导出的 `config.json` 计算持久 KV 参考值：
 
 $$
-B_{token} = 2 \times L_{full} \times H_{kv} \times D_{head} \times b_{dtype}
+B_{token} = 2 \times L_{full} \times H_{kv} \times (D_{head} \times b_{dtype} + b_{quant})
 $$
 
-其中 $L_{full}$ 是真正需要随 token 数增长 KV-cache 的层数，$H_{kv}$、$D_{head}$ 来自模型配置的 `num_key_value_heads` / `head_dim`，$b_{dtype}$ 默认取 2（假设 fp16 KV-cache，因为工具本身无法读取运行时实际精度，这是一个声明的假设而非实测值）。
+其中 $b_{dtype}$ 来自 `KV_CACHE_PRECISION`；u8/i8 的 $b_{quant}=4$，对应每个
+token/head cache row 的 fp16 scale 与 fp16 zero-point。浮点 cache 的 $b_{quant}=0$。
 
-**混合线性注意力架构的处理**：`Qwen/Qwen3.5-9B` 与 `Qwen/Qwen3.6-35B-A3B` 的 `config.json`（`text_config.layer_types`）声明的不是均匀的 transformer，而是 3:1 交替的 `linear_attention` / `full_attention` 混合架构（类似 Qwen3-Next 的 Gated-DeltaNet 设计）：只有 `full_attention` 层需要随 token 数增长的传统 KV-cache，`linear_attention` 层理论上只维持一个不随长度增长的固定大小（O(1)）递归/SSM 状态。因此：
+混合线性注意力模型只有 `full_attention` 层需要随 token 增长的传统 KV-cache：
 
 - 若 `layer_types` 存在，$L_{full}$ 只统计其中标记为 `full_attention` 的层数；
 - 若 `layer_types` 不存在（普通稠密 transformer），$L_{full}$ 等于全部层数（与旧的隐含假设一致）；
-- 若配置缺少 `num_hidden_layers` / `num_key_value_heads` / `head_dim` 等必要字段（导出格式不认识的架构），函数返回 `None`，调用方据此跳过该诊断而不是抛异常。
+- `linear_attention` 的 `conv`/`ssm` 固定 state 由 `_fixed_state_cache_bytes()` 直接从
+    OpenVINO IR 的 variable shape 读取后加到总 expected；
+- 缺少必要字段时返回 `None`，跳过该诊断而不影响试验。
 
-VLM 导出（本工具所有默认候选模型都是）把上述字段嵌套在顶层 `config.json` 的 `text_config` 下而非顶层本身，因此实现读取 `config.get("text_config", config)`，同时兼容纯 LLM 导出（字段在顶层）。
-
-每次试验若 `kv_bytes_per_token` 可计算，则按 `prompt_tokens` 换算出 `expected_kv_gpu_gb`，并计算 `kv_overhead_ratio = kv_gpu_gb / expected_kv_gpu_gb`，一并写入 `trials.csv`、`summary.json` 与 `summary.md`；`summary.md` 在比值达到 `_KV_OVERHEAD_RATIO_NOTE_THRESHOLD`（默认 3x）时，会在 Notes 列直接标注为已知的上游缓存效率问题而不是笼统的容量说明。
-
-这个比值**只是诊断信息**，不会改变 `_passed()` / `_classify_failure()` 的判定——该工具的定位始终是”装不装得下”，不是”效率是否合理”，倍数异常本身不构成容量失败。经验参考：对 `Qwen/Qwen3.5-9B` 用本地已转换的 IR 计算，实测 `kv_gpu_gb` 相对理论值稳定在约 **12.9 倍**（8K 到 120K token 全程一致）。
-
-**一个已被证伪的解释，记录在此避免重蹈覆辙**：早期版本在这里引用过”OpenVINO 2026.2 发行说明中一个已知问题——Linear Attention 模型（如 Qwen3.5/Qwen3.6）配合 prefix caching 会消耗过量内存”来解释这个 12.9 倍。这个已知问题确实存在（可查 OpenVINO Model Server 关于 `cache_interval_multiplier` 参数的发行说明），但它的前提是**启用了 continuous batching 的 prefix caching**，而本工具的触发路径并不满足这个前提：`trial_runner.py::_load_pipeline()` 调用 `LLMPipeline`/`VLMPipeline` 时没有传入 `scheduler_config`、`ATTENTION_BACKEND=PA`，也没有请求 speculative decoding 或 prompt lookup；核对 OpenVINO GenAI 自身的后端选择逻辑（`utils.cpp::explicitly_requires_paged_attention()`）后确认，缺少这些属性时它必然回退到默认的**有状态单序列后端**，而不是 continuous batching/分页注意力/prefix caching 那条路径——导出的 IR 里 `cache_params.past.*` 用 `ReadValue`/`Assign` 的有状态变量表示（而不是 PagedAttention 专用算子）也印证了这一点。也就是说，被引用的那个已知问题的触发条件在这里根本不成立，不能作为这 12.9 倍的解释。
-
-站得住脚的原因是**统计口径不对齐**，不是某个具体的上游 bug：`expected_kv_gpu_gb` 只按会随 token 数增长的持久态缓存层（`full_attention`，8 层）计算；而 `kv_gpu_gb`（即 §9.4 的 $M_{kv}$）按设计统计 loaded 之后的**全部**显存增长，这自然包含 prefill 阶段全部 32 层（含 24 个 `linear_attention` 层）对每个 prompt token 的 Q/K/V 投影、MLP 激活等工作显存——这些层虽然不持久保留随 token 数增长的 KV-cache，但 prefill 时仍要对每个 token 完整计算一遍，其工作显存与「全部层数 × token 数」成正比，而不是「持久态层数 × token 数」。两个数字统计的对象不同，比值偏大是结构性的，不足以单凭这个比值把差距归因于某个具体的上游缺陷；真要进一步拆解，需要在 prefill 刚完成、decode 结束这两个时间点分别打点采样（本工具目前没有做这一级拆分）。
+VLM 配置从 `text_config` 读取，纯 LLM 从顶层读取。Qwen3.5-9B u8 本地 IR 的
+expected 为 128K 约 2.03 GiB、160K 约 2.53 GiB。该值只用于报告，不参与 PASS/FAIL。
 
 ### 9.3 为什么在父进程采样
 
@@ -538,7 +536,7 @@ VLM 导出（本工具所有默认候选模型都是）把上述字段嵌套在�
 
 子进程不再自行析构 pipeline（§7.5），回收改由操作系统在进程退出时完成；而 GPU 数值来自 Windows PDH 计数器，本身也是周期采样。两者叠加意味着 `join()` 返回的瞬间，上一次试验的内存**未必**已经从计数器上消失。
 
-下一次试验的 `baseline = _read_mem()` 恰好在本次 `_run_trial_subprocess()` 返回后立即执行，若基线被上一次的残留抬高，`weight_gpu_gb = M_L - M_0` 会被系统性低估。因此本次试验在返回前先等待：
+下一次试验的 `baseline = _read_mem()` 恰好在本次 `_run_trial_subprocess()` 返回后立即执行，若基线被上一次的残留抬高，后续内存增量会被系统性低估。因此本次试验在返回前先等待：
 
 $$
 M_{ram} \le M_{ram}^{(0)} + \varepsilon \quad\text{且}\quad M_{gpu} \le M_{gpu}^{(0)} + \varepsilon
@@ -707,7 +705,7 @@ $$
 - SLA 与 GPU 压力阈值；
 - `latency_limit_exceeded`；
 - `peak_gpu_pct`、`gpu_memory_at_limit` 与 `host_memory_at_limit`（§10.1.1）；
-- `expected_kv_gpu_gb` 与 `kv_overhead_ratio`（§9.2.1，模型 `config.json` 可解析时才有值，否则为 `None`）；
+- `expected_kv_gpu_gb`（§9.2.1，模型 `config.json` 可解析时才有值，否则为 `None`）；
 - CSV 中的模型、设备、权重格式、磁盘权重和最终状态。
 
 ### 12.2 `trials.csv`
@@ -828,7 +826,7 @@ OpenVINO、GPU 驱动和大内存分配的失败不一定能被 Python 安全恢
 
 ### 15.4 用阶段事件分解内存
 
-`loaded` 和 `done` 两个里程碑把内存曲线粗分为“模型权重驻留”和“prefill/decode 增量”，以低实现成本提供比单一峰值更有解释力的诊断。
+`loaded` 和 `done` 两个里程碑把内存曲线粗分为“pipeline 构造”和“后续推理峰值增量”，以低实现成本提供比单一峰值更有解释力的诊断。
 
 ### 15.5 将软 SLA 与压力证据组合
 

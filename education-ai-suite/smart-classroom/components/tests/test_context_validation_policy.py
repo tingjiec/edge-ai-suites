@@ -5,13 +5,17 @@ import unittest
 from components.llm.context_validation import validate_long_context
 from components.llm.context_validation.trial_runner import _classify_error
 from components.llm.context_validation.validate_long_context import (
+    _DEFAULT_CONFIG_PATH,
     TRIAL_CSV_FIELDS,
     _MemorySampler,
     _classify_failure,
     _format_trial_line,
     _host_memory_exhausted,
     _passed,
+    _coerce_scheduler_value,
+    _resolve_pipeline_config,
 )
+from utils.config_loader import load_config
 
 # Verbatim from the 64 GB shared-memory iGPU box at 160K and 144K tokens. OpenCL reports a
 # command that died on the device at the next synchronization point, so the text names the wait
@@ -36,8 +40,10 @@ def _successful_result(generate_time_s):
     }
 
 
-def _device_abort_result(min_available_ram_gb, peak_ram_pct, peak_gpu_pct=68.5):
-    """A generate-stage OpenCL device abort with the headroom the sampler measured."""
+def _device_abort_result(
+    min_available_ram_gb, peak_ram_pct, peak_gpu_pct=68.5, stage="prefill"
+):
+    """An OpenCL device abort with the phase and headroom the sampler measured."""
     result = {
         "load_ok": True,
         "generate_ok": False,
@@ -48,7 +54,7 @@ def _device_abort_result(min_available_ram_gb, peak_ram_pct, peak_gpu_pct=68.5):
         "peak_ram_pct": peak_ram_pct,
         "peak_gpu_pct": peak_gpu_pct,
         "gpu_memory_at_limit": False,
-        "error": f"generate:{_classify_error(RuntimeError(_OPENCL_DEVICE_ABORT))}:"
+        "error": f"{stage}:{_classify_error(RuntimeError(_OPENCL_DEVICE_ABORT))}:"
         f"{_OPENCL_DEVICE_ABORT}",
     }
     result["host_memory_at_limit"] = _host_memory_exhausted(result)
@@ -102,9 +108,10 @@ class TestGpuFailuresAreNamed(unittest.TestCase):
     def test_ordinary_exceptions_stay_ordinary(self):
         self.assertEqual(_classify_error(ValueError("bad chat template")), "exception")
 
-    def test_device_abort_with_no_headroom_left_is_oom(self):
-        # The observed 144,000-token row: 1.86 GB free of 64 GB, 97.1% used.
-        self.assertEqual(_classify_failure(_device_abort_result(1.86, 97.1)), "oom")
+    def test_prefill_device_abort_with_no_headroom_left_is_not_guessed_to_be_oom(self):
+        # Low headroom is useful evidence, but OpenCL -14 is not an allocation error. Keep both
+        # facts instead of rewriting the device/kernel failure into an OOM claim.
+        self.assertEqual(_classify_failure(_device_abort_result(1.86, 97.1)), "gpu_abort")
 
     def test_device_abort_with_headroom_left_is_not_claimed_to_be_oom(self):
         # The observed 160,000-token row: the GPU gave up while the host still had 9.3 GB, so
@@ -118,14 +125,23 @@ class TestGpuFailuresAreNamed(unittest.TestCase):
                     _classify_failure(_device_abort_result(free_ram, ram_pct)), "generate_error"
                 )
 
-    def test_native_abort_at_the_wall_is_oom_rather_than_an_exit_code(self):
+    def test_console_identifies_device_abort_during_prefill(self):
+        result = _device_abort_result(3.0, 95.0)
+        result["stage_reached"] = "prompt_built"
+
+        line = _format_trial_line("Qwen/Qwen3.5-9B", 144000, result)
+
+        self.assertIn("FAIL (gpu_abort)", line)
+        self.assertIn("failed in prefill (reached prompt_built)", line)
+
+    def test_native_abort_at_the_wall_is_not_guessed_to_be_oom(self):
         result = {
             "error": "crashed:exitcode=3221226505:0xC0000409 STATUS_STACK_BUFFER_OVERRUN",
             "min_available_ram_gb": 0.0,
             "peak_ram_pct": 100.0,
         }
 
-        self.assertEqual(_classify_failure(result), "oom")
+        self.assertEqual(_classify_failure(result), "crashed")
 
     def test_native_abort_with_headroom_left_is_still_a_crash(self):
         result = {
@@ -177,6 +193,55 @@ class TestHostHeadroomIsTheMemoryPressureSignal(unittest.TestCase):
 
     def test_host_pressure_is_reported_per_trial(self):
         self.assertIn("host_memory_at_limit", TRIAL_CSV_FIELDS)
+
+
+class TestPipelineConfig(unittest.TestCase):
+    def test_gpu_receives_common_and_gpu_properties(self):
+        config = {
+            "common": {"KV_CACHE_PRECISION": "u8"},
+            "GPU": {"GPU_ENABLE_LARGE_ALLOCATIONS": "YES"},
+            "CPU": {"INFERENCE_NUM_THREADS": 4},
+        }
+
+        self.assertEqual(
+            _resolve_pipeline_config(config, "GPU.0"),
+            {"KV_CACHE_PRECISION": "u8", "GPU_ENABLE_LARGE_ALLOCATIONS": "YES"},
+        )
+
+    def test_cli_override_can_change_and_remove_properties(self):
+        config = {
+            "common": {},
+            "GPU": {
+                "KV_CACHE_PRECISION": "u8",
+                "GPU_ENABLE_LARGE_ALLOCATIONS": "YES",
+            },
+        }
+
+        self.assertEqual(
+            _resolve_pipeline_config(
+                config,
+                "GPU",
+                {"KV_CACHE_PRECISION": "f16", "GPU_ENABLE_LARGE_ALLOCATIONS": ""},
+            ),
+            {"KV_CACHE_PRECISION": "f16"},
+        )
+
+    def test_scheduler_cli_values_are_typed(self):
+        self.assertEqual(_coerce_scheduler_value("4096"), 4096)
+        self.assertEqual(_coerce_scheduler_value("8.5"), 8.5)
+        self.assertIs(_coerce_scheduler_value("false"), False)
+
+    def test_gpu_defaults_enable_bounded_single_sequence_prefill(self):
+        config = load_config(_DEFAULT_CONFIG_PATH)
+        scheduler = _resolve_pipeline_config(
+            config.summarizer.long_context_validation.scheduler_config, "GPU"
+        )
+
+        self.assertEqual(scheduler["max_num_seqs"], 1)
+        self.assertEqual(scheduler["max_num_batched_tokens"], 4096)
+        self.assertEqual(scheduler["cache_size"], 4)
+        self.assertIs(scheduler["dynamic_split_fuse"], True)
+        self.assertIs(scheduler["enable_prefix_caching"], False)
 
 
 class TestNoMemoryGuard(unittest.TestCase):

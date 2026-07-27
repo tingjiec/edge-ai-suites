@@ -107,6 +107,12 @@ class TestRefinementKeepsTheCapacityAnswer(unittest.TestCase):
         def run_one(_model, _dir, _device, tokens, *_args, **_kwargs):
             outcome = outcomes[tokens]
             passed = outcome == "pass"
+            if passed:
+                error = None
+            elif outcome == "trial_error":
+                error = "trial_error:OSError:no memory"
+            else:
+                error = "prefill:oom:CL_MEM_OBJECT_ALLOCATION_FAILURE"
             return {
                 "tokens_requested": tokens,
                 "load_ok": True,
@@ -115,10 +121,7 @@ class TestRefinementKeepsTheCapacityAnswer(unittest.TestCase):
                 "generate_time_s": 100.0 if passed else None,
                 "min_available_ram_gb": 17.2 if passed else 1.86,
                 "peak_ram_pct": 72.9 if passed else 97.1,
-                "error": None if passed else (
-                    "trial_error:OSError:no memory" if outcome == "trial_error"
-                    else "generate:gpu_abort:CL_EXEC_STATUS_ERROR_FOR_EVENTS_IN_WAIT_LIST"
-                ),
+                "error": error,
             }
 
         with tempfile.TemporaryDirectory() as output_dir, contextlib.redirect_stdout(io.StringIO()):

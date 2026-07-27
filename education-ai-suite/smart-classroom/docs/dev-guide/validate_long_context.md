@@ -42,9 +42,8 @@ OOM, so "eventually returned one token" is not a meaningful capacity result.
 
 > **Scope — capacity, not answer quality.** This tool deliberately does **not** score whether the
 > model *understood* the long context (e.g. a needle-in-a-haystack recall test). Earlier revisions
-> tried that with grammar-constrained decoding, but on some models the constrained decoder
-> collapsed into garbage output (`!!!!`) and produced a *false* FAIL for a context the hardware
-> had actually handled fine. A capacity check is simple, robust, and answers the question that
+> rejected low-information output such as `!!!!`, but that produced a *false* FAIL for a context
+> the hardware had already prefilled and decoded. A capacity check is simple, robust, and answers the question that
 > actually blocks deployment ("does it fit on this box?"). Validate answer quality separately
 > against a couple of real long transcripts before shipping (§8).
 
@@ -70,10 +69,10 @@ tokenizer*, wraps it in the chat template (system prompt + transcript as the use
 2. **Prefills** the full prompt and **decodes** up to `probe_tokens` tokens (default 64) with
   plain greedy decoding. The transcript and final task are explicitly delimited so truncated
   synthetic input still gives the model a meaningful instruction.
-3. **Validates** that decoded output is non-empty natural-language content, rejecting output
-  made only of special tokens, control characters, punctuation, or one repeated character.
+3. **Confirms** that decode produced at least one token. Output quality is deliberately not
+  scored: punctuation, repetition, or an immediate EOS still proves the capacity path ran.
 4. **Passes** unless generation fails or both capacity-pressure signals occur together: the
-  complete `generate()` call exceeds `max_generate_time_sec` (default 600s) **and** the box was
+  complete `generate()` call exceeds `max_generate_time_sec` (default 900s) **and** the box was
   at a memory ceiling while it ran — either sampled GPU memory reaching
   `gpu_memory_pressure_pct` (default 90% of system RAM) or measured host headroom being gone
   (§3.2.3). OOM, crash, hard trial timeout, and invalid output remain unconditional failures.
@@ -90,59 +89,34 @@ many minutes per step for no extra capacity signal. See
 [`context_builder.py`](../../components/llm/context_validation/context_builder.py) and
 [`trial_runner.py`](../../components/llm/context_validation/trial_runner.py).
 
-### 3.1.1 Memory breakdown: weights vs. KV-cache
+### 3.1.1 Memory breakdown
 
-The core signal on hardware where the iGPU shares system RAM is *where the memory went*, so each
-trial reports it split three ways:
+Each trial reports three deliberately separate values:
 
-- **Weights** — the RAM/GPU footprint measured the instant the model finishes loading, before any
-  prefill. This is roughly constant across context sizes for a given model/weight-format, and is
-  cross-checked against the on-disk IR weight size (`weights on disk`, the summed `.bin` bytes).
-- **KV-cache** — the *additional* memory the peak reaches during prefill+decode, on top of the
-  loaded weights. This is what grows with context length and is what eventually exhausts the box.
-- **Peak** — the total high-water mark (weights + KV + everything else), i.e. how close the trial
-  came to the hardware limit.
+- **Weights on disk** — summed IR `.bin` bytes, a stable reference for the selected weight format.
+- **Post-load peak** — all RAM/GPU growth after pipeline construction, including lazily resident
+  weights, persistent cache, and temporary prefill workspace. It is useful for capacity planning
+  but is not labelled KV because OpenVINO can defer device allocation until first inference.
+- **Expected KV** — architecture-derived persistent cache size, excluding prefill workspace.
 
-The child subprocess signals two milestones over its result queue — `loaded` (weights resident)
-and `done` (trial finished) — and the orchestrator snapshots system memory at the `loaded`
-milestone and tracks the running peak throughout, so weights (post-load delta from a pre-spawn
-baseline) and KV-cache (peak minus post-load) fall straight out of those two snapshots. Sampling
+The child subprocess signals milestones over its result queue: `device` (plugin memory budget),
+`loaded` (weights resident), `prompt` (the requested context has been tokenized), `prefilled`
+(the first output token proves the full prompt completed its forward pass), and `done` (trial
+finished). The orchestrator snapshots system memory at the `loaded`
+milestone and tracks the running peak throughout. Sampling
 in the *parent* rather than the child is deliberate: system RAM/GPU counters are process-wide, so
 the parent sees the child's footprint just as well, and — crucially — its readings **survive even
 when the child is killed on a timeout**, which is exactly the case where memory matters most (the
 box was thrashing on a context it couldn't hold, not sitting idle). RAM comes from `psutil`; GPU
 is best-effort and Windows-only via the repo's perf-counter collector (reads `0.0` elsewhere).
 
-**Is a measured KV-cache number too big?** The measured `kv_ram_gb`/`kv_gpu_gb` is a system-level
-delta, not a pure KV-cache tensor size — it also picks up prefill scratch memory and any other
-post-load growth (see §9 caveats below). To make it possible to tell "this looks architecturally
-expected" apart from "this looks inflated" without manually reading the model's `config.json`
-every time, each trial also reports `expected_kv_gpu_gb` and `kv_overhead_ratio` when the model's
-own `config.json` (already present next to every `optimum-cli`-exported IR) has enough
-information: `2 × num_full_attention_layers × num_key_value_heads × head_dim × 2 bytes/token`
-(fp16 KV-cache assumed — the tool has no way to read back the runtime's actual KV precision, this
-is a stated assumption). Plain dense transformers count every layer. **Hybrid linear-attention
-models** — `Qwen/Qwen3.5-9B` and `Qwen/Qwen3.6-35B-A3B`'s exported `config.json` (`text_config.
-layer_types`) declare a repeating 3:1 `linear_attention`:`full_attention` pattern, i.e. only 1-in-4
-layers is a genuine growing-KV-cache attention layer; the rest are Mamba/GatedDeltaNet-style
-recurrent-state layers that should only need a small, constant-size state — so
-`_theoretical_kv_bytes_per_token()` counts only the `full_attention` layers (confirmed against the
-exported IR itself: only the `full_attention` layers' `cache_params.past.{key,value}.N` state
-variables have a sequence-length axis; the `linear_attention` layers' `cache_params.past.{conv,ssm}.N`
-variables are fixed-shape). A `kv_overhead_ratio` well above 1 for these two candidates is
-**expected by construction, not evidence of one specific upstream bug**: `expected_kv_gpu_gb` only
-counts the persistent, growing-KV-cache layers, while `kv_gpu_gb` is (per §3.1's definition above)
-*all* post-load memory growth — which for a hybrid model also includes prefill/decode working
-memory (Q/K/V projections, MLP activations) for the other 3-in-4 layers too, since every layer still
-runs on every prompt token during prefill even though only `full_attention` layers keep a cache
-afterwards. (An earlier version of this note instead blamed a specific known OpenVINO Model Server
-issue — continuous-batching prefix caching over-allocating memory for linear-attention models. That
-issue is real, but doesn't apply here: this tool's `_load_pipeline()` never sets `scheduler_config`
-or `ATTENTION_BACKEND=PA`, and OpenVINO GenAI only enables continuous batching/prefix caching when
-one of those is set — otherwise it uses the plain stateful single-sequence backend, which is what
-this tool exercises, so that issue's precondition isn't met and it isn't a valid explanation for the
-ratio observed here.) This is diagnostic only; it never changes PASS/FAIL (§3.1's policy is
-unchanged).
+`expected_kv_gpu_gb` uses the model's exported `config.json`: `2 × full-attention layers × KV
+heads × (head dimension × element bytes + quantization metadata) × prompt tokens`. For u8/i8,
+the metadata is one fp16 scale plus one fp16 zero-point per token/head row for both K and V.
+Hybrid models count only `full_attention` layers for token-growing cache, then add the fixed
+`conv`/`ssm` recurrent states read directly from the OpenVINO IR. For the local Qwen3.5-9B u8 IR,
+this gives about 2.03 GiB at 128K and 2.53 GiB at 160K. The expected value is diagnostic only and
+never changes PASS/FAIL.
 
 ### 3.2 One subprocess per trial
 
@@ -198,10 +172,11 @@ Two consequences worth knowing:
   `crashed:exitcode=0`.
 - The orchestrator **waits for memory to settle** (up to 30s) before returning, since reclamation
   is now the OS's job and the Windows PDH GPU counters lag it. Otherwise the previous trial's
-  memory would be charged to the next trial's `weight_gpu_gb`.
+  memory would be charged to the next trial's post-load delta.
 
 Reaching `crashed` now means the abort happened *before* the child could report — during load,
-prefill or decode — which is a genuine hardware ceiling. Known native-abort exit codes are decoded
+prefill or decode — which is a genuine failed capacity trial, but not automatically an OOM.
+Known native-abort exit codes are decoded
 in the error column (`crashed:exitcode=3221226505:0xC0000409 STATUS_STACK_BUFFER_OVERRUN - ...`).
 
 ### 3.2.1 No memory guard: every configured step is actually attempted
@@ -282,7 +257,7 @@ split by how much each message actually proves:
   apart — it sees neither the host's free-RAM low-water mark nor the GPU counters, both of which
   the parent samples. So the child reports the narrower fact and the orchestrator decides.
 
-**The orchestrator had no usable memory-pressure signal to decide with.** `gpu_memory_at_limit`
+**The orchestrator had no usable memory-pressure signal to report alongside it.** `gpu_memory_at_limit`
 divides peak GPU usage by *total system RAM* and fires at 90%. On a shared-memory iGPU the host
 needs the rest of the machine, so that ratio has no route to 90%: every failing trial observed
 sat between 63% and 69%. The flag never fired, `too_slow` was unreachable, and a device abort had
@@ -292,13 +267,16 @@ directly, so a new `host_memory_at_limit` column (and `_host_memory_exhausted()`
 figure catches a large box where a comfortable-looking percentage still hides a wall, the
 percentage catches a small box where 3 GB free is plenty of room.
 
-With both in place, `gpu_abort` (and a `crashed` native abort) is promoted to **`oom`** when, and
-only when, the trial's own measurements show the memory was gone. The two rows above now read:
+The failure classifier deliberately does **not** promote `gpu_abort` or `crashed` to `oom` from
+these correlated measurements. OpenCL -14 says only that an accepted command failed; allocation
+pressure, a kernel fault, a driver reset, and TDR can all produce it. Explicit allocation errors
+remain `oom`, while the stage and pressure columns report the independent evidence. The two rows
+above now read:
 
 | Context | Peak GPU | Min free RAM | Peak RAM | Reported as |
 |---:|---:|---:|---:|---|
-| 160,000 | 43.6 GB (68.5%) | 9.3 GB | 85.3% | `gpu_abort` — the GPU gave up while the host still had room |
-| 144,000 | 40.1 GB (63.2%) | 1.9 GB | 97.1% | `oom` — the box had nothing left |
+| 160,000 | 43.6 GB (68.5%) | 9.3 GB | 85.3% | `gpu_abort` in prefill — host still had room |
+| 144,000 | 40.1 GB (63.2%) | 1.9 GB | 97.1% | `gpu_abort` in prefill, with host memory pressure |
 
 Note that this is still a *post-hoc* read of what a trial measured. It never cancels a trial and
 never predicts one; §3.2.1's rule is unchanged. It only names the failure a trial produced.
@@ -439,10 +417,25 @@ summarizer:
     target_context_tokens: 160000
     context_steps_tokens: [8000, 16000, 32000, 48000, 64000, 96000, 128000, 144000, 160000, 176000, 192000, 224000, 256000]
     probe_tokens: 64
-    max_generate_time_sec: 600
+    max_generate_time_sec: 900
     gpu_memory_pressure_pct: 90
     trial_timeout_sec: 1200
     output_dir: monitoring/executionlogs/long_context_validation
+    pipeline_config:
+      common: {}
+      GPU:
+        GPU_ENABLE_LARGE_ALLOCATIONS: "YES"
+        KV_CACHE_PRECISION: "u8"
+      CPU:
+        KV_CACHE_PRECISION: "u8"
+    scheduler_config:
+      common: {}
+      GPU:
+        max_num_seqs: 1
+        max_num_batched_tokens: 4096
+        cache_size: 4
+        dynamic_split_fuse: true
+        enable_prefix_caching: false
 ```
 
 | Key | Meaning |
@@ -453,10 +446,12 @@ summarizer:
 | `target_context_tokens` | The customer requirement to check the ceiling against (160K). |
 | `context_steps_tokens` | Ascending token sizes to probe. |
 | `probe_tokens` | Tokens to decode per trial. Small on purpose — a capacity check only needs a few decode steps (default 64). |
-| `max_generate_time_sec` | Soft time limit for the full prefill + probe `generate()` call (default 600s). It produces `too_slow` only together with memory pressure. |
+| `max_generate_time_sec` | Soft time limit for the full prefill + probe `generate()` call (default 900s). It produces `too_slow` only together with memory pressure. |
 | `gpu_memory_pressure_pct` | Practical shared-iGPU memory pressure line, measured as peak GPU usage divided by total system RAM (default 90%). It is combined with the soft time limit rather than treated as an independent failure. On a shared-memory iGPU this ratio is hard to reach — the measured host headroom is the second, and in practice the effective, pressure signal (§3.2.3). |
 | `trial_timeout_sec` | Hard per-trial wall-clock budget before the subprocess is killed. Keep this above `max_generate_time_sec` so slow trials can return diagnostics. There is deliberately no memory-headroom setting alongside it — see §3.2.1. |
 | `output_dir` | Where `trials.csv` / `summary.json` / `summary.md` are written (relative to `smart-classroom/`). |
+| `pipeline_config` | OpenVINO properties merged from `common` and the active device-family block. The default GPU block enables large allocations and uses `KV_CACHE_PRECISION: "u8"` to reduce the persistent KV-cache footprint. The resolved values are printed and recorded with every run. |
+| `scheduler_config` | OpenVINO GenAI scheduler settings. The GPU default uses one sequence, a bounded 4096-token chunked prefill, a 4 GiB cache budget, and no prefix caching. This covers the 2.53 GiB expected cache at 160K without allocating prefill workspace for the full prompt at once. |
 
 ## 5. Prerequisites & setup
 
@@ -527,6 +522,13 @@ Any extra arguments are forwarded to `validate_long_context.py` as-is:
 # Adjust either half of the combined time + GPU-memory pressure policy
 .\components\llm\context_validation\run_validate_long_context.ps1 --max-generate-time-sec 900 --gpu-memory-pressure-pct 92
 
+# Compare compressed and uncompressed KV cache without editing config.yaml
+.\components\llm\context_validation\run_validate_long_context.ps1 --kv-cache-precision u8
+.\components\llm\context_validation\run_validate_long_context.ps1 --kv-cache-precision f16
+
+# Override or remove any pipeline property for one run
+.\components\llm\context_validation\run_validate_long_context.ps1 --pipeline-config KV_CACHE_PRECISION=u8 GPU_ENABLE_LARGE_ALLOCATIONS=
+
 # Point at a different config file entirely (e.g. a scratch copy for one-off experiments)
 .\components\llm\context_validation\run_validate_long_context.ps1 --config C:\path\to\other.yaml
 ```
@@ -543,7 +545,7 @@ KV-cache (§3.1.1):
 
 ```
 === Qwen/Qwen3-8B ===  weights on disk: 8.5 GB (int8)
-[Qwen/Qwen3-8B]     8,000 tok -> PASS  |  load 12.3s, gen 3.1s (64 tok, 20.65 tok/s)  |  peak RAM 12.4 GB (weights +8.6, kv +1.8)  |  peak GPU 10.1 GB (weights +8.5, kv +1.6)  |  min free RAM 50.8 GB (commit 58.2 GB)
+[Qwen/Qwen3-8B]     8,000 tok -> PASS  |  load 12.3s, gen 3.1s (64 tok, 20.65 tok/s)  |  peak RAM 12.4 GB (post-load peak +1.8)  |  peak GPU 10.1 GB (post-load peak +1.6, expected KV 1.2)  |  min free RAM 50.8 GB (commit 58.2 GB)
 ...
 [Qwen/Qwen3-8B]   160,000 tok -> PASS  |  load 12.1s, gen 9.4s (64 tok, 6.81 tok/s)  |  peak RAM 58.1 GB (weights +8.6, kv +47.5)  |  peak GPU 21.4 GB (weights +8.5, kv +12.9)  |  min free RAM 5.2 GB (commit 9.7 GB)
 [Qwen/Qwen3-8B]   176,000 tok -> FAIL (timeout)  |  load 12.4s  |  peak RAM 63.9 GB (weights +8.6, kv +53.3)  |  peak GPU 22.1 GB  |  min free RAM 0.3 GB (commit 1.1 GB)  |  error=timeout
@@ -562,38 +564,36 @@ Three files land in `output_dir`:
 
 - **`trials.csv`** — one row per trial, written immediately after each trial completes (so a
   crash mid-sweep doesn't lose earlier results): model, tokens requested, device, weight_format,
-  load/generate success, prompt/generated tokens, load & generate time, effective
+  resolved pipeline config and KV-cache precision, load/generate success, the last completed
+  stage, prompt/generated tokens, load & generate time (including time-to-first-token/prefill
+  and decode time), effective
   `tokens_per_second`, the configured `max_generate_time_sec`, and the memory breakdown
-  (`weight_disk_gb`, `weight_ram_gb`/`weight_gpu_gb`, `kv_ram_gb`/`kv_gpu_gb`,
-  `expected_kv_gpu_gb`/`kv_overhead_ratio` (§3.1.1, `None` when the model's `config.json` doesn't
+  (`weight_disk_gb`, `post_load_peak_ram_gb`/`post_load_peak_gpu_gb`,
+  `expected_kv_gpu_gb` (§3.1.1, `None` when the model's `config.json` doesn't
   expose enough architecture info), `peak_ram_gb`/`peak_ram_pct`/`peak_gpu_gb`, and the headroom
   low-water marks `min_available_ram_gb`/`min_commit_available_gb` (§3.2.1)), the two
   memory-pressure decision flags `gpu_memory_at_limit`/`host_memory_at_limit` (§3.2.3), a
   `status` (`PASS` or the failure reason), and the raw `error` string.
 - **`summary.json`** — machine-readable rollup per model: `max_stable_context`,
   `meets_target` (bool, compared against `target_context_tokens`), the memory breakdown at that
-  max stable size (`weight_disk_gb`, `weight_ram_gb`/`weight_gpu_gb`, `kv_ram_gb`/`kv_gpu_gb`,
-  `expected_kv_gpu_gb`/`kv_overhead_ratio`, `peak_ram_gb`/`peak_gpu_gb`,
+  max stable size (`weight_disk_gb`, `post_load_peak_ram_gb`/`post_load_peak_gpu_gb`,
+  `expected_kv_gpu_gb`, `peak_ram_gb`/`peak_gpu_gb`,
   `min_available_ram_gb`/`min_commit_available_gb`), `failure_reason` and the
   `failure_tokens` it was measured at, a top-level `completed` flag (§3.2.4), and the
   hardware fingerprint the sweep ran on (from `utils/platform_info.py`).
 - **`summary.md`** — the same rollup as a table (memory measured at the max stable context;
-  weights = footprint just after load, KV = extra memory prefill+decode added on top, Min free
-  RAM = headroom low-water mark (§3.2.1), Expected KV/KV Ratio = architecture-derived reference
-  and measured/expected ratio, §3.1.1), e.g.:
+  post-load = all growth after pipeline construction, Min free RAM = headroom low-water mark,
+  Expected KV = architecture-derived persistent cache reference, §3.1.1).
 
-  | Model | Device | Weight | Max stable context | Meets target | Weights (disk) | Peak RAM | KV RAM | Min free RAM | Peak GPU | KV GPU | Expected KV | KV Ratio | Notes |
-  |---|---|---|---|---|---|---|---|---|---|---|---|---|---|
-  | Qwen/Qwen3-8B | GPU | int4 | 160,000 | PASS | 4.6 GB | 58.1 GB | 47.5 GB | 5.2 GB | 21.4 GB | 12.9 GB | 11.0 GB | 1.2x | reached top configured step without failing |
-  | Qwen/Qwen3.6-35B-A3B | GPU | int4 | 64,000 | FAIL | 18.2 GB | 63.6 GB | 20.1 GB | 0.4 GB | 58.4 GB | 21.4 GB | 1.7 GB | 12.6x | kv 12.6x theoretical -- known OpenVINO linear-attention cache issue (see release notes), not a capacity problem with this box |
-
-  A `KV Ratio` at or above `_KV_OVERHEAD_RATIO_NOTE_THRESHOLD` (default 3x) replaces the generic
-  `failure_reason` note with a call-out that the gap looks like a known cache-efficiency issue
-  rather than a plain capacity limit — see §3.1.1.
+  | Model | Device | Weight | Max stable context | Meets target | Weights (disk) | Peak RAM | Post-load RAM | Min free RAM | Peak GPU | Post-load GPU | Expected KV | Notes |
+  |---|---|---|---|---|---|---|---|---|---|---|---|---|
+  | Qwen/Qwen3.5-9B | GPU | int8 | 160,000 | PASS | 8.8 GB | 29.5 GB | 13.6 GB | 34.1 GB | 17.6 GB | 8.4 GB | 2.5 GB | reached top configured step without failing |
 
 `failure_reason` values: `oom`, `gpu_abort`, `timeout`, `crashed`, `load_error`,
 `generate_error`, `no_output`, `too_slow`, `trial_error`. `gpu_abort` means the GPU killed a
-command it had accepted and the box still had headroom, so it was not called `oom` (§3.2.3);
+command it had accepted; it remains distinct from `oom` even under sampled memory pressure
+because OpenCL -14 does not identify the cause (§3.2.3). The stage says whether the last
+completed milestone places that failure in load, prompt construction, prefill, or decode;
 `trial_error` means the orchestrator could not carry the step out at all (§3.2.4).
 A model whose max stable context still meets the target can show a failure reason
 too — it just means the sweep found the *next* configured step above the target failed for that
@@ -637,16 +637,10 @@ weight format, device, driver, system memory, time budget, and pressure threshol
   about 20K tokens of context. Only re-run at a lower precision if you would actually ship that
   precision; otherwise keep `weight_format` pinned to the deployed value and report the ceiling
   it really has.
-- **`Qwen/Qwen3.5-9B` and `Qwen/Qwen3.6-35B-A3B` are hybrid linear-attention models, and a large
-  `kv_overhead_ratio` for them is currently expected, not a sign this box is under-provisioned.**
-  Their exported `config.json` declares only 1-in-4 layers as `full_attention` (the rest are
-  Mamba/GatedDeltaNet-style `linear_attention` layers, which should hold an O(1) state rather than
-  one that grows with context length). The ratio being large is a scope mismatch, not a single
-  identifiable upstream bug: `kv_gpu_gb` measures *all* post-load memory growth, which for a hybrid
-  model includes prefill/decode working memory across all layers (not just the ones that keep a
-  growing cache). See §3.1.1 for the full theoretical-vs-measured comparison, including why an
-  earlier version of this doc's more specific "known OpenVINO prefix-caching bug" explanation
-  doesn't actually apply to how this tool invokes the pipeline.
+- **Hybrid linear-attention models have both growing and fixed cache state.** The expected KV
+  calculation counts token-growing K/V only for `full_attention` layers and reads fixed recurrent
+  state shapes from the IR. Do not compare post-load peak growth directly to Expected KV: the
+  former also includes lazy weights and temporary prefill workspace.
 - **Large candidates cost real disk/RAM even to attempt.** `Qwen/Qwen3.6-35B-A3B`-class models
   need substantial disk space for the IR and host RAM just to load, independent of how far the
   context sweep gets.

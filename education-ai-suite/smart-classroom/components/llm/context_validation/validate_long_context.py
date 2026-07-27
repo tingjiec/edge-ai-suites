@@ -8,9 +8,9 @@ What it measures is deliberately narrow (mirroring refer/long_context): whether
 *this machine* can load the model and prefill + decode a prompt of a given token
 size without running out of GPU/host memory (or hanging). It does NOT judge
 answer quality -- content is irrelevant to a capacity check, only whether the
-box survives the token volume. Each trial reports where its memory went: the
-weight footprint (measured just after load) versus the KV-cache footprint (the
-extra memory prefill+decode adds on top). See
+box survives the token volume. Each trial reports total peak memory, growth
+after pipeline construction, and an architecture-derived persistent KV-cache
+estimate. See
 docs/dev-guide/validate_long_context.md.
 
 This is a standalone diagnostic tool: it reads its own bundled config.yaml
@@ -49,8 +49,10 @@ import sys
 import threading
 import time
 import traceback
+import xml.etree.ElementTree as ET
 from datetime import datetime
 from queue import Empty
+from types import SimpleNamespace
 
 from components.llm.context_validation import trial_runner
 from utils.config_loader import load_config
@@ -104,41 +106,52 @@ _MEMORY_SETTLE_TOLERANCE_GB = 1.0
 _MEMORY_EXHAUSTED_FREE_RAM_GB = 3.0
 _MEMORY_EXHAUSTED_RAM_PCT = 95.0
 
-# Measured kv_gpu_gb / expected_kv_gpu_gb at or above this is called out in the summary notes as a
-# scope mismatch between the two numbers (persistent-cache-only estimate vs. all post-load growth)
-# rather than a plain capacity limit -- see _theoretical_kv_bytes_per_token()'s docstring and the
-# note built in _write_summary() for what this can and cannot be blamed on.
-_KV_OVERHEAD_RATIO_NOTE_THRESHOLD = 3.0
+# Bytes per KV-cache element for each precision the pipeline can be configured with, used to keep
+# `expected_kv_gpu_gb` honest when the sweep runs with a compressed cache: comparing a u8 run
+# against an fp16 estimate would report a phantom 2x saving. int8/int4 caches also store a scale
+# and zero-point per token per head, which this does not model -- the estimate is a floor.
+# "dynamic" (the GPU plugin's default) means "the plugin decides", which in practice is fp16, so
+# anything unrecognized falls back to _DEFAULT_KV_BYTES rather than to no estimate at all.
+_KV_PRECISION_BYTES = {"f32": 4, "f16": 2, "bf16": 2, "u8": 1, "i8": 1, "f8e4m3": 1, "f8e5m2": 1}
+_DEFAULT_KV_BYTES = 2
+_COMPRESSED_KV_PRECISIONS = {"u8", "i8", "u4", "i4"}
+_KV_QUANT_PARAMS_BYTES = 4
+_IR_TYPE_BYTES = {"f32": 4, "fp32": 4, "f16": 2, "fp16": 2, "bf16": 2, "i8": 1, "u8": 1}
 
 TRIAL_CSV_FIELDS = [
     "model",
     "tokens_requested",
     "device",
     "weight_format",
+    "kv_cache_precision",
+    "pipeline_config",
+    "scheduler_config",
     "load_ok",
     "load_time_s",
+    "stage_reached",
     "generate_ok",
     "prompt_tokens",
     "generated_tokens",
     "generate_time_s",
+    "time_to_first_token_s",
+    "decode_time_s",
     "tokens_per_second",
     "max_generate_time_sec",
     "latency_limit_exceeded",
     "gpu_memory_pressure_pct",
     "peak_gpu_pct",
+    "gpu_budget_gb",
+    "peak_gpu_pct_of_budget",
     "gpu_memory_at_limit",
     "host_memory_at_limit",
     "weight_disk_gb",
-    "weight_ram_gb",
-    "kv_ram_gb",
+    "post_load_peak_ram_gb",
     "peak_ram_gb",
     "peak_ram_pct",
     "min_available_ram_gb",
     "min_commit_available_gb",
-    "weight_gpu_gb",
-    "kv_gpu_gb",
+    "post_load_peak_gpu_gb",
     "expected_kv_gpu_gb",
-    "kv_overhead_ratio",
     "peak_gpu_gb",
     "status",
     "error",
@@ -324,7 +337,11 @@ def _load_model_config(model_dir: str) -> dict | None:
         return None
 
 
-def _theoretical_kv_bytes_per_token(config: dict, kv_cache_dtype_bytes: int = 2) -> float | None:
+def _theoretical_kv_bytes_per_token(
+    config: dict,
+    kv_cache_dtype_bytes: int = 2,
+    quantization_param_bytes: int = 0,
+) -> float | None:
     """Expected KV-cache growth per token from the model's own declared
     architecture, treating hybrid linear-attention layers correctly.
 
@@ -344,34 +361,17 @@ def _theoretical_kv_bytes_per_token(config: dict, kv_cache_dtype_bytes: int = 2)
     `cache_params.past.{conv,ssm}.N` variables have a fixed shape regardless
     of context length.
 
-    This function returns a *persistent-cache-only* estimate, which is
-    deliberately narrower than what trial_runner's kv_gpu_gb/kv_ram_gb
-    measure (see the `kv_overhead_ratio` note in `_write_summary()`): those
-    also include prefill/decode working memory (Q/K/V projections, MLP
-    activations, ...) for *every* layer, including the linear-attention ones
-    -- a hybrid model still runs all its layers on every prompt token during
-    prefill even though only the full_attention layers keep a cache
-    afterwards. A large kv_overhead_ratio for a hybrid model is therefore
-    expected from this scope mismatch alone; it is not, by itself, evidence
-    of a specific OpenVINO defect (an earlier version of this comment cited
-    a known OpenVINO Model Server issue where continuous-batching prefix
-    caching over-allocates memory for linear-attention models -- that issue
-    is real, but its precondition isn't met here: trial_runner's
-    `_load_pipeline()` never sets `scheduler_config`/`ATTENTION_BACKEND=PA`,
-    so OpenVINO GenAI's own backend-selection logic keeps this tool on the
-    plain stateful single-sequence backend, not continuous batching, so that
-    specific issue cannot be what's being observed in this tool's trials).
-    If `layer_types` is absent, every layer is assumed to be a standard
-    growing-KV-cache attention layer (ordinary dense transformer).
+    This is persistent cache only; it intentionally excludes temporary prefill
+    activations. If `layer_types` is absent, every layer is assumed to be a
+    standard growing-KV-cache attention layer.
 
     Returns None if the config doesn't expose enough info to compute this
     (num_hidden_layers / num_key_value_heads / head_dim), so callers can
     degrade gracefully for architectures/exports this doesn't understand yet.
 
-    kv_cache_dtype_bytes defaults to 2 (fp16), OpenVINO GenAI's default KV
-    cache precision when not otherwise configured -- this is a stated
-    assumption, not something measured, since the tool has no way to read
-    back the runtime's actual KV precision.
+    kv_cache_dtype_bytes defaults to 2 (fp16). Compressed GPU caches also
+    store a scale and zero-point per token/head row; callers pass their total
+    byte size as quantization_param_bytes.
     """
     text_cfg = config.get("text_config", config)
     num_layers = text_cfg.get("num_hidden_layers")
@@ -385,7 +385,44 @@ def _theoretical_kv_bytes_per_token(config: dict, kv_cache_dtype_bytes: int = 2)
     )
     if not growing_layers:
         return None
-    return 2 * growing_layers * num_kv_heads * head_dim * kv_cache_dtype_bytes
+    bytes_per_row = head_dim * kv_cache_dtype_bytes + quantization_param_bytes
+    return 2 * growing_layers * num_kv_heads * bytes_per_row
+
+
+def _fixed_state_cache_bytes(model_dir: str) -> int:
+    """Read fixed linear-attention cache state sizes from an exported IR."""
+    model_xml = next(
+        (
+            os.path.join(model_dir, name)
+            for name in ("openvino_language_model.xml", "openvino_model.xml")
+            if os.path.isfile(os.path.join(model_dir, name))
+        ),
+        None,
+    )
+    if model_xml is None:
+        return 0
+
+    total = 0
+    seen = set()
+    try:
+        for _event, elem in ET.iterparse(model_xml, events=("start",)):
+            variable_id = elem.attrib.get("variable_id", "")
+            if not re.search(r"cache_params\.past\.(?:conv|ssm)\.", variable_id):
+                continue
+            if variable_id in seen:
+                continue
+            seen.add(variable_id)
+            item_bytes = _IR_TYPE_BYTES.get(elem.attrib.get("variable_type", "").lower())
+            shape = elem.attrib.get("variable_shape", "")
+            if not item_bytes or not shape:
+                continue
+            elements = 1
+            for value in shape.split(","):
+                elements *= 1 if value == "?" else int(value)
+            total += elements * item_bytes
+    except (ET.ParseError, OSError, ValueError):
+        return 0
+    return total
 
 
 @contextlib.contextmanager
@@ -446,6 +483,26 @@ def _parse_args():
         help="Override the GPU-used/system-RAM percentage treated as the practical iGPU limit",
     )
     parser.add_argument(
+        "--pipeline-config",
+        nargs="+",
+        metavar="KEY=VALUE",
+        help="Add to or override the resolved OpenVINO plugin properties for this run "
+        "(e.g. KV_CACHE_PRECISION=f16 CACHE_DIR=models/.ov_cache). KEY= with an empty value "
+        "removes a property the config file sets.",
+    )
+    parser.add_argument(
+        "--kv-cache-precision",
+        help="Shortcut for --pipeline-config KV_CACHE_PRECISION=... (u8 halves the memory the "
+        "KV cache needs; f16 measures the uncompressed baseline; dynamic leaves it to the plugin)",
+    )
+    parser.add_argument(
+        "--scheduler-config",
+        nargs="+",
+        metavar="KEY=VALUE",
+        help="Add to or override OpenVINO GenAI SchedulerConfig values for this run. "
+        "KEY= with an empty value removes a configured property.",
+    )
+    parser.add_argument(
         "--no-refine",
         action="store_true",
         help="Skip the bisection between the last pass and the first failure. Refinement is on by "
@@ -460,6 +517,105 @@ def _parse_args():
     return parser.parse_args()
 
 
+def _device_family(device: str) -> str:
+    """"GPU.1" -> "GPU". Plugin properties are a property of the device family, not of which
+    card in it OpenVINO happens to be pointed at."""
+    return str(device or "").split(".")[0].strip().upper()
+
+
+def _namespace_to_dict(value):
+    """Undo utils.config_loader's dict -> SimpleNamespace conversion.
+
+    The loader turns every nested mapping in the YAML into a namespace, which is convenient
+    for the fixed schema (`settings.summarizer.device`) and wrong for this one: `pipeline_config`
+    is an open-ended property bag whose keys are OpenVINO's, not ours, and it has to reach the
+    pipeline constructor as a plain dict.
+    """
+    if isinstance(value, SimpleNamespace):
+        return {key: _namespace_to_dict(val) for key, val in vars(value).items()}
+    if isinstance(value, dict):
+        return {key: _namespace_to_dict(val) for key, val in value.items()}
+    return value
+
+
+def _parse_pipeline_config_overrides(overrides) -> dict:
+    """`["KV_CACHE_PRECISION=f16", "GPU_ENABLE_LARGE_ALLOCATIONS="]` -> a merge map.
+
+    An empty value means "drop this key", so a single command line can both try a different
+    precision and take a configured property back out -- without which the only way to measure
+    the box without one of the config file's defaults would be to edit the config file, which
+    is exactly the sort of uncommitted local change that makes a sweep unreproducible.
+    """
+    parsed = {}
+    for item in overrides or []:
+        key, sep, value = str(item).partition("=")
+        if not sep or not key.strip():
+            raise SystemExit(
+                f"--pipeline-config expects KEY=VALUE (or KEY= to remove a key), got: {item!r}"
+            )
+        parsed[key.strip()] = value.strip()
+    return parsed
+
+
+def _coerce_scheduler_value(value: str):
+    lowered = value.lower()
+    if lowered in ("true", "false"):
+        return lowered == "true"
+    try:
+        return int(value)
+    except ValueError:
+        try:
+            return float(value)
+        except ValueError:
+            return value
+
+
+def _resolve_pipeline_config(raw, device: str, overrides=None) -> dict:
+    """Merge the `common` block, the block for `device`'s family, and any CLI overrides.
+
+    Device-keyed so that a CPU run is not handed GPU-only properties (the plugin would refuse
+    to build the pipeline at all), and so the GPU defaults can carry memory settings that only
+    make sense on a shared-memory device without turning into a footgun on `--device CPU`.
+    """
+    blocks = _namespace_to_dict(raw) or {}
+    if not isinstance(blocks, dict):
+        raise SystemExit("summarizer.long_context_validation.pipeline_config must be a mapping")
+    by_key = {str(key).strip().upper(): (value or {}) for key, value in blocks.items()}
+    resolved = {}
+    for section in ("COMMON", _device_family(device)):
+        block = by_key.get(section) or {}
+        if not isinstance(block, dict):
+            raise SystemExit(f"pipeline_config.{section} must be a mapping of property -> value")
+        resolved.update(block)
+    for key, value in (overrides or {}).items():
+        if value == "":
+            resolved.pop(key, None)
+        else:
+            resolved[key] = value
+    return resolved
+
+
+def _format_pipeline_config(pipeline_config: dict) -> str:
+    """One-line rendering for the console header, the CSV column and the summary."""
+    if not pipeline_config:
+        return "(plugin defaults)"
+    return " ".join(f"{key}={value}" for key, value in sorted(pipeline_config.items()))
+
+
+def _kv_cache_dtype_bytes(pipeline_config: dict) -> int:
+    """Bytes per KV element implied by the configured KV_CACHE_PRECISION.
+
+    Feeds `expected_kv_gpu_gb`; compressed-cache metadata is added separately.
+    """
+    precision = str((pipeline_config or {}).get("KV_CACHE_PRECISION", "")).strip().lower()
+    return _KV_PRECISION_BYTES.get(precision, _DEFAULT_KV_BYTES)
+
+
+def _kv_cache_quantization_param_bytes(pipeline_config: dict) -> int:
+    precision = str((pipeline_config or {}).get("KV_CACHE_PRECISION", "")).strip().lower()
+    return _KV_QUANT_PARAMS_BYTES if precision in _COMPRESSED_KV_PRECISIONS else 0
+
+
 def _load_settings(args) -> dict:
     cfg = load_config(args.config)
     summarizer = getattr(cfg, "summarizer", None)
@@ -469,11 +625,27 @@ def _load_settings(args) -> dict:
             f"summarizer.long_context_validation is missing from {args.config}. "
             "See docs/dev-guide/validate_long_context.md for the expected schema."
         )
+    device = args.device or summarizer.device
+    overrides = _parse_pipeline_config_overrides(args.pipeline_config)
+    if args.kv_cache_precision is not None:
+        overrides["KV_CACHE_PRECISION"] = args.kv_cache_precision.strip()
+    pipeline_config = _resolve_pipeline_config(
+        getattr(lcv, "pipeline_config", None), device, overrides
+    )
+    scheduler_overrides = {
+        key: (_coerce_scheduler_value(value) if value != "" else "")
+        for key, value in _parse_pipeline_config_overrides(args.scheduler_config).items()
+    }
+    scheduler_config = _resolve_pipeline_config(
+        getattr(lcv, "scheduler_config", None), device, scheduler_overrides
+    )
     return {
         "provider": summarizer.provider,
         "models_base_path": summarizer.models_base_path,
-        "device": args.device or summarizer.device,
+        "device": device,
         "weight_format": args.weight_format or summarizer.weight_format,
+        "pipeline_config": pipeline_config,
+        "scheduler_config": scheduler_config,
         "candidate_models": args.models or lcv.candidate_models,
         "target_context_tokens": (
             args.target_tokens if args.target_tokens is not None else lcv.target_context_tokens
@@ -595,14 +767,13 @@ def _error_classification(error: str) -> str:
 
 
 def _classify_failure(result: dict) -> str:
-    """Name the failure, using the memory the parent measured to resolve what the child couldn't.
+    """Name the failure without turning correlated memory pressure into an OOM claim.
 
-    A GPU device abort (`gpu_abort`, e.g. OpenCL -14) is the ambiguous case: the child only knows
-    the device killed the command, so this promotes it to `oom` when -- and only when -- the
-    trial's own measurements show the memory was gone. Same for a native abort that killed the
-    child outright (`crashed`). Without that promotion, the single most important row the sweep
-    produces -- the step that establishes the ceiling -- was labelled `generate_error`, which
-    reads as "the tool hit an unexplained error" rather than "this box ran out of memory here".
+    OpenCL -14 only says that a queued command failed. It can be caused by allocation pressure,
+    a kernel failure, a driver reset, or TDR, so even a low host-memory reading is not enough to
+    rewrite it as `oom`. Explicit allocation errors remain `oom`; an ambiguous device abort stays
+    `gpu_abort`, with `stage_reached` and the sampled memory columns reporting the independent
+    facts that it happened during prefill/decode and whether the machine was under pressure.
     """
     error = str(result.get("error") or "")
     if error.startswith("trial_error"):
@@ -610,10 +781,10 @@ def _classify_failure(result: dict) -> str:
     if error == "timeout":
         return "timeout"
     if error.startswith("crashed"):
-        return "oom" if _memory_at_limit(result) else "crashed"
+        return "crashed"
     classification = _error_classification(error)
     is_gpu_abort = classification == "gpu_abort"
-    is_oom = classification == "oom" or (is_gpu_abort and _memory_at_limit(result))
+    is_oom = classification == "oom"
     if not result.get("load_ok"):
         if is_oom:
             return "oom"
@@ -637,8 +808,37 @@ def _status_label(result: dict) -> str:
     return "PASS" if _passed(result) else _classify_failure(result)
 
 
+def _retire_csv_with_a_different_schema(path: str) -> None:
+    """Move an existing trials.csv aside when its header no longer matches TRIAL_CSV_FIELDS.
+
+    The file is appended to across runs, and the writer only emits a header when the file is
+    absent -- so a run that adds a column would otherwise write wider rows underneath the old
+    narrow header, silently shifting every value in them one column to the left of its name.
+    The old rows are still worth keeping (they are measurements), so they are renamed rather
+    than deleted, stamped with the file's own last-modified time.
+    """
+    if not os.path.exists(path):
+        return
+    try:
+        with open(path, "r", encoding="utf-8", newline="") as handle:
+            header = handle.readline().strip()
+        if header == ",".join(TRIAL_CSV_FIELDS):
+            return
+        stamp = datetime.fromtimestamp(os.path.getmtime(path)).strftime("%Y%m%d-%H%M%S")
+        retired = f"{os.path.splitext(path)[0]}.{stamp}.csv"
+        os.replace(path, retired)
+        print(
+            f"  [info] {os.path.basename(path)} was written with a different set of columns; "
+            f"kept as {os.path.basename(retired)} and starting a new one",
+            flush=True,
+        )
+    except OSError:
+        pass  # worst case the writer appends as before; never lose a trial over bookkeeping
+
+
 def _append_trial_row(output_dir: str, row: dict) -> None:
     path = os.path.join(output_dir, "trials.csv")
+    _retire_csv_with_a_different_schema(path)
     flat = {field: row.get(field) for field in TRIAL_CSV_FIELDS}
     flat["model"] = row["model"]
     flat["device"] = row["device"]
@@ -660,26 +860,41 @@ def _format_trial_line(model_name: str, tokens: int, result: dict) -> str:
     if result.get("load_time_s") is not None:
         timing.append(f"load {result['load_time_s']:.1f}s")
     if result.get("generate_time_s") is not None:
-        timing.append(
+        segment = (
             f"gen {result['generate_time_s']:.1f}s ({result.get('generated_tokens', 0)} tok, "
             f"{result.get('tokens_per_second', 0):.2f} tok/s)"
         )
+        # Where the wall-clock went. At these context lengths prefill dominates by an order of
+        # magnitude, so a single "gen 114.7s" hides the fact that ~all of it was one forward
+        # pass over the prompt -- and hides it getting worse a step before the box gives up.
+        if result.get("time_to_first_token_s") is not None:
+            segment += f" [prefill {result['time_to_first_token_s']:.1f}s"
+            if result.get("decode_time_s") is not None:
+                segment += f" + decode {result['decode_time_s']:.1f}s"
+            segment += "]"
+        timing.append(segment)
     if timing:
         parts.append(", ".join(timing))
 
     if result.get("peak_ram_gb") is not None:
         seg = f"peak RAM {_fmt_gb(result.get('peak_ram_gb'))}"
-        if result.get("weight_ram_gb") is not None and result.get("kv_ram_gb") is not None:
-            seg += f" (weights +{result['weight_ram_gb']:.1f}, kv +{result['kv_ram_gb']:.1f})"
+        if result.get("post_load_peak_ram_gb") is not None:
+            seg += f" (post-load peak +{result['post_load_peak_ram_gb']:.1f})"
         parts.append(seg)
     if result.get("peak_gpu_gb") is not None:
         seg = f"peak GPU {_fmt_gb(result.get('peak_gpu_gb'))}"
         if result.get("peak_gpu_pct") is not None:
-            seg += f" ({result['peak_gpu_pct']:.1f}% of system RAM)"
-        if result.get("weight_gpu_gb") is not None and result.get("kv_gpu_gb") is not None:
-            seg += f" (weights +{result['weight_gpu_gb']:.1f}, kv +{result['kv_gpu_gb']:.1f}"
-            if result.get("kv_overhead_ratio") is not None:
-                seg += f", expected {result['expected_kv_gpu_gb']:.2f}, {result['kv_overhead_ratio']:.1f}x"
+            seg += f" ({result['peak_gpu_pct']:.1f}% of system RAM"
+            if result.get("peak_gpu_pct_of_budget") is not None:
+                seg += (
+                    f", {result['peak_gpu_pct_of_budget']:.0f}% of the "
+                    f"{result['gpu_budget_gb']:.1f} GB device budget"
+                )
+            seg += ")"
+        if result.get("post_load_peak_gpu_gb") is not None:
+            seg += f" (post-load peak +{result['post_load_peak_gpu_gb']:.1f}"
+            if result.get("expected_kv_gpu_gb") is not None:
+                seg += f", expected KV {result['expected_kv_gpu_gb']:.2f}"
             seg += ")"
         parts.append(seg)
 
@@ -694,8 +909,15 @@ def _format_trial_line(model_name: str, tokens: int, result: dict) -> str:
     if result.get("latency_limit_exceeded") and not _memory_at_limit(result):
         parts.append("latency budget exceeded without memory saturation")
 
-    if not passed and result.get("error"):
-        parts.append(f"error={result.get('error')}")
+    if not passed:
+        # Named before the error text, and for the errors that have no text of their own
+        # (`timeout`, a native abort) it is the only thing that says what the box was doing:
+        # "died in prefill" is a statement about this context length, "died in decode" is not.
+        stage = result.get("stage_reached")
+        if stage and stage != trial_runner.STAGE_DECODED:
+            parts.append(f"failed in {trial_runner.failing_stage(stage)} (reached {stage})")
+        if result.get("error"):
+            parts.append(f"error={result.get('error')}")
     return "  |  ".join(parts)
 
 
@@ -725,30 +947,33 @@ def _fake_ceiling_tokens(model_name: str, steps: list) -> int:
 
 def _run_trial_dry_run(model_name: str, tokens: int, probe_tokens: int, fake_ceiling: int) -> dict:
     ok = tokens <= fake_ceiling
-    weight_ram = 4.0  # pretend a small fixed weight footprint
-    weight_gpu = 3.5
-    kv_ram = round(tokens / 8000.0, 2)  # KV grows with context
-    kv_gpu = round(tokens / 10000.0, 2)
-    peak_gpu = round(1.0 + weight_gpu + kv_gpu, 2)
+    post_load_ram = round(tokens / 8000.0, 2)
+    post_load_gpu = round(tokens / 10000.0, 2)
+    peak_gpu = round(4.5 + post_load_gpu, 2)
     return {
         "tokens_requested": tokens,
         "load_ok": True,
         "load_time_s": 0.01,
+        # A synthetic failure is a prefill failure: that is where a real one lands at the
+        # ceiling, and it keeps --dry-run exercising the stage columns rather than leaving
+        # them empty in every fake row.
+        "stage_reached": trial_runner.STAGE_DECODED if ok else trial_runner.STAGE_PROMPT_BUILT,
         "generate_ok": ok,
         "prompt_tokens": tokens,
         "generated_tokens": probe_tokens if ok else 0,
-        "generate_time_s": 0.01,
-        "weight_ram_gb": weight_ram,
-        "weight_gpu_gb": weight_gpu,
-        "kv_ram_gb": kv_ram,
-        "kv_gpu_gb": kv_gpu,
-        "peak_ram_gb": round(2.0 + weight_ram + kv_ram, 2),
+        "generate_time_s": 0.01 if ok else None,
+        "time_to_first_token_s": 0.008 if ok else None,
+        "decode_time_s": 0.002 if ok else None,
+        "gpu_budget_gb": 32.0,
+        "post_load_peak_ram_gb": post_load_ram,
+        "post_load_peak_gpu_gb": post_load_gpu,
+        "peak_ram_gb": round(6.0 + post_load_ram, 2),
         "peak_ram_pct": 50.0,
-        "min_available_ram_gb": round(max(0.0, 64.0 - (2.0 + weight_ram + kv_ram)), 2),
-        "min_commit_available_gb": round(max(0.0, 72.0 - (2.0 + weight_ram + kv_ram)), 2),
+        "min_available_ram_gb": round(max(0.0, 64.0 - (6.0 + post_load_ram)), 2),
+        "min_commit_available_gb": round(max(0.0, 72.0 - (6.0 + post_load_ram)), 2),
         "peak_gpu_gb": peak_gpu,
         "ram_total_gb": 64.0,
-        "error": None if ok else "generate:oom:allocation failed (dry-run)",
+        "error": None if ok else "prefill:oom:allocation failed (dry-run)",
     }
 
 
@@ -759,6 +984,8 @@ def _run_trial_subprocess(
     tokens: int,
     probe_tokens: int,
     timeout_sec: int,
+    ov_config: dict | None = None,
+    scheduler_config: dict | None = None,
     sample_interval: float = 0.5,
     poll_interval: float = 0.25,
     drain_timeout: float = 5.0,
@@ -771,6 +998,13 @@ def _run_trial_subprocess(
     isolation is what makes that safe -- a native GPU allocation abort near
     shared-memory exhaustion kills only this child, and the parent's sampler has
     already recorded the memory high-water mark that explains why.
+
+    The child's milestone messages are tracked as they arrive rather than only
+    read off the final result, so the stage it got to survives the child: a run
+    that is killed by the timeout or by a native abort never posts a result at
+    all, and "hung in prefill" versus "hung in decode" is the difference between
+    "one forward pass over this context is beyond the box" and "the context is
+    in, generation is just crawling".
     """
     baseline = _read_mem()
     sampler = _MemorySampler(interval=sample_interval)
@@ -780,26 +1014,49 @@ def _run_trial_subprocess(
     result_queue = ctx.Queue()
     process = ctx.Process(
         target=trial_runner.run_trial,
-        args=(model_dir, model_name, device, tokens, probe_tokens, result_queue),
+        args=(
+            model_dir,
+            model_name,
+            device,
+            tokens,
+            probe_tokens,
+            result_queue,
+            ov_config,
+            scheduler_config,
+        ),
     )
     process.start()
 
     loaded_mem = None
     load_ok = False
     result = None
+    milestones = {
+        "stage_reached": trial_runner.STAGE_START,
+        "prompt_tokens": 0,
+        "time_to_first_token_s": None,
+        "gpu_budget_gb": None,
+    }
 
     def _consume(msg: dict, child_alive: bool) -> bool:
         """Apply one child message; True once the terminal "done" has arrived."""
         nonlocal loaded_mem, load_ok, result
         event = msg.get("event")
-        if event == "loaded":
+        if event == "device":
+            milestones["gpu_budget_gb"] = msg.get("gpu_budget_gb")
+        elif event == "loaded":
             load_ok = True
-            # Snapshot the weight footprint before prefill grows it. Only meaningful
-            # while the child still holds the weights, so a "loaded" recovered from
-            # the post-mortem drain below records load_ok without a memory reading
-            # rather than attributing a dead child's footprint to its weights.
+            milestones["stage_reached"] = trial_runner.STAGE_LOADED
+            # Snapshot pipeline-construction memory before inference. Only meaningful
+            # while the child is alive; a post-mortem "loaded" records load_ok without
+            # fabricating a memory delta from a dead process.
             if child_alive and loaded_mem is None:
                 loaded_mem = _read_mem()
+        elif event == "prompt":
+            milestones["stage_reached"] = trial_runner.STAGE_PROMPT_BUILT
+            milestones["prompt_tokens"] = msg.get("prompt_tokens", 0)
+        elif event == "prefilled":
+            milestones["stage_reached"] = trial_runner.STAGE_PREFILLED
+            milestones["time_to_first_token_s"] = msg.get("time_to_first_token_s")
         elif event == "done":
             result = msg
             load_ok = load_ok or bool(msg.get("load_ok"))
@@ -867,16 +1124,24 @@ def _run_trial_subprocess(
             else None
         ),
         "peak_gpu_gb": round(sampler.peak_gpu, 2),
-        "weight_ram_gb": _delta(loaded_mem["ram_gb"], baseline["ram_gb"]) if loaded_mem else None,
-        "weight_gpu_gb": _delta(loaded_mem["gpu_gb"], baseline["gpu_gb"]) if loaded_mem else None,
-        "kv_ram_gb": _delta(sampler.peak_ram, loaded_mem["ram_gb"]) if loaded_mem else None,
-        "kv_gpu_gb": _delta(sampler.peak_gpu, loaded_mem["gpu_gb"]) if loaded_mem else None,
+        "post_load_peak_ram_gb": (
+            _delta(sampler.peak_ram, loaded_mem["ram_gb"]) if loaded_mem else None
+        ),
+        "post_load_peak_gpu_gb": (
+            _delta(sampler.peak_gpu, loaded_mem["gpu_gb"]) if loaded_mem else None
+        ),
         "ram_total_gb": round(baseline["ram_total_gb"], 2),
     }
 
     if result is not None:
         result.pop("event", None)
         result.update(mem)
+        # The child's own reading wins where it has one; the milestones fill in what a
+        # result posted from a failure path could not know (a GPU budget read before the
+        # trial began, a prefill that completed before the step that then threw).
+        for key, value in milestones.items():
+            if result.get(key) in (None, 0, trial_runner.STAGE_START) and value not in (None, 0):
+                result[key] = value
         return result
 
     # A native GPU allocation abort near shared-memory exhaustion kills the child
@@ -894,10 +1159,14 @@ def _run_trial_subprocess(
         "load_ok": load_ok,  # crashed/hung during generate, not load
         "load_time_s": None,
         "generate_ok": False,
-        "prompt_tokens": 0,
         "generated_tokens": 0,
         "generate_time_s": None,
+        "decode_time_s": None,
         "error": reason,
+        # `stage_reached` is the whole reason the milestones are tracked: it is all that
+        # separates a box that could not push the context through the model once from one
+        # that did and then died on the way out.
+        **milestones,
         **mem,
     }
 
@@ -923,7 +1192,9 @@ def _failed_to_run_result(tokens: int, exc: Exception) -> dict:
     }
 
 
-def _run_one(model_name, model_dir, device, tokens, settings, dry_run, fake_ceiling, kv_bytes_per_token=None):
+def _run_one(model_name, model_dir, device, tokens, settings, dry_run, fake_ceiling, kv_estimate=None):
+    pipeline_config = settings.get("pipeline_config") or {}
+    scheduler_config = settings.get("scheduler_config") or {}
     if dry_run:
         result = _run_trial_dry_run(model_name, tokens, settings["probe_tokens"], fake_ceiling)
     else:
@@ -935,6 +1206,8 @@ def _run_one(model_name, model_dir, device, tokens, settings, dry_run, fake_ceil
                 tokens,
                 settings["probe_tokens"],
                 settings["trial_timeout_sec"],
+                ov_config=pipeline_config,
+                scheduler_config=scheduler_config,
             )
         except Exception as exc:  # noqa: BLE001 - recorded as this step's failure, see helper
             traceback.print_exc()
@@ -948,36 +1221,51 @@ def _run_one(model_name, model_dir, device, tokens, settings, dry_run, fake_ceil
     result["latency_limit_exceeded"] = bool(
         generate_time is not None and generate_time > settings["max_generate_time_sec"]
     )
+    # Which configuration produced this row. A sweep run with a compressed KV cache is a
+    # different measurement from one without, and a trials.csv that does not say so invites
+    # the two to be read as a before/after of the hardware.
+    result["pipeline_config"] = _format_pipeline_config(pipeline_config)
+    result["scheduler_config"] = _format_pipeline_config(scheduler_config)
+    result["kv_cache_precision"] = pipeline_config.get("KV_CACHE_PRECISION", "(plugin default)")
     ram_total_gb = result.pop("ram_total_gb", 0.0)
     peak_gpu_gb = result.get("peak_gpu_gb", 0.0)
     result["gpu_memory_pressure_pct"] = settings["gpu_memory_pressure_pct"]
     result["peak_gpu_pct"] = (
         round(peak_gpu_gb / ram_total_gb * 100, 1) if peak_gpu_gb and ram_total_gb else None
     )
+    # Peak usage against what the driver says this device gets (GPU_DEVICE_TOTAL_MEM_SIZE).
+    # Reported, deliberately not enforced: the sampled counter is machine-wide across every GPU
+    # adapter and counts shared usage that overlaps the dedicated carve-out, so it can read past
+    # 100% on a step that passes -- it is the right number to size a run against, and the wrong
+    # one to convict a trial with. Classification keeps using measured host headroom instead.
+    gpu_budget_gb = result.get("gpu_budget_gb")
+    result["peak_gpu_pct_of_budget"] = (
+        round(peak_gpu_gb / gpu_budget_gb * 100, 1) if peak_gpu_gb and gpu_budget_gb else None
+    )
     result["gpu_memory_at_limit"] = bool(
         result["peak_gpu_pct"] is not None
         and result["peak_gpu_pct"] >= settings["gpu_memory_pressure_pct"]
     )
     result["host_memory_at_limit"] = _host_memory_exhausted(result)
-    if kv_bytes_per_token and result.get("prompt_tokens"):
-        expected_kv_gb = kv_bytes_per_token * result["prompt_tokens"] / (1024 ** 3)
+    if kv_estimate and result.get("prompt_tokens"):
+        bytes_per_token, fixed_state_bytes = kv_estimate
+        expected_kv_gb = (
+            bytes_per_token * result["prompt_tokens"] + fixed_state_bytes
+        ) / (1024 ** 3)
         result["expected_kv_gpu_gb"] = round(expected_kv_gb, 2)
-        kv_gpu = result.get("kv_gpu_gb")
-        result["kv_overhead_ratio"] = round(kv_gpu / expected_kv_gb, 2) if kv_gpu else None
     else:
         result["expected_kv_gpu_gb"] = None
-        result["kv_overhead_ratio"] = None
     return result
 
 
 def _refine_boundary(
     model_name, model_dir, device, settings, low, high, dry_run, fake_ceiling, weight_disk,
-    kv_bytes_per_token=None, max_extra=3,
+    kv_estimate=None, max_extra=3,
 ):
     """Bisect between the last pass (`low`) and the first failure (`high`).
 
     Returns ``(highest_pass, best_result, lowest_failure)``, where `lowest_failure` is
-    ``{"tokens", "reason"}`` for the smallest context refinement saw fail, or None if every
+    ``{"tokens", "reason", "stage"}`` for the smallest context refinement saw fail, or None if every
     refinement trial passed. The summary quotes it, because after refinement the context this
     box actually broke at is no longer the configured step that first failed -- and the reason
     can differ too (`oom` at 160K, but the run this fixes could equally have produced a
@@ -994,7 +1282,7 @@ def _refine_boundary(
         _print_trial_start(model_name, mid, settings, indent="  ")
         result = _run_one(
             model_name, model_dir, device, mid, settings, dry_run, fake_ceiling,
-            kv_bytes_per_token,
+            kv_estimate,
         )
         _append_trial_row(
             settings["output_dir"],
@@ -1011,7 +1299,11 @@ def _refine_boundary(
         if passed:
             best_result = result
         else:
-            lowest_failure = {"tokens": mid, "reason": _classify_failure(result)}
+            lowest_failure = {
+                "tokens": mid,
+                "reason": _classify_failure(result),
+                "stage": result.get("stage_reached"),
+            }
         lo, hi = (mid, hi) if passed else (lo, mid)
     return lo, best_result, lowest_failure
 
@@ -1041,13 +1333,27 @@ def _sweep_model(model_name: str, settings: dict, dry_run: bool) -> dict:
     )
 
     model_config = None if dry_run else _load_model_config(model_dir)
-    kv_bytes_per_token = _theoretical_kv_bytes_per_token(model_config) if model_config else None
+    kv_bytes_per_token = (
+        _theoretical_kv_bytes_per_token(
+            model_config,
+            _kv_cache_dtype_bytes(settings.get("pipeline_config")),
+            _kv_cache_quantization_param_bytes(settings.get("pipeline_config")),
+        )
+        if model_config
+        else None
+    )
+    kv_estimate = (
+        (kv_bytes_per_token, _fixed_state_cache_bytes(model_dir))
+        if kv_bytes_per_token is not None
+        else None
+    )
 
     fake_ceiling = _fake_ceiling_tokens(model_name, settings["context_steps_tokens"]) if dry_run else None
 
     max_stable = 0
     max_stable_result = None
     fail_reason = None
+    fail_stage = None
     completed_all_steps = True
     last_tokens = settings["context_steps_tokens"][0]
 
@@ -1056,7 +1362,7 @@ def _sweep_model(model_name: str, settings: dict, dry_run: bool) -> dict:
         _print_trial_start(model_name, tokens, settings)
         result = _run_one(
             model_name, model_dir, device, tokens, settings, dry_run, fake_ceiling,
-            kv_bytes_per_token,
+            kv_estimate,
         )
         _append_trial_row(
             settings["output_dir"],
@@ -1073,6 +1379,7 @@ def _sweep_model(model_name: str, settings: dict, dry_run: bool) -> dict:
         print(_format_trial_line(model_name, tokens, result), flush=True)
         if not passed:
             fail_reason = _classify_failure(result)
+            fail_stage = result.get("stage_reached")
             completed_all_steps = False
             break
         max_stable = tokens
@@ -1081,12 +1388,13 @@ def _sweep_model(model_name: str, settings: dict, dry_run: bool) -> dict:
     fail_tokens = None
     if completed_all_steps:
         fail_reason = None
+        fail_stage = None
     else:
         fail_tokens = last_tokens
         if settings["refine"] and max_stable:
             max_stable, refined_result, refined_failure = _refine_boundary(
                 model_name, model_dir, device, settings, max_stable, last_tokens, dry_run,
-                fake_ceiling, weight_disk, kv_bytes_per_token=kv_bytes_per_token,
+                fake_ceiling, weight_disk, kv_estimate=kv_estimate,
             )
             if refined_result is not None:
                 max_stable_result = refined_result
@@ -1097,6 +1405,7 @@ def _sweep_model(model_name: str, settings: dict, dry_run: bool) -> dict:
             if refined_failure is not None and refined_failure["reason"] != "trial_error":
                 fail_tokens = refined_failure["tokens"]
                 fail_reason = refined_failure["reason"]
+                fail_stage = refined_failure.get("stage")
 
     peak = max_stable_result or {}
     return {
@@ -1105,15 +1414,19 @@ def _sweep_model(model_name: str, settings: dict, dry_run: bool) -> dict:
         "max_stable_context": max_stable,
         "meets_target": max_stable >= settings["target_context_tokens"],
         "failure_tokens": fail_tokens,
+        "failure_stage": fail_stage,
         "device": device,
         "weight_format": weight_format,
+        "pipeline_config": _format_pipeline_config(settings.get("pipeline_config")),
+        "kv_cache_precision": (settings.get("pipeline_config") or {}).get(
+            "KV_CACHE_PRECISION", "(plugin default)"
+        ),
+        "gpu_budget_gb": peak.get("gpu_budget_gb"),
+        "time_to_first_token_s": peak.get("time_to_first_token_s"),
         "weight_disk_gb": weight_disk,
-        "weight_ram_gb": peak.get("weight_ram_gb"),
-        "weight_gpu_gb": peak.get("weight_gpu_gb"),
-        "kv_ram_gb": peak.get("kv_ram_gb"),
-        "kv_gpu_gb": peak.get("kv_gpu_gb"),
+        "post_load_peak_ram_gb": peak.get("post_load_peak_ram_gb"),
+        "post_load_peak_gpu_gb": peak.get("post_load_peak_gpu_gb"),
         "expected_kv_gpu_gb": peak.get("expected_kv_gpu_gb"),
-        "kv_overhead_ratio": peak.get("kv_overhead_ratio"),
         "peak_ram_gb": peak.get("peak_ram_gb"),
         "peak_gpu_gb": peak.get("peak_gpu_gb"),
         "min_available_ram_gb": peak.get("min_available_ram_gb"),
@@ -1139,12 +1452,18 @@ def _write_summary(
     minutes of real trials had just measured. A stale report that looks current is worse than
     no report, so the file on disk always describes the run that is actually happening.
     """
+    pipeline_config = settings.get("pipeline_config") or {}
+    scheduler_config = settings.get("scheduler_config") or {}
     summary = {
         "generated_at": datetime.now().isoformat(timespec="seconds"),
         "completed": completed,
         "target_context_tokens": settings["target_context_tokens"],
         "probe_tokens": settings["probe_tokens"],
         "max_generate_time_sec": settings["max_generate_time_sec"],
+        # Recorded at run level as well as per model: it is a property of the run, and the
+        # first question asked of any two of these reports is what was different between them.
+        "pipeline_config": pipeline_config,
+        "scheduler_config": scheduler_config,
         "hardware": platform_info,
         "models": model_reports,
     }
@@ -1174,54 +1493,56 @@ def _write_summary(
         f"Hardware: {platform_info.get('Processor', '--')}, {platform_info.get('Memory', '--')} RAM, "
         f"{platform_info.get('iGPU', '--')}",
         "",
-        "Memory columns are measured at the max stable context: weights = footprint just after "
-        "load; KV = additional memory prefill+decode added on top; peak = total high-water mark; "
+        f"Pipeline config: `{_format_pipeline_config(pipeline_config)}`",
+        f"Scheduler config: `{_format_pipeline_config(scheduler_config)}`",
+        "",
+        "Memory columns are measured at the max stable context. Post-load peak is all growth after "
+        "pipeline construction, including lazy weights and prefill workspace; Expected KV is the "
+        "architecture-derived persistent cache size; peak is the total high-water mark; "
         "Min free RAM = low-water mark of available physical RAM, i.e. the real headroom left at "
         "that context.",
         "",
         "| Model | Device | Weight | Max stable context | Meets target | Weights (disk) | "
-        "Peak RAM | KV RAM | Min free RAM | Peak GPU | KV GPU | Expected KV | KV Ratio | Notes |",
-        "|---|---|---|---|---|---|---|---|---|---|---|---|---|---|",
+        "Peak RAM | Post-load RAM | Min free RAM | Peak GPU | Post-load GPU | Expected KV | Notes |",
+        "|---|---|---|---|---|---|---|---|---|---|---|---|---|",
     ]
     for r in model_reports:
         if r["status"] == "not_run":
             lines.append(
                 f"| {r['model']} | {r['device']} | {r['weight_format']} | - | - | - | - | - | - | "
-                "- | - | - | - | not run |"
+                "- | - | - | not run |"
             )
             continue
         if r["status"] == "missing_ir":
             lines.append(
-                f"| {r['model']} | {r['device']} | {r['weight_format']} | - | - | - | - | - | - | - | - | - | - | "
+                f"| {r['model']} | {r['device']} | {r['weight_format']} | - | - | - | - | - | - | - | - | - | "
                 f"IR not found; run: `{r['prep_command']}` |"
             )
             continue
         max_ctx = f"{r['max_stable_context']:,}" if r["max_stable_context"] else "0"
         meets = "PASS" if r["meets_target"] else "FAIL"
-        ratio = r.get("kv_overhead_ratio")
         notes = []
         if r.get("failure_reason"):
             capped = f"capped by {r['failure_reason']}"
             if r.get("failure_tokens"):
                 capped += f" at {r['failure_tokens']:,} tokens"
+            # Which phase gave out. `oom in prefill` and `oom in decode` call for different
+            # answers -- the first is the size of one forward pass over the context, the second
+            # is the cache that pass left behind -- so the summary must not collapse them.
+            stage = r.get("failure_stage")
+            if stage and stage != trial_runner.STAGE_DECODED:
+                capped += f" (failed in {trial_runner.failing_stage(stage)})"
             notes.append(capped)
-        if ratio is not None and ratio >= _KV_OVERHEAD_RATIO_NOTE_THRESHOLD:
-            notes.append(
-                f"kv {ratio:g}x the persistent-cache-only estimate -- expected_kv_gpu_gb counts "
-                "only growing-KV-cache layers, kv_gpu_gb also includes prefill/decode working "
-                "memory across all layers, so a large ratio here is not a capacity problem with "
-                "this box by itself, and not proof of a specific OpenVINO defect either"
-            )
         if not notes:
             notes.append("reached top configured step without failing")
         note = "; ".join(notes)
         lines.append(
             f"| {r['model']} | {r['device']} | {r['weight_format']} | {max_ctx} | {meets} | "
             f"{_fmt_gb(r.get('weight_disk_gb'))} | {_fmt_gb(r.get('peak_ram_gb'))} | "
-            f"{_fmt_gb(r.get('kv_ram_gb'))} | {_fmt_gb(r.get('min_available_ram_gb'))} | "
+            f"{_fmt_gb(r.get('post_load_peak_ram_gb'))} | {_fmt_gb(r.get('min_available_ram_gb'))} | "
             f"{_fmt_gb(r.get('peak_gpu_gb'))} | "
-            f"{_fmt_gb(r.get('kv_gpu_gb'))} | {_fmt_gb(r.get('expected_kv_gpu_gb'))} | "
-            f"{f'{ratio:g}x' if ratio is not None else '--'} | {note} |"
+            f"{_fmt_gb(r.get('post_load_peak_gpu_gb'))} | {_fmt_gb(r.get('expected_kv_gpu_gb'))} | "
+            f"{note} |"
         )
 
     with open(os.path.join(output_dir, "summary.md"), "w", encoding="utf-8") as f:
@@ -1287,6 +1608,16 @@ def main() -> None:
         f"Target: {settings['target_context_tokens']:,} tokens | "
         f"Probe decode: {settings['probe_tokens']} tok | "
         f"Max generation: {settings['max_generate_time_sec']:g}s | Output: {settings['output_dir']}",
+        flush=True,
+    )
+    print(
+        f"Pipeline config ({settings['device']}): "
+        f"{_format_pipeline_config(settings['pipeline_config'])}",
+        flush=True,
+    )
+    print(
+        f"Scheduler config ({settings['device']}): "
+        f"{_format_pipeline_config(settings['scheduler_config'])}",
         flush=True,
     )
 

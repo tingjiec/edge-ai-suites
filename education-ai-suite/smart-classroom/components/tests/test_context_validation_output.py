@@ -29,16 +29,17 @@ class TestGeneratedOutputValidation(unittest.TestCase):
         self.assertGreater(count, 0)
         self.assertIsNone(error)
 
-    def test_rejects_punctuation_and_special_tokens(self):
+    def test_accepts_low_information_output_as_decode_success(self):
         for output in ("!!!!", "<eos>"):
             valid, _count, error = _validate_generated_output(output, self.tokenizer)
-            self.assertFalse(valid)
-            self.assertIsNotNone(error)
+            self.assertTrue(valid)
+            self.assertIsNone(error)
 
-    def test_rejects_repeated_single_character(self):
-        valid, _count, error = _validate_generated_output("aaaaaaaa", self.tokenizer)
+    def test_rejects_empty_output(self):
+        valid, count, error = _validate_generated_output("", self.tokenizer)
         self.assertFalse(valid)
-        self.assertEqual(error, "repetitive_output")
+        self.assertEqual(count, 0)
+        self.assertEqual(error, "no_output")
 
 
 if __name__ == "__main__":

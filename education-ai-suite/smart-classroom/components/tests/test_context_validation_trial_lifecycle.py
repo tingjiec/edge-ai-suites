@@ -216,9 +216,8 @@ class TestParentRecoversResultRacingChildExit(_ParentHarness):
         self.assertNotIn("event", result)
 
     def test_post_mortem_loaded_event_sets_load_ok_without_a_memory_snapshot(self):
-        # A weight-footprint snapshot taken after the child is gone would measure a
-        # dead process, so the drain records that loading happened and leaves the
-        # weight columns empty rather than reporting a fabricated number.
+        # A post-load snapshot taken after the child is gone would measure a dead
+        # process, so the drain records loading and leaves growth columns empty.
         queue = _RacingQueue(
             [
                 {"event": "loaded", "load_time_s": 13.1},
@@ -229,8 +228,8 @@ class TestParentRecoversResultRacingChildExit(_ParentHarness):
         result = self._run(queue, _DeadProcess(exitcode=0))
 
         self.assertTrue(result["load_ok"])
-        self.assertIsNone(result["weight_ram_gb"])
-        self.assertIsNone(result["weight_gpu_gb"])
+        self.assertIsNone(result["post_load_peak_ram_gb"])
+        self.assertIsNone(result["post_load_peak_gpu_gb"])
 
 
 class TestGenuineCrashStillReported(_ParentHarness):
@@ -251,6 +250,32 @@ class TestGenuineCrashStillReported(_ParentHarness):
 
     def test_unknown_exit_code_is_left_undecorated(self):
         self.assertEqual(_crash_reason(1), "crashed:exitcode=1")
+
+
+class TestPrefillMilestoneSurvivesFailure(_ParentHarness):
+    def test_prompt_built_without_first_token_is_reported_as_prefill_failure(self):
+        done = {
+            "event": "done",
+            "tokens_requested": 144000,
+            "load_ok": True,
+            "generate_ok": False,
+            "prompt_tokens": 144000,
+            "generated_tokens": 0,
+            "stage_reached": trial_runner.STAGE_PROMPT_BUILT,
+            "error": "prefill:gpu_abort:CL_EXEC_STATUS_ERROR_FOR_EVENTS_IN_WAIT_LIST",
+        }
+        queue = _RacingQueue(
+            [
+                {"event": "loaded", "load_time_s": 12.2},
+                {"event": "prompt", "prompt_tokens": 144000},
+                done,
+            ]
+        )
+
+        result = self._run(queue, _DeadProcess(exitcode=0))
+
+        self.assertEqual(result["stage_reached"], trial_runner.STAGE_PROMPT_BUILT)
+        self.assertEqual(trial_runner.failing_stage(result["stage_reached"]), "prefill")
 
 
 class TestMemorySettlesBeforeNextTrial(unittest.TestCase):

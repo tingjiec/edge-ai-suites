@@ -24,7 +24,7 @@ summarizer:
 #      - Qwen/Qwen3.6-35B-A3B
       - Qwen/Qwen3.5-9B
     target_context_tokens: 160000
-    context_steps_tokens: [160000, 176000, 192000, 224000, 256000]
+    context_steps_tokens: [8000, 16000, 32000, 64000, 96000, 128000, 160000, 192000, 224000, 256000]
     # Decode length per trial. Proving the hardware can prefill + decode a context
     # size only needs a few decode steps, not a full summary -- a small cap keeps
     # each step fast (generating thousands of tokens at 128K+ context would add
@@ -33,7 +33,7 @@ summarizer:
     # A context is operationally supported only when prefill plus probe decoding
     # completes within this wall-clock SLA. This prevents severe memory-pressure
     # slowdown from being reported as usable capacity merely because it did not OOM.
-    max_generate_time_sec: 600
+    max_generate_time_sec: 900
     # Windows iGPU memory is shared with system RAM. Treat the GPU as being at
     # its practical memory ceiling when sampled usage reaches this percentage.
     # A latency breach is a capacity failure only when this pressure is present.
@@ -46,3 +46,49 @@ summarizer:
     # context came to the wall without a threshold ever cancelling a trial.
     trial_timeout_sec: 1200
     output_dir: monitoring/executionlogs/long_context_validation
+
+    # OpenVINO plugin properties handed to the pipeline constructor for every
+    # trial. `common` applies on any device; the device-family blocks (GPU / CPU /
+    # NPU, matched against the part of `device` before any ".N" suffix) are merged
+    # on top, so a CPU run never receives a GPU-only property. Whatever ends up
+    # resolved is echoed in the sweep header and recorded per trial in trials.csv
+    # (`pipeline_config`, `kv_cache_precision`), because a sweep run with a
+    # different KV precision is a different measurement, not a repeat of the last one.
+    # Override without editing this file: --pipeline-config KEY=VALUE (repeatable;
+    # KEY= with an empty value drops a key) or the --kv-cache-precision shortcut.
+    pipeline_config:
+      common: {}
+      GPU:
+        # Lets the GPU plugin allocate buffers larger than the driver's default
+        # per-allocation cap -- required at all at these context lengths.
+        GPU_ENABLE_LARGE_ALLOCATIONS: "YES"
+        # Store the KV cache as int8 instead of the fp16 default, roughly halving
+        # the part of GPU memory that grows with context length (a per-token scale
+        # and zero-point are stored alongside, so the saving is a little under 2x).
+        # This is the main memory lever available to a stateful LLM pipeline: on a
+        # shared-memory iGPU the read-only device budget
+        # (GPU_DEVICE_TOTAL_MEM_SIZE, reported per trial as gpu_budget_gb) is well
+        # below system RAM, and KV cache is what walks a long-context run into it.
+        # Set "f16" to measure the uncompressed baseline, or "dynamic" to leave
+        # the choice to the plugin.
+        KV_CACHE_PRECISION: "u8"
+        # Other levers worth trying on a box that still cannot reach the target,
+        # left off by default because each changes more than memory:
+        #   DYNAMIC_QUANTIZATION_GROUP_SIZE: 32   # quantize activations too
+        #   GPU_ENABLE_SDPA_OPTIMIZATION: "NO"    # may use less memory on some GPUs
+        #   CACHE_DIR: "models/.ov_cache"         # compile once, reload fast
+      CPU:
+        KV_CACHE_PRECISION: "u8"
+
+    # Bound prefill working memory by processing long prompts in 4096-token
+    # chunks. One sequence and no prefix cache match this capacity probe; the
+    # 4 GB cache budget covers the target model's estimated 2.53 GiB u8 KV
+    # cache at 160K while staying below the shared GPU device budget.
+    scheduler_config:
+      common: {}
+      GPU:
+        max_num_seqs: 1
+        max_num_batched_tokens: 4096
+        cache_size: 4
+        dynamic_split_fuse: true
+        enable_prefix_caching: false
