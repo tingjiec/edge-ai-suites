@@ -253,8 +253,8 @@ stateDiagram-v2
 5. 创建 greedy `GenerationConfig(max_new_tokens=probe_tokens, do_sample=False)`；
 6. 调用 `pipe.generate()`，记录完整 prefill + decode 耗时；
 7. 验证输出并计算生成 token 数；
-8. 删除 pipeline、触发垃圾回收；
-9. 发送 `done` 事件。
+8. 发送 `done` 事件、冲刷队列；
+9. 直接 `os._exit(0)`，**不析构 pipeline**（见 §7.5）。
 
 `generate_time_s` 包含长 prompt 的 prefill 和短输出的 decode，因此：
 
@@ -312,7 +312,66 @@ load:oom:out of memory
 generate:exception:unsupported operation
 ```
 
-`_classify_error()` 用一组文本标记识别 OOM，包括 `out of memory`、`allocation failed`、`bad_alloc`、`cannot allocate` 等；其余异常归为 `exception`。父进程只读取第二段分类字段，避免异常 detail 中出现 `oom` 字样或额外冒号造成误判。
+`_classify_error()` 用两组文本标记分类，其余异常归为 `exception`。父进程只读取第二段分类字段，避免异常 detail 中出现 `oom` 字样或额外冒号造成误判。
+
+到达容量上限时抛出的异常来自 GPU 插件而不是 Python，以 `ov::Exception` 的纯文本形式传上来；而且 OpenCL 是在下一个同步点才报告「已入队命令在设备上失败」，所以消息里出现的是等待函数名，从头到尾不会提到内存：
+
+```text
+Exception from src\plugins\intel_gpu\src\runtime\ocl\ocl_memory.cpp:591:
+[GPU] clWaitForEvents, error code: -14 CL_EXEC_STATUS_ERROR_FOR_EVENTS_IN_WAIT_LIST
+```
+
+因此两组标记按「这条消息到底证明了什么」划分：
+
+| 分类 | 标记 | 含义 |
+|---|---|---|
+| `oom` | `out of memory`、`allocation failed`、`bad_alloc`、`cannot allocate`、`CL_MEM_OBJECT_ALLOCATION_FAILURE`、`CL_OUT_OF_HOST_MEMORY`、`CL_INVALID_BUFFER_SIZE` 等 | 分配确实没有发生 |
+| `gpu_abort` | `CL_EXEC_STATUS_ERROR_FOR_EVENTS_IN_WAIT_LIST`(-14)、`CL_OUT_OF_RESOURCES`(-5)、`CL_INVALID_COMMAND_QUEUE`(-36)、`clWaitForEvents`、`clFinish` | 设备接受了命令后又杀掉了它 |
+
+在共享内存 iGPU 上 `gpu_abort` 通常就是内存耗尽，但驱动复位（TDR）会给出同样的错误码，而子进程既看不到宿主机的空闲内存低水位也读不到 GPU 计数器——这两者都由父进程采样。所以子进程只上报它能确认的窄事实，由父进程结合实测内存决定是否升级为 `oom`（§10.2）。
+
+### 7.5 先上报结果，再 `os._exit(0)`：不析构 pipeline
+
+子进程的每一条退出路径都走 `_post_result_and_exit()`：**先** `put(done)` → `close()` → `join_thread()`，**再** `os._exit(0)`。既不 `del pipe`，也不 `gc.collect()`。这不是省事，而是对一次真实崩溃的正面修复。
+
+**现象**：在 64 GB 共享内存 iGPU 机器上，`Qwen/Qwen3.5-9B` 的 128K 阶梯干净通过，紧接着的 160K 阶梯整个子进程被终止，退出码 `3221226505`（`0xC0000409`），并打印一段由 PyTorch `c10/util/AbortHandler.h` 输出的原生调用栈（transformers 会引入 torch，torch 在 Windows 上默认安装自定义 `std::terminate` handler，所以这段栈由 torch 打印，但崩溃与 torch 本身无关）。
+
+**根因**：把那段栈自下而上读，崩溃点非常明确——它发生在**析构路径**上：
+
+```text
+py_openvino_genai.pyd
+  -> openvino_genai.dll!ov::genai::VLMPipeline::~VLMPipeline
+  -> openvino.dll!ov::IAsyncInferRequest::~IAsyncInferRequest
+  -> openvino.dll!ov::ISyncInferRequest::~ISyncInferRequest
+  -> openvino_intel_gpu_plugin.dll!...
+  -> openvino.dll!ov::Exception::create        <- 在析构函数里抛异常
+  -> VCRUNTIME140.dll!CxxThrowException
+  -> ucrtbase.dll!terminate                    <- 无人可接，进程 abort
+```
+
+也就是说：在共享内存已经接近耗尽（该次试验 peak GPU 43.6 GB、min free RAM 3.2 GB、commit 仅剩 17.1 GB）的状态下释放 GPU infer request 时，Intel GPU plugin 抛出了 `ov::Exception`；析构函数隐式 `noexcept`，异常逃逸即 `std::terminate`，进程被 abort。栈顶还能看到 `PyEval_EvalFrameDefault`，说明这是**正常执行中的 Python 字节码**触发的，而不是解释器退出阶段——对应的就是旧代码 `finally` 块里的 `del pipe`。
+
+**为什么旧写法挡不住**：旧代码是
+
+```python
+finally:
+    try:
+        del pipe
+        gc.collect()
+    except Exception:
+        pass
+
+result_queue.put(done)
+```
+
+`std::terminate` 不是 Python 异常，`except Exception` 根本没有机会执行；更糟的是析构排在 `put(done)` **之前**，于是这次试验**已经算完的结果**（prefill 是否成功、decode 了多少 token、耗时多少）随进程一起消失，父进程只能看到 `FAIL (crashed)`——恰好把工具唯一要回答的那个 160K 目标点变成了无信息的失败。
+
+**修复的两半**：
+
+1. **结果先出去**。`done` 在任何清理动作之前送达父进程，此后再发生任何原生 abort 都不会抹掉一次已完成的测量。因为 `multiprocessing.Queue.put()` 是异步的（由 feeder 线程写管道），而 `os._exit()` 会跳过负责等待该线程的 atexit hook，所以必须显式 `close()` + `join_thread()` 冲刷，否则消息会和进程退出赛跑。
+2. **让会抛异常的析构根本不执行**。子进程本来就只跑一次试验，§8.1 的设计前提一直是「进程退出才是资源回收边界」，本节只是把这句话贯彻到底：回收交给操作系统，而操作系统不会抛异常。
+
+**代价与补偿**：回收时机从「进程内析构」推迟到了「进程退出后由 OS 完成」，而本工具读取的 Windows PDH GPU 计数器本身也是采样值、有滞后。下一次试验的 baseline 恰好在本次试验返回时读取，因此父进程在返回前调用 `_wait_for_memory_settle()`（§9.5）等待内存真正落回基线，避免上一次的显存被记到下一次的「权重」头上。
 
 ## 8. 父子进程协议与生命周期
 
@@ -350,14 +409,17 @@ sequenceDiagram
     C->>C: build prompt + generate
     S->>S: sample RAM/GPU every 0.5s
     C-->>P: event=done + result
+    C->>C: close + join_thread, os._exit(0)（不析构 pipeline）
     P->>C: terminate if still alive
     P->>S: stop + join
+    P->>P: drain queue（回收与退出赛跑的消息）
+    P->>P: wait_for_memory_settle(baseline)
     P->>P: merge timing, status and memory
 ```
 
 ### 8.3 超时与崩溃处理
 
-父进程默认每 2 秒轮询队列，直到：
+父进程默认每 0.25 秒轮询队列，直到：
 
 - 收到 `done`；
 - 超过 `trial_timeout_sec`；
@@ -366,6 +428,27 @@ sequenceDiagram
 若 deadline 到达且没有结果，状态为 `timeout`；若子进程提前退出且没有 `done`，状态为 `crashed:exitcode=N`。父进程随后终止仍存活的子进程并等待最多 10 秒，再停止采样线程。
 
 `max_generate_time_sec` 与 `trial_timeout_sec` 含义不同：前者是业务可用性软阈值，后者是防止进程永久挂起的硬保护。
+
+#### 8.3.1 退出后补捞队列（drain）
+
+`os._exit(0)` 紧跟在 `put(done)` 之后（§7.5），于是出现一个必然存在的时序窗口：轮询刚好 `Empty` 超时返回 → 子进程写入消息并退出 → 父进程检查 `is_alive()` 得到 False 并 break。此时消息**已经在管道里**，却因为没人再读而丢失，一次成功的试验会被误报成 `crashed:exitcode=0`。
+
+因此 `_run_trial_subprocess()` 在 `join()` 之后、判定崩溃之前，会在 `drain_timeout`（默认 5 秒）内继续把队列里剩余的消息读完。若补捞到 `done`，该结果照常返回，`timeout` 标记也随之撤销。
+
+补捞阶段读到的 `loaded` 事件只用于置 `load_ok=True`，**不会**再触发 `_read_mem()` 快照：子进程此时已经不存在，那一刻测到的内存与权重驻留量无关，宁可让 `weight_ram_gb` / `weight_gpu_gb` 留空，也不写入一个编造出来的数字。
+
+#### 8.3.2 崩溃退出码的可读化
+
+真正的崩溃（子进程在能上报之前就死了）现在通过 `_crash_reason()` 生成错误串。已知的原生 abort 状态码会附带解码说明：
+
+```text
+crashed:exitcode=3221226505:0xC0000409 STATUS_STACK_BUFFER_OVERRUN - how the CRT reports abort()/std::terminate
+crashed:exitcode=3221225477:0xC0000005 STATUS_ACCESS_VIOLATION
+```
+
+未知退出码保持 `crashed:exitcode=N` 原样。前缀仍是 `crashed:`，`_classify_failure()` 取第一段，分类结果不变。
+
+修复之后，仍然走到这条路径就有了明确含义：abort 发生在**上报之前**，即 load / prefill / decode 途中，那是真实的硬件容量边界；而不再可能是「结果已算完却被析构崩溃吃掉」的假失败。
 
 ## 9. 内存采样与估算
 
@@ -451,6 +534,18 @@ VLM 导出（本工具所有默认候选模型都是）把上述字段嵌套在�
 
 因此报告适合容量比较与瓶颈定位，不应当作精确显存 profiler 的替代品。
 
+### 9.5 试验之间的内存沉降（`_wait_for_memory_settle`）
+
+子进程不再自行析构 pipeline（§7.5），回收改由操作系统在进程退出时完成；而 GPU 数值来自 Windows PDH 计数器，本身也是周期采样。两者叠加意味着 `join()` 返回的瞬间，上一次试验的内存**未必**已经从计数器上消失。
+
+下一次试验的 `baseline = _read_mem()` 恰好在本次 `_run_trial_subprocess()` 返回后立即执行，若基线被上一次的残留抬高，`weight_gpu_gb = M_L - M_0` 会被系统性低估。因此本次试验在返回前先等待：
+
+$$
+M_{ram} \le M_{ram}^{(0)} + \varepsilon \quad\text{且}\quad M_{gpu} \le M_{gpu}^{(0)} + \varepsilon
+$$
+
+其中 $\varepsilon$ 为 `_MEMORY_SETTLE_TOLERANCE_GB`（默认 1 GB），$M^{(0)}$ 是本次试验开始前的基线。等待上限 `_MEMORY_SETTLE_TIMEOUT_SEC`（默认 30 秒）；超时不算错误，只表示机器上有别的东西占着内存，扫描照常继续，不会因为条件不满足而卡死。
+
 ## 10. 通过策略与失败分类
 
 ### 10.1 PASS 条件
@@ -468,12 +563,12 @@ AND NOT resource_limit_reached
 
 ```text
 generate_time_s > max_generate_time_sec
-AND gpu_memory_at_limit is True
+AND memory_at_limit is True
 ```
 
 因此：
 
-| 生成时间 | GPU 内存压力 | 结果 |
+| 生成时间 | 内存压力 | 结果 |
 |---|---|---|
 | SLA 内 | 任意 | 不因资源策略失败 |
 | 超过 SLA | 未达压力线 | 仍可 PASS，但报告 latency breach |
@@ -481,16 +576,41 @@ AND gpu_memory_at_limit is True
 
 这种组合策略用于区分“模型本身较慢”和“共享内存耗尽导致的 paging/thrashing”。单独变慢不被视为容量上限，变慢且内存饱和才被视为不具备实际可用性。边界是严格大于：`generate_time_s == max_generate_time_sec` 仍通过。
 
+### 10.1.1 内存压力信号：`gpu_memory_at_limit` 之外必须有 `host_memory_at_limit`
+
+`gpu_memory_at_limit` 的定义是「GPU 峰值占用 ÷ **系统总内存** ≥ `gpu_memory_pressure_pct`（默认 90%）」。在共享内存 iGPU 上宿主机本身要用掉相当一部分内存，这个比值根本没有到 90% 的路径：64 GB 机器上所有失败的试验都落在 63%～69% 之间。结果是该标志永远不触发，`too_slow` 成为死代码，设备崩溃也拿不到任何内存证据。
+
+采样器已经记录的余量低水位可以直接回答同一个问题，所以新增 `host_memory_at_limit` 列（由 `_host_memory_exhausted()` 计算）：
+
+```text
+min_available_ram_gb <= 3 GB   OR   peak_ram_pct >= 95%
+```
+
+两种形式缺一不可：绝对值用于捕捉「百分比看着还宽裕、其实已经贴墙」的大内存机器，百分比用于捕捉「3 GB 空闲其实很充裕」的小内存机器。`_memory_at_limit()` = 两者取或，并且直接由试验数据现算，不依赖 `host_memory_at_limit` 列是否已经写入。
+
+这是对**试验产生的测量值**的事后解读：它既不取消试验也不预测试验，§9 的规则不变，只负责给已经发生的失败一个正确的名字。
+
 ### 10.2 失败分类优先级
 
 `_classify_failure()` 按以下顺序分类：
 
-1. 原始错误为 `timeout` 或 `crashed:*`；
-2. 加载失败：OOM 为 `oom`，否则 `load_error`；
-3. 生成失败：OOM 为 `oom`，`no_output` 单独保留，否则 `generate_error`；
-4. 生成 token 数为 0：`no_output`；
-5. 触发组合资源阈值：`too_slow`；
-6. 无法归类：`unknown`。
+1. 原始错误为 `trial_error:*`（父进程自身无法执行该阶梯，§11.3）；
+2. 原始错误为 `timeout`；
+3. 原始错误为 `crashed:*`：内存实测已到极限则升级为 `oom`，否则 `crashed`；
+4. 加载失败：`oom` 为 `oom`，`gpu_abort` 为 `gpu_abort`，否则 `load_error`；
+5. 生成失败：`oom` 为 `oom`，`gpu_abort` 在内存实测已到极限时升级为 `oom`、否则保留 `gpu_abort`，`no_output` 单独保留，其余为 `generate_error`；
+6. 生成 token 数为 0：`no_output`；
+7. 触发组合资源阈值：`too_slow`；
+8. 无法归类：`unknown`。
+
+`gpu_abort` 的升级规则是这套分类的关键。在 64 GB 机器上 128K 通过之后：
+
+| 上下文 | GPU 峰值 | 最低空闲内存 | RAM 峰值占比 | 分类 |
+|---:|---:|---:|---:|---|
+| 160,000 | 43.6 GB (68.5%) | 9.3 GB | 85.3% | `gpu_abort`——GPU 先放弃，宿主机还有余量 |
+| 144,000 | 40.1 GB (63.2%) | 1.9 GB | 97.1% | `oom`——机器确实没有内存了 |
+
+修复前这两行都是 `generate_error`。`generate_error` 是「工具没看懂的错误」，于是整个工具唯一要给出的那个数字——容量上限——在报告里和工具自身的 bug 无法区分。
 
 注意：`special_tokens_only`、`invalid_characters`、`no_semantic_output` 和 `repetitive_output` 会令 `generate_ok=False`，最终统一归入 `generate_error`，详细原因保留在 `error` 字段中。
 
@@ -511,7 +631,7 @@ flowchart TD
     F -->|是| B
     F -->|否| G[达到最高配置阶梯]
     D -->|否| H[记录 failure_reason 并停止]
-    H --> I{--refine 且已有成功点?}
+    H --> I{细化已启用且已有成功点?}
     I -->|否| J[形成模型报告]
     I -->|是| K[在最后成功与首次失败间二分]
     K --> J
@@ -522,9 +642,9 @@ flowchart TD
 
 如果首个阶梯就失败，`max_stable_context=0`，且没有可用下界，因此不会执行 refine。
 
-### 11.2 `--refine` 二分细化
+### 11.2 二分细化（默认开启，`--no-refine` 关闭）
 
-当存在最后成功值 $L$ 和首次失败值 $H$ 时，最多额外执行 3 次：
+细化默认开启：扫描的目的就是**实测**上限，而不是报告目标下方最近的那个阶梯值。当存在最后成功值 $L$ 和首次失败值 $H$ 时，最多额外执行 3 次：
 
 $$
 M=\left\lfloor\frac{L+H}{2}\right\rfloor
@@ -536,7 +656,21 @@ $$
 
 每次 refine 试验也立即追加到 `trials.csv`。该过程只收紧区间，不追求 token 级精确边界；最终 `max_stable_context` 是已观测通过值，而不是推测值。
 
-### 11.3 dry-run
+`_refine_boundary()` 返回 `(highest_pass, best_result, lowest_failure)`。`lowest_failure` 是 `{"tokens", "reason"}`，因为细化之后「机器实际崩掉的那个上下文」不再是首次失败的那个配置阶梯，失败原因也可能不同（160K 是 `oom`，而机器被逼到墙角之后 144K 完全可能变成 `trial_error`）。`summary.md` 的 Notes 列因此写成 `capped by oom at 144,000 tokens`，而不只是 `capped by oom`。
+
+### 11.3 扫描本身必须活过它的被测对象
+
+这个工具的职责就是把机器压到崩，所以它必须能在机器正在崩的时候继续工作。修复前它做不到：64 GB 机器上扫描测完 64K/96K/128K 通过、160K/144K 失败之后，在细化阶段结束、**什么都没写**，`summary.md` 里留着的还是上一次 `--dry-run` 的结果——报告该模型 **160,000 tokens PASS**，与紧接其前的十二分钟真实试验测出的结论完全相反，还带着一个看上去很正常的时间戳。看起来是新的过期报告比没有报告更糟。
+
+三处改动，都不会让扫描提前停止：
+
+- **summary 持续重写**：任何模型开始之前先写一次（每个候选模型都是显式的 `not run` 行），每个模型结束后再写一次，最后在 `finally` 里再写一次——`finally` 同时覆盖 Ctrl-C 和未捕获异常。`summary.json` 带 `completed: true|false`，`summary.md` 在扫描完成前带「Run in progress or ended early」横幅。
+- **父进程自身跑不动的阶梯变成该阶梯的一行记录**，分类为 `trial_error`，而不是把整个扫描掀翻。启动一次试验本身也需要机器挤出内存（spawn 一个新解释器并重新导入整个 OpenVINO 栈），而细化恰好紧跟在把内存榨干的那个阶梯之后。细化阶段出现的 `trial_error` **不会**顶替已经测到的容量原因：`capped by oom at 144,000 tokens` 才是扫描的结论，`capped by trial_error at 136,000 tokens` 会把它埋掉。两种情况下 `max_stable_context` 相同，跑不动的那一步仍然在控制台输出和 `trials.csv` 里。
+- **每次试验开始前就打印一行**，而不是只在结束后打印。128K 以上单步就要几分钟，找到上限的那一步又是最慢的一步，只在完成时打印会让正在运行的扫描和卡死的扫描在最长 `trial_timeout_sec`（默认 20 分钟）内无法区分。所有输出都 flush，因为重定向到日志时 stdout 是块缓冲的。
+
+此外，`_wait_for_memory_settle()` 放弃等待时现在会打印告警：这不致命，但它意味着下一次试验的基线被污染、weights/KV 拆分会算错，不应该以「测量值」的身份静默通过。
+
+### 11.4 dry-run
 
 `--dry-run` 使用由模型名确定的伪上限生成稳定结果：
 
@@ -572,7 +706,7 @@ $$
 - `tokens_per_second`；
 - SLA 与 GPU 压力阈值；
 - `latency_limit_exceeded`；
-- `peak_gpu_pct` 与 `gpu_memory_at_limit`；
+- `peak_gpu_pct`、`gpu_memory_at_limit` 与 `host_memory_at_limit`（§10.1.1）；
 - `expected_kv_gpu_gb` 与 `kv_overhead_ratio`（§9.2.1，模型 `config.json` 可解析时才有值，否则为 `None`）；
 - CSV 中的模型、设备、权重格式、磁盘权重和最终状态。
 
@@ -584,18 +718,18 @@ $$
 
 ### 12.3 `summary.json`
 
-扫描结束后覆盖写入，包含：
+在任何模型开始之前、每个模型结束之后、以及 `finally` 中各覆盖写入一次（§11.3），包含：
 
-- 生成时间；
+- 生成时间与 `completed` 标志；
 - 目标 token、probe token、生成 SLA；
 - 当前硬件信息；
-- 每个模型的最大稳定上下文、是否达标、最大稳定点内存和失败原因。
+- 每个模型的最大稳定上下文、是否达标、最大稳定点内存、失败原因 `failure_reason` 及其对应的 `failure_tokens`。尚未跑到的模型为 `status: "not_run"`。
 
-内存字段来自“最大已通过点”，不是首次失败点。`failure_reason` 则来自其后的首次失败，因此一个已经达到目标的模型仍可能有失败原因，表示工具继续探测到了更高容量边界。
+内存字段来自“最大已通过点”，不是首次失败点。`failure_reason` 则来自其后的首次失败（细化后是细化过程中最小的那个失败点），因此一个已经达到目标的模型仍可能有失败原因，表示工具继续探测到了更高容量边界。
 
 ### 12.4 `summary.md`
 
-面向人工阅读，展示每个模型的设备、权重格式、最大稳定上下文、是否达到目标、磁盘权重、峰值内存和说明。
+面向人工阅读，展示每个模型的设备、权重格式、最大稳定上下文、是否达到目标、磁盘权重、峰值内存和说明。扫描未完成时（`completed: false`）表格上方会带一条「Run in progress or ended early」横幅，未跑到的模型显示为 `not run`。
 
 `meets_target` 的计算为：
 
@@ -603,7 +737,7 @@ $$
 meets\_target = max\_stable\_context \ge target\_context\_tokens
 $$
 
-由于 `max_stable_context` 只取实际测试过的点，如果阶梯没有包含目标附近的足够密度，报告会偏保守。例如最后通过 144K、下一点 176K 失败，并不能直接证明 160K 失败；应把 160K 加入阶梯或使用 refine。
+由于 `max_stable_context` 只取实际测试过的点，如果阶梯没有包含目标附近的足够密度，报告会偏保守。例如最后通过 144K、下一点 176K 失败，并不能直接证明 160K 失败；应把 160K 加入阶梯，或依靠默认开启的二分细化。
 
 ## 13. 完整调用链
 
@@ -640,7 +774,7 @@ main()
 │                   └── merge memory metrics
 │           ├── _append_trial_row()
 │           ├── _passed()
-│           └── optional _refine_boundary()
+│           └── _refine_boundary()（默认执行，--no-refine 跳过）
 └── _write_summary()
     ├── summary.json
     └── summary.md
@@ -654,25 +788,27 @@ main()
 |---|---|
 | `test_context_validation_context_builder.py` | 0 token、固定长度构造、160K 大输入、模板开销排除 user content、完整 prompt 命中目标。 |
 | `test_context_validation_output.py` | 接受自然语言；拒绝标点、特殊 token 和单字符重复输出。 |
-| `test_context_validation_policy.py` | 正常通过、慢但无 GPU 压力仍通过、慢且内存饱和失败、SLA 等号边界通过。 |
+| `test_context_validation_policy.py` | 正常通过、慢但无 GPU 压力仍通过、慢且内存饱和失败、SLA 等号边界通过；§7.4 / §10.1.1 / §10.2 的分类修复：OpenCL 设备崩溃识别为 `gpu_abort`、显式 OpenCL 分配失败识别为 `oom`、无余量时 `gpu_abort`/`crashed` 升级为 `oom`、有余量时不升级、任何情况下都不再是 `generate_error`、宿主机余量低水位驱动的内存压力判定。 |
 | `test_context_validation_kv_estimate.py` | 无 `layer_types` 的稠密模型全层计数、Qwen3.5-9B 形态的混合线性注意力只统计 `full_attention` 层、VLM 的 `text_config` 嵌套读取、缺字段返回 `None`、自定义 KV 精度字节数。 |
+| `test_context_validation_trial_lifecycle.py` | §7.5 / §8.3.1 的崩溃修复：子进程「先上报再 `os._exit(0)`」的调用顺序、上报失败仍然退出、`run_trial` 里不再出现 `del pipe`/`gc.collect`、父进程补捞与退出赛跑的 `done`、补捞到的 `loaded` 不产生伪内存快照、真崩溃仍归类为 `crashed`、退出码解码、内存沉降等待的成功与超时两条路径。 |
+| `test_context_validation_reporting.py` | §11.3 的扫描存活性：父进程侧异常变成该阶梯的 `trial_error` 行且仍可写入 CSV、扫描中途死亡时上一次运行的过期报告被替换并标记未完成、Ctrl-C 同样留下报告、正常完成标记 `completed` 且 Notes 写出失败点 token 数。 |
 
-测试使用轻量 `FakeTokenizer`，因此不会下载模型或引入 OpenVINO 环境依赖。
+测试使用轻量 `FakeTokenizer`，因此不会下载模型或引入 OpenVINO 环境依赖。生命周期测试用假的 `multiprocessing` context、假队列和假进程复现时序，同样不启动真实子进程。
 
 推荐验证命令：
 
 ```powershell
 Set-Location smart-classroom
-python -m unittest components.tests.test_context_validation_context_builder components.tests.test_context_validation_output components.tests.test_context_validation_policy components.tests.test_context_validation_kv_estimate
+python -m unittest components.tests.test_context_validation_context_builder components.tests.test_context_validation_output components.tests.test_context_validation_policy components.tests.test_context_validation_kv_estimate components.tests.test_context_validation_trial_lifecycle components.tests.test_context_validation_reporting
 ```
 
 还可以执行以下 dry-run 作为编排层集成检查：
 
 ```powershell
-.\components\llm\context_validation\run_validate_long_context.ps1 --dry-run --refine
+.\components\llm\context_validation\run_validate_long_context.ps1 --dry-run
 ```
 
-当前自动化测试没有覆盖的高风险区域包括：真实 `multiprocessing spawn` 生命周期、queue 事件丢失、Windows GPU counter、OpenVINO LLM/VLM pipeline 选择、真实 tokenizer 回退，以及报告在多次运行下的 CSV 追加行为。
+当前自动化测试没有覆盖的高风险区域包括：真实 `multiprocessing spawn` 生命周期（生命周期测试用假 context 复现时序，不启动真实子进程）、Windows GPU counter、OpenVINO LLM/VLM pipeline 选择、真实 tokenizer 回退，以及报告在多次运行下的 CSV 追加行为。
 
 ## 15. 核心设计思想总结
 
@@ -687,6 +823,8 @@ python -m unittest components.tests.test_context_validation_context_builder comp
 ### 15.3 用进程边界处理 native 失败
 
 OpenVINO、GPU 驱动和大内存分配的失败不一定能被 Python 安全恢复。独立进程让退出本身成为资源回收与故障隔离机制。
+
+推论有两条，都是 §7.5 那次崩溃换来的：既然回收靠进程退出，子进程就**不该**再自己析构 pipeline——在内存耗尽状态下析构 GPU infer request 会从析构函数里抛出 `ov::Exception`，直接 `std::terminate`，而 Python 层根本接不住；既然 native 失败随时可能发生，**结果就必须先于任何清理动作送出去**，否则一次已经算完的测量会被清理阶段的崩溃一并带走，把「这台机器 160K 到底行不行」变成「不知道」。
 
 ### 15.4 用阶段事件分解内存
 
@@ -731,8 +869,9 @@ OpenVINO、GPU 驱动和大内存分配的失败不一定能被 Python 安全恢
 |---|---|
 | CLI 入口 | `validate_long_context.main`, `_parse_args`, `_load_settings` |
 | 模型扫描 | `_sweep_model`, `_run_one`, `_refine_boundary` |
-| 子进程控制 | `_run_trial_subprocess` |
-| 内存采样 | `_read_mem`, `_MemorySampler`, `_delta` |
+| 子进程控制 | `_run_trial_subprocess`, `_crash_reason` |
+| 子进程退出 | `trial_runner._post_result_and_exit` |
+| 内存采样 | `_read_mem`, `_MemorySampler`, `_delta`, `_wait_for_memory_settle` |
 | 理论 KV 估算 | `_load_model_config`, `_theoretical_kv_bytes_per_token` |
 | 策略判断 | `_passed`, `_resource_limit_reached`, `_classify_failure` |
 | 单次推理 | `trial_runner.run_trial` |

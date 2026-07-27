@@ -24,7 +24,7 @@ start-smart-classroom.ps1's own venv convention):
 
     .\\components\\llm\\context_validation\\run_validate_long_context.ps1
     .\\components\\llm\\context_validation\\run_validate_long_context.ps1 --dry-run
-    .\\components\\llm\\context_validation\\run_validate_long_context.ps1 --models Qwen/Qwen3-8B --refine
+    .\\components\\llm\\context_validation\\run_validate_long_context.ps1 --models Qwen/Qwen3-8B
 
 Equivalent, if you already have the right interpreter active (run from the
 smart-classroom/ directory so relative model paths resolve):
@@ -38,6 +38,7 @@ from __future__ import annotations
 
 import argparse
 import contextlib
+import ctypes
 import gc
 import importlib.util
 import json
@@ -47,6 +48,7 @@ import re
 import sys
 import threading
 import time
+import traceback
 from datetime import datetime
 from queue import Empty
 
@@ -76,6 +78,32 @@ _MODEL_IR_RE = re.compile(r"(.*)?openvino(.*)?_model(.*)?\.xml$")
 _TOKENIZER_IR_NAME = "openvino_tokenizer.xml"
 _DETOKENIZER_IR_NAME = "openvino_detokenizer.xml"
 
+# Windows exit codes a trial child can die with that mean "a native runtime aborted", not "the
+# program chose to exit". Decoded onto the reported error so `crashed:exitcode=3221226505` isn't
+# an opaque number -- the tool's whole failure story at the capacity ceiling is told through it.
+_NATIVE_ABORT_EXIT_CODES = {
+    3221226505: "0xC0000409 STATUS_STACK_BUFFER_OVERRUN - how the CRT reports abort()/std::terminate",
+    3221225477: "0xC0000005 STATUS_ACCESS_VIOLATION",
+    3221225725: "0xC00000FD STATUS_STACK_OVERFLOW",
+}
+
+# After a trial child exits, its RAM/GPU allocations are reclaimed by the OS rather than by
+# OpenVINO's own teardown (see trial_runner._post_result_and_exit), and the Windows PDH GPU
+# counters this tool reads are themselves sampled, so both lag the process a little. The next
+# trial's baseline is taken the moment this one returns, so wait -- briefly and with a cap -- for
+# usage to come back down, or the previous trial's memory gets charged to the next trial's weights.
+_MEMORY_SETTLE_TIMEOUT_SEC = 30.0
+_MEMORY_SETTLE_TOLERANCE_GB = 1.0
+
+# What "the box had nothing left to give" looks like in the low-water marks the sampler already
+# records. This is read *after* a trial, from what that trial measured -- it never cancels a trial
+# and never predicts one (§3.2.1); it only names the failure a trial actually produced. Both forms
+# are needed: the absolute figure catches a large machine where a comfortable-looking percentage
+# still hides a wall (63.2% of a 64 GB box was 1.9 GB free when the GPU aborted), and the
+# percentage catches a small one where 3 GB free is plenty of room.
+_MEMORY_EXHAUSTED_FREE_RAM_GB = 3.0
+_MEMORY_EXHAUSTED_RAM_PCT = 95.0
+
 # Measured kv_gpu_gb / expected_kv_gpu_gb at or above this is called out in the summary notes as a
 # scope mismatch between the two numbers (persistent-cache-only estimate vs. all post-load growth)
 # rather than a plain capacity limit -- see _theoretical_kv_bytes_per_token()'s docstring and the
@@ -99,11 +127,14 @@ TRIAL_CSV_FIELDS = [
     "gpu_memory_pressure_pct",
     "peak_gpu_pct",
     "gpu_memory_at_limit",
+    "host_memory_at_limit",
     "weight_disk_gb",
     "weight_ram_gb",
     "kv_ram_gb",
     "peak_ram_gb",
     "peak_ram_pct",
+    "min_available_ram_gb",
+    "min_commit_available_gb",
     "weight_gpu_gb",
     "kv_gpu_gb",
     "expected_kv_gpu_gb",
@@ -124,13 +155,37 @@ TRIAL_CSV_FIELDS = [
 # ---------------------------------------------------------------------------
 def _read_mem() -> dict:
     ram_used = ram_total = ram_pct = 0.0
+    available_ram = None
     try:
         import psutil
 
         vm = psutil.virtual_memory()
         ram_used, ram_total, ram_pct = vm.used / (1024 ** 3), vm.total / (1024 ** 3), vm.percent
+        available_ram = vm.available / (1024 ** 3)
     except Exception:
         pass
+    commit_available = None
+    if sys.platform == "win32":
+        try:
+            class _MemoryStatusEx(ctypes.Structure):
+                _fields_ = [
+                    ("dwLength", ctypes.c_ulong),
+                    ("dwMemoryLoad", ctypes.c_ulong),
+                    ("ullTotalPhys", ctypes.c_ulonglong),
+                    ("ullAvailPhys", ctypes.c_ulonglong),
+                    ("ullTotalPageFile", ctypes.c_ulonglong),
+                    ("ullAvailPageFile", ctypes.c_ulonglong),
+                    ("ullTotalVirtual", ctypes.c_ulonglong),
+                    ("ullAvailVirtual", ctypes.c_ulonglong),
+                    ("ullAvailExtendedVirtual", ctypes.c_ulonglong),
+                ]
+
+            status = _MemoryStatusEx()
+            status.dwLength = ctypes.sizeof(status)
+            if ctypes.windll.kernel32.GlobalMemoryStatusEx(ctypes.byref(status)):
+                commit_available = status.ullAvailPageFile / (1024 ** 3)
+        except (AttributeError, OSError):
+            pass
     gpu_gb = 0.0
     try:
         from monitoring.scripts.windows.collect_gpu import get_gpu_memory_total
@@ -140,11 +195,27 @@ def _read_mem() -> dict:
             gpu_gb = used_mb / 1024
     except Exception:
         pass
-    return {"ram_gb": ram_used, "ram_total_gb": ram_total, "ram_pct": ram_pct, "gpu_gb": gpu_gb}
+    return {
+        "ram_gb": ram_used,
+        "ram_total_gb": ram_total,
+        "ram_pct": ram_pct,
+        "available_ram_gb": available_ram,
+        "commit_available_gb": commit_available,
+        "gpu_gb": gpu_gb,
+    }
 
 
 class _MemorySampler(threading.Thread):
-    """Tracks peak (and latest) system RAM / GPU usage while a trial runs."""
+    """Tracks peak (and latest) system RAM / GPU usage while a trial runs, plus the
+    low-water mark of free physical RAM and Windows commit capacity.
+
+    The low-water marks are pure instrumentation: nothing acts on them mid-trial.
+    An earlier revision aborted a trial when they crossed a configured reserve,
+    which turned "how much headroom was left" into an unanswerable question --
+    the trial that would have told you never ran. Reporting the minimum instead
+    answers it directly: a step that passes with 7 GB still free is a step with
+    real headroom above it, and one that passes with 0.3 GB free is at the wall.
+    """
 
     def __init__(self, interval: float = 0.5):
         super().__init__(daemon=True)
@@ -153,15 +224,30 @@ class _MemorySampler(threading.Thread):
         self.peak_ram = 0.0
         self.peak_ram_pct = 0.0
         self.peak_gpu = 0.0
+        self.min_available_ram = None
+        self.min_commit_available = None
         self.latest = _read_mem()
+        self._observe(self.latest)
+
+    def _observe(self, m: dict) -> None:
+        self.peak_ram = max(self.peak_ram, m["ram_gb"])
+        self.peak_ram_pct = max(self.peak_ram_pct, m["ram_pct"])
+        self.peak_gpu = max(self.peak_gpu, m["gpu_gb"])
+        for key, attr in (
+            ("available_ram_gb", "min_available_ram"),
+            ("commit_available_gb", "min_commit_available"),
+        ):
+            value = m.get(key)
+            if value is None:
+                continue
+            current = getattr(self, attr)
+            setattr(self, attr, value if current is None else min(current, value))
 
     def run(self):
         while not self._stop_event.is_set():
             m = _read_mem()
             self.latest = m
-            self.peak_ram = max(self.peak_ram, m["ram_gb"])
-            self.peak_ram_pct = max(self.peak_ram_pct, m["ram_pct"])
-            self.peak_gpu = max(self.peak_gpu, m["gpu_gb"])
+            self._observe(m)
             self._stop_event.wait(self.interval)
 
     def stop(self):
@@ -170,6 +256,44 @@ class _MemorySampler(threading.Thread):
 
 def _delta(higher: float, lower: float) -> float:
     return round(max(0.0, higher - lower), 2)
+
+
+def _crash_reason(exitcode) -> str:
+    """Human-readable `crashed:...` error for a child that died without reporting.
+
+    Keeps the `crashed:` prefix `_classify_failure()` matches on, and appends what
+    the exit code means when it's a known native-abort status, so a reader doesn't
+    have to look up 3221226505 to learn the trial was killed by a C++ abort rather
+    than by an ordinary non-zero return.
+    """
+    detail = _NATIVE_ABORT_EXIT_CODES.get(exitcode)
+    return f"crashed:exitcode={exitcode}" + (f":{detail}" if detail else "")
+
+
+def _wait_for_memory_settle(
+    baseline: dict,
+    timeout_sec: float = _MEMORY_SETTLE_TIMEOUT_SEC,
+    tolerance_gb: float = _MEMORY_SETTLE_TOLERANCE_GB,
+    interval: float = 0.5,
+) -> bool:
+    """Block until the finished trial's memory is actually back to the OS.
+
+    Returns True once RAM *and* GPU usage are within `tolerance_gb` of the
+    pre-trial baseline, or False if `timeout_sec` elapses first -- the timeout is
+    not an error, it just means something else on the box is holding memory, and
+    the sweep continues either way rather than stalling on an unmet condition.
+    """
+    deadline = time.monotonic() + timeout_sec
+    while True:
+        current = _read_mem()
+        if (
+            current["ram_gb"] <= baseline["ram_gb"] + tolerance_gb
+            and current["gpu_gb"] <= baseline["gpu_gb"] + tolerance_gb
+        ):
+            return True
+        if time.monotonic() >= deadline:
+            return False
+        time.sleep(interval)
 
 
 def _weight_disk_gb(model_dir: str) -> float:
@@ -322,9 +446,10 @@ def _parse_args():
         help="Override the GPU-used/system-RAM percentage treated as the practical iGPU limit",
     )
     parser.add_argument(
-        "--refine",
+        "--no-refine",
         action="store_true",
-        help="Bisect near the pass/fail boundary to tighten the reported ceiling (up to 3 extra trials per model)",
+        help="Skip the bisection between the last pass and the first failure. Refinement is on by "
+        "default because the point of the sweep is the actual ceiling, not the nearest step below it.",
     )
     parser.add_argument(
         "--dry-run",
@@ -369,7 +494,7 @@ def _load_settings(args) -> dict:
         ),
         "trial_timeout_sec": lcv.trial_timeout_sec,
         "output_dir": args.output_dir or lcv.output_dir,
-        "refine": args.refine,
+        "refine": not args.no_refine,
     }
 
 
@@ -419,15 +544,43 @@ def _passed(result: dict) -> bool:
     )
 
 
+def _host_memory_exhausted(result: dict) -> bool:
+    """Did this trial drive the *box* out of memory, per the sampler's low-water marks?
+
+    `gpu_memory_at_limit` alone cannot answer this. It compares peak GPU usage against total
+    system RAM, and on a shared-memory iGPU that ratio has no route to its 90% default -- the
+    host needs the rest of the machine. Every failing trial observed on the 64 GB box sat between
+    63% and 69%, so the flag never fired, and with it `too_slow` was unreachable and a device
+    abort had no memory evidence attached. The headroom the sampler measures does answer it:
+    1.9 GB of free RAM at 97.1% used is the wall, whatever the GPU-versus-RAM ratio says.
+    """
+    free_ram = result.get("min_available_ram_gb")
+    peak_ram_pct = result.get("peak_ram_pct")
+    return bool(
+        (free_ram is not None and free_ram <= _MEMORY_EXHAUSTED_FREE_RAM_GB)
+        or (peak_ram_pct is not None and peak_ram_pct >= _MEMORY_EXHAUSTED_RAM_PCT)
+    )
+
+
+def _memory_at_limit(result: dict) -> bool:
+    """True when either memory ceiling -- shared-GPU or host -- was reached during the trial.
+
+    Host exhaustion is recomputed from the trial's own numbers rather than read back from the
+    `host_memory_at_limit` column, so classification never depends on that column having been
+    filled in first.
+    """
+    return bool(result.get("gpu_memory_at_limit")) or _host_memory_exhausted(result)
+
+
 def _resource_limit_reached(result: dict) -> bool:
-    """A soft latency breach is a capacity failure only with GPU memory pressure."""
+    """A soft latency breach is a capacity failure only under memory pressure."""
     generate_time = result.get("generate_time_s")
     max_generate_time = result.get("max_generate_time_sec")
     return bool(
         max_generate_time is not None
         and generate_time is not None
         and generate_time > max_generate_time
-        and result.get("gpu_memory_at_limit") is True
+        and _memory_at_limit(result)
     )
 
 
@@ -442,15 +595,34 @@ def _error_classification(error: str) -> str:
 
 
 def _classify_failure(result: dict) -> str:
+    """Name the failure, using the memory the parent measured to resolve what the child couldn't.
+
+    A GPU device abort (`gpu_abort`, e.g. OpenCL -14) is the ambiguous case: the child only knows
+    the device killed the command, so this promotes it to `oom` when -- and only when -- the
+    trial's own measurements show the memory was gone. Same for a native abort that killed the
+    child outright (`crashed`). Without that promotion, the single most important row the sweep
+    produces -- the step that establishes the ceiling -- was labelled `generate_error`, which
+    reads as "the tool hit an unexplained error" rather than "this box ran out of memory here".
+    """
     error = str(result.get("error") or "")
-    if error == "timeout" or error.startswith("crashed"):
-        return error.split(":")[0]
-    is_oom = _error_classification(error) == "oom"
+    if error.startswith("trial_error"):
+        return "trial_error"
+    if error == "timeout":
+        return "timeout"
+    if error.startswith("crashed"):
+        return "oom" if _memory_at_limit(result) else "crashed"
+    classification = _error_classification(error)
+    is_gpu_abort = classification == "gpu_abort"
+    is_oom = classification == "oom" or (is_gpu_abort and _memory_at_limit(result))
     if not result.get("load_ok"):
-        return "oom" if is_oom else "load_error"
+        if is_oom:
+            return "oom"
+        return "gpu_abort" if is_gpu_abort else "load_error"
     if not result.get("generate_ok"):
         if is_oom:
             return "oom"
+        if is_gpu_abort:
+            return "gpu_abort"
         if error == "no_output":
             return "no_output"
         return "generate_error"
@@ -511,12 +683,37 @@ def _format_trial_line(model_name: str, tokens: int, result: dict) -> str:
             seg += ")"
         parts.append(seg)
 
-    if result.get("latency_limit_exceeded") and not result.get("gpu_memory_at_limit"):
-        parts.append("latency budget exceeded without GPU memory saturation")
+    # How close the box actually came to the wall -- the number the removed
+    # memory guard used to spend a trial guessing at instead of measuring.
+    if result.get("min_available_ram_gb") is not None:
+        seg = f"min free RAM {result['min_available_ram_gb']:.1f} GB"
+        if result.get("min_commit_available_gb") is not None:
+            seg += f" (commit {result['min_commit_available_gb']:.1f} GB)"
+        parts.append(seg)
+
+    if result.get("latency_limit_exceeded") and not _memory_at_limit(result):
+        parts.append("latency budget exceeded without memory saturation")
 
     if not passed and result.get("error"):
         parts.append(f"error={result.get('error')}")
     return "  |  ".join(parts)
+
+
+def _print_trial_start(model_name: str, tokens: int, settings: dict, indent: str = "") -> None:
+    """Announce a trial before it runs, not only after.
+
+    A single step at 128K+ takes minutes, and the step that finds the ceiling is the slowest of
+    all -- it thrashes first and then dies. Printing only on completion makes that indis-
+    tinguishable from a hung sweep for as long as `trial_timeout_sec` (20 minutes by default),
+    which is how the run this fixes was read as "it crashed". `flush` because stdout is
+    block-buffered whenever the sweep is piped or redirected to a log.
+    """
+    print(
+        f"{indent}[{model_name}] {tokens:>9,} tok -> running "
+        f"(load + prefill + {settings['probe_tokens']} tok decode, timeout "
+        f"{settings['trial_timeout_sec']:g}s) ...",
+        flush=True,
+    )
 
 
 def _fake_ceiling_tokens(model_name: str, steps: list) -> int:
@@ -547,6 +744,8 @@ def _run_trial_dry_run(model_name: str, tokens: int, probe_tokens: int, fake_cei
         "kv_gpu_gb": kv_gpu,
         "peak_ram_gb": round(2.0 + weight_ram + kv_ram, 2),
         "peak_ram_pct": 50.0,
+        "min_available_ram_gb": round(max(0.0, 64.0 - (2.0 + weight_ram + kv_ram)), 2),
+        "min_commit_available_gb": round(max(0.0, 72.0 - (2.0 + weight_ram + kv_ram)), 2),
         "peak_gpu_gb": peak_gpu,
         "ram_total_gb": 64.0,
         "error": None if ok else "generate:oom:allocation failed (dry-run)",
@@ -561,8 +760,18 @@ def _run_trial_subprocess(
     probe_tokens: int,
     timeout_sec: int,
     sample_interval: float = 0.5,
-    poll_interval: float = 2.0,
+    poll_interval: float = 0.25,
+    drain_timeout: float = 5.0,
 ) -> dict:
+    """Run one trial to completion, OOM, native abort, or the hard timeout.
+
+    Nothing here stops the child early on a memory threshold: the whole point of
+    the sweep is to find where this box actually breaks, so the trial is allowed
+    to run until the hardware (or `timeout_sec`) decides the outcome. Subprocess
+    isolation is what makes that safe -- a native GPU allocation abort near
+    shared-memory exhaustion kills only this child, and the parent's sampler has
+    already recorded the memory high-water mark that explains why.
+    """
     baseline = _read_mem()
     sampler = _MemorySampler(interval=sample_interval)
     sampler.start()
@@ -576,20 +785,37 @@ def _run_trial_subprocess(
     process.start()
 
     loaded_mem = None
+    load_ok = False
     result = None
+
+    def _consume(msg: dict, child_alive: bool) -> bool:
+        """Apply one child message; True once the terminal "done" has arrived."""
+        nonlocal loaded_mem, load_ok, result
+        event = msg.get("event")
+        if event == "loaded":
+            load_ok = True
+            # Snapshot the weight footprint before prefill grows it. Only meaningful
+            # while the child still holds the weights, so a "loaded" recovered from
+            # the post-mortem drain below records load_ok without a memory reading
+            # rather than attributing a dead child's footprint to its weights.
+            if child_alive and loaded_mem is None:
+                loaded_mem = _read_mem()
+        elif event == "done":
+            result = msg
+            load_ok = load_ok or bool(msg.get("load_ok"))
+            return True
+        return False
+
     deadline = time.monotonic() + timeout_sec
-    while time.monotonic() < deadline:
+    while result is None and time.monotonic() < deadline:
         try:
             msg = result_queue.get(timeout=poll_interval)
         except Empty:
             if not process.is_alive():
-                break  # child exited without a "done" message -> crash
-            continue
-        if msg.get("event") == "loaded":
-            loaded_mem = _read_mem()  # snapshot the weight footprint before prefill grows it
-        elif msg.get("event") == "done":
-            result = msg
-            break
+                break  # child exited; anything it queued is recovered by the drain below
+        else:
+            if _consume(msg, child_alive=True):
+                break
 
     timed_out = result is None and time.monotonic() >= deadline
     if process.is_alive():
@@ -598,9 +824,48 @@ def _run_trial_subprocess(
     sampler.stop()
     sampler.join(2 * sample_interval + 1)
 
+    if result is None:
+        # The child posts its result and then exits immediately, without running
+        # OpenVINO's teardown (trial_runner._post_result_and_exit), so a finished
+        # trial's message can land in the pipe in the window between the poll above
+        # timing out and is_alive() going False. Drain what's left instead of
+        # reporting a completed measurement as a crash.
+        drain_deadline = time.monotonic() + drain_timeout
+        while time.monotonic() < drain_deadline:
+            try:
+                msg = result_queue.get(timeout=poll_interval)
+            except Empty:
+                break
+            if _consume(msg, child_alive=False):
+                timed_out = False
+                break
+
+    # Reclamation now happens on process exit rather than in OpenVINO's destructors,
+    # so let it land before the next trial reads its baseline (see the constants). Giving up
+    # is not fatal, but it does mean the next trial's baseline is polluted and its weight/KV
+    # split will be wrong, so say so rather than letting a bad number look like a measurement.
+    if not _wait_for_memory_settle(baseline):
+        current = _read_mem()
+        print(
+            f"  [warn] memory has not returned to the pre-trial baseline after "
+            f"{_MEMORY_SETTLE_TIMEOUT_SEC:g}s (RAM {current['ram_gb']:.1f} GB vs "
+            f"{baseline['ram_gb']:.1f} GB, GPU {current['gpu_gb']:.1f} GB vs "
+            f"{baseline['gpu_gb']:.1f} GB); the next trial's weights/kv split may be charged "
+            "with what is left over",
+            flush=True,
+        )
+
     mem = {
         "peak_ram_gb": round(sampler.peak_ram, 2),
         "peak_ram_pct": round(sampler.peak_ram_pct, 1),
+        "min_available_ram_gb": (
+            round(sampler.min_available_ram, 2) if sampler.min_available_ram is not None else None
+        ),
+        "min_commit_available_gb": (
+            round(sampler.min_commit_available, 2)
+            if sampler.min_commit_available is not None
+            else None
+        ),
         "peak_gpu_gb": round(sampler.peak_gpu, 2),
         "weight_ram_gb": _delta(loaded_mem["ram_gb"], baseline["ram_gb"]) if loaded_mem else None,
         "weight_gpu_gb": _delta(loaded_mem["gpu_gb"], baseline["gpu_gb"]) if loaded_mem else None,
@@ -614,10 +879,19 @@ def _run_trial_subprocess(
         result.update(mem)
         return result
 
-    reason = "timeout" if timed_out else f"crashed:exitcode={process.exitcode}"
+    # A native GPU allocation abort near shared-memory exhaustion kills the child
+    # without a Python exception, so it surfaces here as `crashed` rather than
+    # `oom`. Reaching this point now means the abort happened *before* the child
+    # could report -- i.e. during load, prefill or decode, which is a real capacity
+    # ceiling -- because a post-result teardown abort can no longer occur (the child
+    # skips the teardown) and a result racing the child's exit is recovered by the
+    # drain above. The memory columns still explain it either way: the sampler
+    # recorded the peak and the low-water headroom from the parent, which survives
+    # the child.
+    reason = "timeout" if timed_out else _crash_reason(process.exitcode)
     return {
         "tokens_requested": tokens,
-        "load_ok": loaded_mem is not None,  # crashed/hung during generate, not load
+        "load_ok": load_ok,  # crashed/hung during generate, not load
         "load_time_s": None,
         "generate_ok": False,
         "prompt_tokens": 0,
@@ -628,18 +902,43 @@ def _run_trial_subprocess(
     }
 
 
+def _failed_to_run_result(tokens: int, exc: Exception) -> dict:
+    """A step the orchestrator itself could not carry out, recorded as that step's failure.
+
+    Running the sweep is not free: each trial spawns a fresh interpreter that re-imports the
+    OpenVINO stack, and the sweep deliberately keeps going until the box breaks, so the spawn
+    can be what breaks. Letting that exception unwind would discard every measurement already
+    taken along with the report -- which is exactly what happened on the 64 GB box, where the
+    sweep died during refinement and left `summary.md` still describing an earlier `--dry-run`.
+    """
+    return {
+        "tokens_requested": tokens,
+        "load_ok": False,
+        "load_time_s": None,
+        "generate_ok": False,
+        "prompt_tokens": 0,
+        "generated_tokens": 0,
+        "generate_time_s": None,
+        "error": f"trial_error:{type(exc).__name__}:{exc}",
+    }
+
+
 def _run_one(model_name, model_dir, device, tokens, settings, dry_run, fake_ceiling, kv_bytes_per_token=None):
     if dry_run:
         result = _run_trial_dry_run(model_name, tokens, settings["probe_tokens"], fake_ceiling)
     else:
-        result = _run_trial_subprocess(
-            model_name,
-            model_dir,
-            device,
-            tokens,
-            settings["probe_tokens"],
-            settings["trial_timeout_sec"],
-        )
+        try:
+            result = _run_trial_subprocess(
+                model_name,
+                model_dir,
+                device,
+                tokens,
+                settings["probe_tokens"],
+                settings["trial_timeout_sec"],
+            )
+        except Exception as exc:  # noqa: BLE001 - recorded as this step's failure, see helper
+            traceback.print_exc()
+            result = _failed_to_run_result(tokens, exc)
     generate_time = result.get("generate_time_s")
     generated_tokens = result.get("generated_tokens", 0)
     result["tokens_per_second"] = (
@@ -659,6 +958,7 @@ def _run_one(model_name, model_dir, device, tokens, settings, dry_run, fake_ceil
         result["peak_gpu_pct"] is not None
         and result["peak_gpu_pct"] >= settings["gpu_memory_pressure_pct"]
     )
+    result["host_memory_at_limit"] = _host_memory_exhausted(result)
     if kv_bytes_per_token and result.get("prompt_tokens"):
         expected_kv_gb = kv_bytes_per_token * result["prompt_tokens"] / (1024 ** 3)
         result["expected_kv_gpu_gb"] = round(expected_kv_gb, 2)
@@ -674,14 +974,28 @@ def _refine_boundary(
     model_name, model_dir, device, settings, low, high, dry_run, fake_ceiling, weight_disk,
     kv_bytes_per_token=None, max_extra=3,
 ):
+    """Bisect between the last pass (`low`) and the first failure (`high`).
+
+    Returns ``(highest_pass, best_result, lowest_failure)``, where `lowest_failure` is
+    ``{"tokens", "reason"}`` for the smallest context refinement saw fail, or None if every
+    refinement trial passed. The summary quotes it, because after refinement the context this
+    box actually broke at is no longer the configured step that first failed -- and the reason
+    can differ too (`oom` at 160K, but the run this fixes could equally have produced a
+    `trial_error` at 144K once the box was that close to the wall).
+    """
     lo, hi = low, high
     smallest_step = settings["context_steps_tokens"][0]
     best_result = None
+    lowest_failure = None
     for _ in range(max_extra):
         if hi - lo <= max(1, smallest_step // 8):
             break
         mid = (lo + hi) // 2
-        result = _run_one(model_name, model_dir, device, mid, settings, dry_run, fake_ceiling, kv_bytes_per_token)
+        _print_trial_start(model_name, mid, settings, indent="  ")
+        result = _run_one(
+            model_name, model_dir, device, mid, settings, dry_run, fake_ceiling,
+            kv_bytes_per_token,
+        )
         _append_trial_row(
             settings["output_dir"],
             {
@@ -693,11 +1007,13 @@ def _refine_boundary(
             },
         )
         passed = _passed(result)
-        print("  " + _format_trial_line(model_name, mid, result))
+        print("  " + _format_trial_line(model_name, mid, result), flush=True)
         if passed:
             best_result = result
+        else:
+            lowest_failure = {"tokens": mid, "reason": _classify_failure(result)}
         lo, hi = (mid, hi) if passed else (lo, mid)
-    return lo, best_result
+    return lo, best_result, lowest_failure
 
 
 def _sweep_model(model_name: str, settings: dict, dry_run: bool) -> dict:
@@ -707,7 +1023,7 @@ def _sweep_model(model_name: str, settings: dict, dry_run: bool) -> dict:
 
     if not dry_run and not _ir_ready(model_dir):
         prep_command = _prep_command(model_name, model_dir, weight_format)
-        print(f"[{model_name}] IR not found at {model_dir}\n  Run first: {prep_command}")
+        print(f"[{model_name}] IR not found at {model_dir}\n  Run first: {prep_command}", flush=True)
         return {
             "model": model_name,
             "status": "missing_ir",
@@ -719,7 +1035,10 @@ def _sweep_model(model_name: str, settings: dict, dry_run: bool) -> dict:
         }
 
     weight_disk = 0.0 if dry_run else _weight_disk_gb(model_dir)
-    print(f"\n=== {model_name} ===  weights on disk: {_fmt_gb(weight_disk)} ({weight_format})")
+    print(
+        f"\n=== {model_name} ===  weights on disk: {_fmt_gb(weight_disk)} ({weight_format})",
+        flush=True,
+    )
 
     model_config = None if dry_run else _load_model_config(model_dir)
     kv_bytes_per_token = _theoretical_kv_bytes_per_token(model_config) if model_config else None
@@ -734,7 +1053,11 @@ def _sweep_model(model_name: str, settings: dict, dry_run: bool) -> dict:
 
     for tokens in settings["context_steps_tokens"]:
         last_tokens = tokens
-        result = _run_one(model_name, model_dir, device, tokens, settings, dry_run, fake_ceiling, kv_bytes_per_token)
+        _print_trial_start(model_name, tokens, settings)
+        result = _run_one(
+            model_name, model_dir, device, tokens, settings, dry_run, fake_ceiling,
+            kv_bytes_per_token,
+        )
         _append_trial_row(
             settings["output_dir"],
             {
@@ -747,7 +1070,7 @@ def _sweep_model(model_name: str, settings: dict, dry_run: bool) -> dict:
         )
 
         passed = _passed(result)
-        print(_format_trial_line(model_name, tokens, result))
+        print(_format_trial_line(model_name, tokens, result), flush=True)
         if not passed:
             fail_reason = _classify_failure(result)
             completed_all_steps = False
@@ -755,15 +1078,25 @@ def _sweep_model(model_name: str, settings: dict, dry_run: bool) -> dict:
         max_stable = tokens
         max_stable_result = result
 
+    fail_tokens = None
     if completed_all_steps:
         fail_reason = None
-    elif settings["refine"] and max_stable:
-        max_stable, refined_result = _refine_boundary(
-            model_name, model_dir, device, settings, max_stable, last_tokens, dry_run, fake_ceiling, weight_disk,
-            kv_bytes_per_token=kv_bytes_per_token,
-        )
-        if refined_result is not None:
-            max_stable_result = refined_result
+    else:
+        fail_tokens = last_tokens
+        if settings["refine"] and max_stable:
+            max_stable, refined_result, refined_failure = _refine_boundary(
+                model_name, model_dir, device, settings, max_stable, last_tokens, dry_run,
+                fake_ceiling, weight_disk, kv_bytes_per_token=kv_bytes_per_token,
+            )
+            if refined_result is not None:
+                max_stable_result = refined_result
+            # A refinement step the orchestrator could not run is not a capacity measurement, so
+            # it must not displace one: "capped by oom at 144,000" is the sweep's answer, and
+            # "capped by trial_error at 136,000" would bury it. The un-runnable step is still on
+            # the console and in trials.csv, and `max_stable_context` is the same either way.
+            if refined_failure is not None and refined_failure["reason"] != "trial_error":
+                fail_tokens = refined_failure["tokens"]
+                fail_reason = refined_failure["reason"]
 
     peak = max_stable_result or {}
     return {
@@ -771,6 +1104,7 @@ def _sweep_model(model_name: str, settings: dict, dry_run: bool) -> dict:
         "status": "ok",
         "max_stable_context": max_stable,
         "meets_target": max_stable >= settings["target_context_tokens"],
+        "failure_tokens": fail_tokens,
         "device": device,
         "weight_format": weight_format,
         "weight_disk_gb": weight_disk,
@@ -782,13 +1116,32 @@ def _sweep_model(model_name: str, settings: dict, dry_run: bool) -> dict:
         "kv_overhead_ratio": peak.get("kv_overhead_ratio"),
         "peak_ram_gb": peak.get("peak_ram_gb"),
         "peak_gpu_gb": peak.get("peak_gpu_gb"),
+        "min_available_ram_gb": peak.get("min_available_ram_gb"),
+        "min_commit_available_gb": peak.get("min_commit_available_gb"),
         "failure_reason": fail_reason,
     }
 
 
-def _write_summary(output_dir: str, settings: dict, model_reports: list, platform_info: dict) -> None:
+def _write_summary(
+    output_dir: str,
+    settings: dict,
+    model_reports: list,
+    platform_info: dict,
+    completed: bool = True,
+) -> None:
+    """(Re)write summary.json and summary.md for the run so far.
+
+    Called after every model rather than once at the end, and with `completed=False` until the
+    last one lands, because the sweep's whole job is to push the box until it breaks and it can
+    break hard enough to take the orchestrator with it. When that happened on the 64 GB box, no
+    summary was written at all and `summary.md` still held the previous `--dry-run` -- which
+    reported the candidate as a **PASS at 160,000 tokens**, the exact opposite of what twelve
+    minutes of real trials had just measured. A stale report that looks current is worse than
+    no report, so the file on disk always describes the run that is actually happening.
+    """
     summary = {
         "generated_at": datetime.now().isoformat(timespec="seconds"),
+        "completed": completed,
         "target_context_tokens": settings["target_context_tokens"],
         "probe_tokens": settings["probe_tokens"],
         "max_generate_time_sec": settings["max_generate_time_sec"],
@@ -798,9 +1151,20 @@ def _write_summary(output_dir: str, settings: dict, model_reports: list, platfor
     with open(os.path.join(output_dir, "summary.json"), "w", encoding="utf-8") as f:
         json.dump(summary, f, indent=2, ensure_ascii=False)
 
+    incomplete_banner = (
+        []
+        if completed
+        else [
+            "> **Run in progress or ended early.** Rows below cover only the models the sweep "
+            "reached; anything marked `not run` has no measurement yet. `trials.csv` has every "
+            "step that did run.",
+            "",
+        ]
+    )
     lines = [
         "# Long-Context Capacity Validation Summary",
         "",
+        *incomplete_banner,
         f"Generated: {summary['generated_at']}",
         f"Target context: {settings['target_context_tokens']:,} tokens | "
         f"Probe decode: {settings['probe_tokens']} tokens/trial | "
@@ -811,37 +1175,51 @@ def _write_summary(output_dir: str, settings: dict, model_reports: list, platfor
         f"{platform_info.get('iGPU', '--')}",
         "",
         "Memory columns are measured at the max stable context: weights = footprint just after "
-        "load; KV = additional memory prefill+decode added on top; peak = total high-water mark.",
+        "load; KV = additional memory prefill+decode added on top; peak = total high-water mark; "
+        "Min free RAM = low-water mark of available physical RAM, i.e. the real headroom left at "
+        "that context.",
         "",
         "| Model | Device | Weight | Max stable context | Meets target | Weights (disk) | "
-        "Peak RAM | KV RAM | Peak GPU | KV GPU | Expected KV | KV Ratio | Notes |",
-        "|---|---|---|---|---|---|---|---|---|---|---|---|---|",
+        "Peak RAM | KV RAM | Min free RAM | Peak GPU | KV GPU | Expected KV | KV Ratio | Notes |",
+        "|---|---|---|---|---|---|---|---|---|---|---|---|---|---|",
     ]
     for r in model_reports:
+        if r["status"] == "not_run":
+            lines.append(
+                f"| {r['model']} | {r['device']} | {r['weight_format']} | - | - | - | - | - | - | "
+                "- | - | - | - | not run |"
+            )
+            continue
         if r["status"] == "missing_ir":
             lines.append(
-                f"| {r['model']} | {r['device']} | {r['weight_format']} | - | - | - | - | - | - | - | - | - | "
+                f"| {r['model']} | {r['device']} | {r['weight_format']} | - | - | - | - | - | - | - | - | - | - | "
                 f"IR not found; run: `{r['prep_command']}` |"
             )
             continue
         max_ctx = f"{r['max_stable_context']:,}" if r["max_stable_context"] else "0"
         meets = "PASS" if r["meets_target"] else "FAIL"
         ratio = r.get("kv_overhead_ratio")
+        notes = []
+        if r.get("failure_reason"):
+            capped = f"capped by {r['failure_reason']}"
+            if r.get("failure_tokens"):
+                capped += f" at {r['failure_tokens']:,} tokens"
+            notes.append(capped)
         if ratio is not None and ratio >= _KV_OVERHEAD_RATIO_NOTE_THRESHOLD:
-            note = (
+            notes.append(
                 f"kv {ratio:g}x the persistent-cache-only estimate -- expected_kv_gpu_gb counts "
                 "only growing-KV-cache layers, kv_gpu_gb also includes prefill/decode working "
                 "memory across all layers, so a large ratio here is not a capacity problem with "
                 "this box by itself, and not proof of a specific OpenVINO defect either"
             )
-        elif r.get("failure_reason"):
-            note = f"capped by {r['failure_reason']}"
-        else:
-            note = "reached top configured step without failing"
+        if not notes:
+            notes.append("reached top configured step without failing")
+        note = "; ".join(notes)
         lines.append(
             f"| {r['model']} | {r['device']} | {r['weight_format']} | {max_ctx} | {meets} | "
             f"{_fmt_gb(r.get('weight_disk_gb'))} | {_fmt_gb(r.get('peak_ram_gb'))} | "
-            f"{_fmt_gb(r.get('kv_ram_gb'))} | {_fmt_gb(r.get('peak_gpu_gb'))} | "
+            f"{_fmt_gb(r.get('kv_ram_gb'))} | {_fmt_gb(r.get('min_available_ram_gb'))} | "
+            f"{_fmt_gb(r.get('peak_gpu_gb'))} | "
             f"{_fmt_gb(r.get('kv_gpu_gb'))} | {_fmt_gb(r.get('expected_kv_gpu_gb'))} | "
             f"{f'{ratio:g}x' if ratio is not None else '--'} | {note} |"
         )
@@ -885,6 +1263,15 @@ def _preflight_environment_check() -> None:
     raise SystemExit("\n".join(lines))
 
 
+def _pending_model_report(model_name: str, settings: dict) -> dict:
+    return {
+        "model": model_name,
+        "status": "not_run",
+        "device": settings["device"],
+        "weight_format": settings["weight_format"],
+    }
+
+
 def main() -> None:
     args = _parse_args()
     if not args.dry_run:
@@ -893,21 +1280,45 @@ def main() -> None:
     os.makedirs(settings["output_dir"], exist_ok=True)
     platform_info = _safe_platform_info()
 
-    print(f"Long-context capacity validation sweep starting (dry_run={args.dry_run})")
-    print(f"Candidates: {settings['candidate_models']}")
-    print(f"Steps: {settings['context_steps_tokens']}")
+    print(f"Long-context capacity validation sweep starting (dry_run={args.dry_run})", flush=True)
+    print(f"Candidates: {settings['candidate_models']}", flush=True)
+    print(f"Steps: {settings['context_steps_tokens']}", flush=True)
     print(
         f"Target: {settings['target_context_tokens']:,} tokens | "
         f"Probe decode: {settings['probe_tokens']} tok | "
-        f"Max generation: {settings['max_generate_time_sec']:g}s | Output: {settings['output_dir']}"
+        f"Max generation: {settings['max_generate_time_sec']:g}s | Output: {settings['output_dir']}",
+        flush=True,
     )
 
-    model_reports = []
-    for model_name in settings["candidate_models"]:
-        model_reports.append(_sweep_model(model_name, settings, args.dry_run))
-
-    _write_summary(settings["output_dir"], settings, model_reports, platform_info)
-    print(f"\nReports written to {settings['output_dir']} (trials.csv, summary.json, summary.md)")
+    # Every candidate starts as an explicit "not run" placeholder and is replaced as the sweep
+    # reaches it, so the report on disk describes *this* run from the first moment -- never a
+    # previous one. See _write_summary() for what the stale-report failure looked like.
+    model_reports = [_pending_model_report(name, settings) for name in settings["candidate_models"]]
+    completed = False
+    try:
+        _write_summary(settings["output_dir"], settings, model_reports, platform_info, completed=False)
+        for index, model_name in enumerate(settings["candidate_models"]):
+            model_reports[index] = _sweep_model(model_name, settings, args.dry_run)
+            _write_summary(
+                settings["output_dir"], settings, model_reports, platform_info, completed=False
+            )
+        completed = True
+    finally:
+        # Reached on Ctrl-C and on an unhandled failure too: the measurements already in
+        # trials.csv are worth a report either way, and the banner says the run ended early.
+        try:
+            _write_summary(
+                settings["output_dir"], settings, model_reports, platform_info, completed=completed
+            )
+        except Exception:  # noqa: BLE001 - must not mask whatever is already unwinding
+            traceback.print_exc()
+        else:
+            print(
+                f"\nReports written to {settings['output_dir']} "
+                f"(trials.csv, summary.json, summary.md)"
+                + ("" if completed else " -- sweep ended early, report marked incomplete"),
+                flush=True,
+            )
 
 
 if __name__ == "__main__":

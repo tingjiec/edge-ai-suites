@@ -22,6 +22,11 @@ can time its snapshots: an "loaded" event once the weights are resident (so the
 parent can separate weight memory from KV-cache memory), then a "done" event
 with the trial outcome.
 
+Because process exit is the resource-reclamation boundary, this module never
+tears the pipeline down itself: it reports its result and then calls os._exit()
+(see _post_result_and_exit, which documents the native abort that made running
+the teardown actively harmful).
+
 OpenVINO / transformers are imported lazily inside run_trial() rather than at
 module scope, so this module -- and therefore validate_long_context.py, which
 imports it -- can be imported (e.g. for --dry-run) on a machine that doesn't
@@ -30,7 +35,6 @@ have the OpenVINO stack installed.
 
 from __future__ import annotations
 
-import gc
 import os
 import sys
 import time
@@ -39,14 +43,42 @@ import unicodedata
 
 from components.llm.context_validation.context_builder import build_context_prompt
 
+# Text that says outright that the memory was never handed over. Includes OpenCL's own
+# vocabulary, because at the capacity ceiling the exception the pipeline raises is the GPU
+# plugin's, not Python's, and it reaches us as the plain text of an ov::Exception.
 _OOM_MARKERS = (
     "out of gpu resources",
     "out of memory",
     "allocation failed",
     "bad_alloc",
     "cannot allocate",
+    "can't allocate",
     "insufficient memory",
     "memoryerror",
+    "cl_mem_object_allocation_failure",  # -4: the device could not back the buffer
+    "cl_out_of_host_memory",  # -6: the runtime could not back it on the host either
+    "cl_invalid_buffer_size",  # -61: one buffer larger than the device permits
+)
+
+# A GPU *command* that was accepted and then died on the device. OpenCL surfaces this on the
+# next synchronization point rather than at enqueue, which is why the message names the wait
+# (`clWaitForEvents`) and never names what actually ran out:
+#
+#     Exception from src\\plugins\\intel_gpu\\src\\runtime\\ocl\\ocl_memory.cpp:591:
+#     [GPU] clWaitForEvents, error code: -14 CL_EXEC_STATUS_ERROR_FOR_EVENTS_IN_WAIT_LIST
+#
+# On a shared-memory iGPU at its ceiling this is the usual face of memory exhaustion, but a
+# driver reset (TDR) produces the same code, and this process cannot tell the two apart: it
+# sees neither the host's free-RAM low-water mark nor the GPU counters, both of which are
+# sampled by the parent. So it reports the honest, narrower fact -- the device aborted the
+# command -- and the orchestrator, which does have those measurements, decides whether to call
+# it `oom` (see validate_long_context._classify_failure).
+_GPU_ABORT_MARKERS = (
+    "cl_exec_status_error_for_events_in_wait_list",  # -14
+    "cl_out_of_resources",  # -5
+    "cl_invalid_command_queue",  # -36, typical after a device reset
+    "clwaitforevents",
+    "clfinish",
 )
 
 
@@ -54,6 +86,8 @@ def _classify_error(exc: Exception) -> str:
     text = str(exc).lower()
     if any(marker in text for marker in _OOM_MARKERS):
         return "oom"
+    if any(marker in text for marker in _GPU_ABORT_MARKERS):
+        return "gpu_abort"
     return "exception"
 
 
@@ -147,6 +181,59 @@ def _load_pipeline(model_dir: str, device: str, ov_config: dict):
     )
 
 
+def _post_result_and_exit(result_queue, message: dict) -> None:
+    """Hand the trial result to the parent, then leave the process *without*
+    running OpenVINO's teardown. Never returns.
+
+    Destroying an OpenVINO GPU pipeline that has just prefilled a very long
+    context can throw an `ov::Exception` from inside a destructor. Observed on
+    the 64 GB shared-memory iGPU box at 160K tokens, immediately after a clean
+    128K pass:
+
+        openvino_genai.dll!ov::genai::VLMPipeline::~VLMPipeline
+          -> openvino.dll!ov::IAsyncInferRequest::~IAsyncInferRequest
+          -> openvino.dll!ov::ISyncInferRequest::~ISyncInferRequest
+          -> openvino_intel_gpu_plugin.dll!...
+          -> openvino.dll!ov::Exception::create        <- throws out of a destructor
+          -> ucrtbase.dll!terminate                    <- nothing above can catch it
+        exit code 3221226505 (0xC0000409)
+
+    An escaping exception in a destructor is `std::terminate`, not a Python
+    exception, so the old `finally: try: del pipe ... except Exception: pass`
+    could not contain it -- the process was gone before the next bytecode ran.
+    And because that teardown ran *before* the `done` message was posted, the
+    abort also destroyed a result the trial had already finished computing: the
+    orchestrator saw only `crashed`, with no way to tell whether 160K had in
+    fact prefilled and decoded successfully.
+
+    Both halves are fixed by this function. The result is posted first, so an
+    abort can no longer erase a completed measurement, and the teardown that
+    throws is not run at all. Skipping it does not leak anything: it is the
+    design this module already documents. The child exists to run exactly
+    one trial, and the orchestrator relies on process exit -- not on Python-level
+    cleanup -- to reclaim GPU/host memory between trials. `os._exit()` hands that
+    reclamation to the OS, which cannot throw. (The orchestrator waits for the
+    reclamation to land before starting the next trial; see
+    `validate_long_context._wait_for_memory_settle`.)
+    """
+    try:
+        result_queue.put(message)
+        # Queue.put() is asynchronous: a feeder thread copies the message into the
+        # pipe. os._exit() skips the atexit hook that normally waits for that thread,
+        # so flush it explicitly here or the result races the process exit.
+        result_queue.close()
+        result_queue.join_thread()
+    except Exception:  # noqa: BLE001 - the parent's crash path is the fallback
+        traceback.print_exc(file=sys.stderr)
+    finally:
+        for stream in (sys.stdout, sys.stderr):
+            try:
+                stream.flush()
+            except Exception:  # noqa: BLE001 - flushing must not block the exit
+                pass
+        os._exit(0)
+
+
 def run_trial(
     model_dir: str,
     model_name: str,
@@ -163,6 +250,10 @@ def run_trial(
     result. Finding the memory ceiling only needs a few decode steps, not a full
     summary, so `probe_tokens` is small on purpose -- generating thousands of
     tokens at 128K+ context would add many minutes per step for no extra signal.
+
+    Does not return: every exit path goes through `_post_result_and_exit()`,
+    which posts `done` and then ends the process before OpenVINO's destructors
+    can run. `pipe` is deliberately left alive.
     """
     done = {
         "event": "done",
@@ -191,8 +282,7 @@ def run_trial(
     except Exception as exc:  # noqa: BLE001 - reported to orchestrator, not re-raised
         print(f"[trial_runner] load failed: {traceback.format_exc()}", file=sys.stderr)
         done["error"] = f"load:{_classify_error(exc)}:{exc}"
-        result_queue.put(done)
-        return
+        _post_result_and_exit(result_queue, done)
 
     import openvino_genai as ov_genai
 
@@ -216,11 +306,8 @@ def run_trial(
         print(f"[trial_runner] generate failed: {traceback.format_exc()}", file=sys.stderr)
         done["error"] = f"generate:{_classify_error(exc)}:{exc}"
         done["generate_ok"] = False
-    finally:
-        try:
-            del pipe
-            gc.collect()
-        except Exception:
-            pass
 
-    result_queue.put(done)
+    # No `del pipe` / gc.collect() here on purpose -- destroying the pipeline at
+    # this point is what aborted the process and threw away the result this line
+    # is about to report. See _post_result_and_exit().
+    _post_result_and_exit(result_queue, done)

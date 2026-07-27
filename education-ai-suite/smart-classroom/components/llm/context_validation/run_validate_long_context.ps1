@@ -11,7 +11,7 @@
 # Usage (any extra arguments are forwarded to validate_long_context.py):
 #   .\components\llm\context_validation\run_validate_long_context.ps1
 #   .\components\llm\context_validation\run_validate_long_context.ps1 --dry-run
-#   .\components\llm\context_validation\run_validate_long_context.ps1 --models Qwen/Qwen3-8B --refine
+#   .\components\llm\context_validation\run_validate_long_context.ps1 --models Qwen/Qwen3-8B
 #
 # If PowerShell blocks the script with an UnauthorizedAccess/SecurityError:
 #   Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass
