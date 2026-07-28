@@ -1,0 +1,49 @@
+# Copyright (C) 2026 Intel Corporation
+# SPDX-License-Identifier: Apache-2.0
+#
+# PTL 64 GB / 59 GB shared-GPU configuration for Qwen3.5-9B int8 at 160K.
+# This single profile has the lowest reproducible historical TTFT while keeping
+# substantial shared-memory headroom.
+
+model:
+  provider: openvino
+  device: GPU
+  weight_format: int8
+  models_base_path: "models"
+
+benchmark:
+  models: [Qwen/Qwen3.5-9B]
+  context_tokens: [160000]
+  output_tokens: 64
+  warmup: 1
+  iterations: 3
+  timeout_sec: 2400
+  # Host and GPU use the same physical memory on PTL. Do not reject a completed
+  # case on host-RAM percentage; the 59 GB GPU budget is reported independently.
+  max_system_memory_pct: 100
+  gpu_memory_budget_gb: 59
+  cache_dir: null
+  output_dir: monitoring/executionlogs/context_bench/qwen3.5_9b
+
+# Selection evidence from exact-160K historical runs:
+# - f16/32K/cache7: TTFT median 244.663s (240.603-247.445s), peak GPU
+#   25.98/59 GB (44.0%) and peak RAM 41.23/63.56 GB (64.9%).
+# - f16/32K/cache8 had one 236.961s outlier, but its three historical TTFTs
+#   were 236.961/290.826/338.594s (median 290.826s), much less repeatable.
+# - u8/32K/cache4: TTFT median 350.792s, 43.4% slower than f16/32K.
+# - f16/64K/cache8: TTFT 293.746s and peak GPU 31.37 GB, so the larger
+#   prefill chunk was both slower and more memory-intensive.
+# - f16 persistent KV is 4.93 GiB. cache_size=7 covers it with allocation
+#   slack while avoiding the extra reserved memory of cache8/16.
+# - max_num_seqs=1: this benchmark is one 160K request, not a concurrency test.
+# - dynamic_split_fuse=true: keeps prefill/decode scheduling fused.
+# - enable_prefix_caching=false: prevents warmup prompt reuse from faking TTFT.
+profiles:
+  - name: optimized-f16
+    ov: {GPU_ENABLE_LARGE_ALLOCATIONS: "YES", KV_CACHE_PRECISION: f16}
+    scheduler:
+      max_num_seqs: 1
+      max_num_batched_tokens: 32768
+      cache_size: 7
+      dynamic_split_fuse: true
+      enable_prefix_caching: false

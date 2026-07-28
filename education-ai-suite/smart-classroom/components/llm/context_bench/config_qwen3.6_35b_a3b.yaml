@@ -1,0 +1,42 @@
+# Copyright (C) 2026 Intel Corporation
+# SPDX-License-Identifier: Apache-2.0
+#
+# PTL 64 GB / 59 GB shared-GPU configuration for Qwen3.6-35B-A3B int8 at 160K.
+# This single profile is the lowest measured TTFT that completed 160K while
+# retaining enough shared-memory headroom for stable decode.
+
+model:
+  provider: openvino
+  device: GPU
+  weight_format: int8
+  models_base_path: "models"
+
+benchmark:
+  models: [Qwen/Qwen3.6-35B-A3B]
+  context_tokens: [160000]
+  output_tokens: 64
+  warmup: 1
+  iterations: 3
+  timeout_sec: 3600
+  max_system_memory_pct: 100
+  gpu_memory_budget_gb: 59
+  cache_dir: null
+  output_dir: monitoring/executionlogs/context_bench/qwen3.6_35b_a3b
+
+# Tuning rationale from the 160K screening run:
+# - 32K reduced TTFT by 8.0% versus 16K: 432.34s vs 470.15s.
+# - 64K/cache3 was rejected after it passed 449s without a first token while
+#   system RAM reached 59.26/63.56 GB (93.2%); it was slower and less stable.
+# - u8 KV keeps the persistent 160K cache at 1.61 GiB. cache_size=4 GiB is the
+#   measured stable pool and leaves 15.23 GB under the 59 GB GPU budget.
+# - max_num_seqs=1 avoids concurrency overhead for this single long request.
+# - prefix caching stays off so repeated runs cannot report a fictional TTFT.
+profiles:
+  - name: optimized-u8
+    ov: {GPU_ENABLE_LARGE_ALLOCATIONS: "YES", KV_CACHE_PRECISION: u8}
+    scheduler:
+      max_num_seqs: 1
+      max_num_batched_tokens: 65536
+      cache_size: 4
+      dynamic_split_fuse: true
+      enable_prefix_caching: false

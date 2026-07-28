@@ -1,17 +1,18 @@
 # Copyright (C) 2026 Intel Corporation
 # SPDX-License-Identifier: Apache-2.0
 #
-# One-command way to run the long-context validator. Reuses the exact same
+# One-command way to run the long-context benchmark. Reuses the exact same
 # backend venv and activation convention as setup-smart-classroom.ps1 /
 # start-smart-classroom.ps1 (../smartclassroom, sibling of smart-classroom/):
 # creates it via setup_env.ps1 if it doesn't exist yet, activates it the same
 # way start-smart-classroom.ps1 activates it for the main backend, then runs
-# validate_long_context.py from the smart-classroom/ working directory.
+# benchmark.py from the smart-classroom/ working directory.
 #
-# Usage (any extra arguments are forwarded to validate_long_context.py):
-#   .\components\llm\context_validation\run_validate_long_context.ps1
-#   .\components\llm\context_validation\run_validate_long_context.ps1 --dry-run
-#   .\components\llm\context_validation\run_validate_long_context.ps1 --models Qwen/Qwen3-8B
+# Usage (any extra arguments are forwarded to benchmark.py):
+#   .\components\llm\context_bench\run_benchmark.ps1
+#   .\components\llm\context_bench\run_benchmark.ps1 --list-profiles
+#   .\components\llm\context_bench\run_benchmark.ps1 --profiles optimized-f16-32k --iterations 1
+#   .\components\llm\context_bench\run_benchmark.ps1 --config components/llm/context_bench/config_qwen3.6_35b_a3b.yaml
 #
 # If PowerShell blocks the script with an UnauthorizedAccess/SecurityError:
 #   Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass
@@ -27,7 +28,7 @@ $ScriptDir = Split-Path -Parent $MyInvocation.MyCommand.Definition
 if (-not $ScriptDir) { $ScriptDir = Get-Location }
 
 # smart-classroom/ is 3 levels up from this script's directory
-# (context_validation -> llm -> components -> smart-classroom).
+# (context_bench -> llm -> components -> smart-classroom).
 $SmartClassroomRoot = (Resolve-Path (Join-Path $ScriptDir "..\..\..")).Path
 $VenvPath = Join-Path (Split-Path $SmartClassroomRoot -Parent) "smartclassroom"
 $VenvPython = Join-Path $VenvPath "Scripts\python.exe"
@@ -42,5 +43,5 @@ Write-Host "Activating backend venv ($VenvPath) ..." -ForegroundColor Gray
 & (Join-Path $VenvPath "Scripts\Activate.ps1")
 
 Set-Location $SmartClassroomRoot
-python -m components.llm.context_validation.validate_long_context @ExtraArgs
+python -m components.llm.context_bench.benchmark @ExtraArgs
 exit $LASTEXITCODE

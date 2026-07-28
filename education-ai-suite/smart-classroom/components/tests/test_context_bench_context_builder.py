@@ -2,11 +2,12 @@
 # SPDX-License-Identifier: Apache-2.0
 import unittest
 
-from components.llm.context_validation.context_builder import (
-    build_context_prompt,
+from components.llm.context_bench.context_builder import (
+    build_benchmark_prompt,
     build_text_of_token_length,
     measure_template_overhead,
 )
+from components.llm.context_bench.trial_runner import count_pipeline_prompt_tokens
 
 
 class FakeTokenizer:
@@ -77,10 +78,10 @@ class TestContextBuilder(unittest.TestCase):
         # User content must not inflate the overhead measurement.
         self.assertLess(overhead, 10)
 
-    def test_build_context_prompt_lands_near_target(self):
+    def test_build_benchmark_prompt_lands_on_target(self):
         tok = FakeTokenizer()
-        for target in (2000, 8000):
-            prompt, prompt_tokens = build_context_prompt(tok, target)
+        for target in (2000, 80000, 160000):
+            prompt, prompt_tokens = build_benchmark_prompt(tok, target)
             self.assertIn("<system>", prompt)
             self.assertIn("<user>", prompt)
             self.assertIn("CLASSROOM TRANSCRIPT", prompt)
@@ -89,6 +90,32 @@ class TestContextBuilder(unittest.TestCase):
             # The rendered prompt (content + template overhead) should land on the
             # requested size for a round-tripping tokenizer.
             self.assertEqual(prompt_tokens, target, f"target={target}")
+
+    def test_corrects_template_boundary_token_drift(self):
+        class BoundaryDriftTokenizer(FakeTokenizer):
+            def apply_chat_template(self, messages, tokenize=False, **kwargs):
+                rendered = super().apply_chat_template(messages, tokenize=tokenize, **kwargs)
+                if messages[-1].get("content"):
+                    rendered += " boundary-token"
+                return rendered
+
+        tok = BoundaryDriftTokenizer()
+        _prompt, prompt_tokens = build_benchmark_prompt(tok, 80000)
+        self.assertEqual(prompt_tokens, 80000)
+
+    def test_pipeline_tokenizer_count_uses_input_id_width(self):
+        class InputIds:
+            shape = (1, 160000)
+
+        class PipelineTokenizer:
+            def encode(self, _prompt):
+                return type("Tokenized", (), {"input_ids": InputIds()})()
+
+        class Pipeline:
+            def get_tokenizer(self):
+                return PipelineTokenizer()
+
+        self.assertEqual(count_pipeline_prompt_tokens(Pipeline(), "prompt"), 160000)
 
 
 if __name__ == "__main__":

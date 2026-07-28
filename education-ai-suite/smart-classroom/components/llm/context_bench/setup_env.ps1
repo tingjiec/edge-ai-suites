@@ -1,7 +1,7 @@
 # Copyright (C) 2026 Intel Corporation
 # SPDX-License-Identifier: Apache-2.0
 #
-# Prepares the Python environment validate_long_context.py needs (openvino-genai,
+# Prepares the Python environment benchmark.py needs (openvino-genai,
 # transformers, optimum-intel, torch) WITHOUT running the full interactive
 # setup-smart-classroom.ps1, which also sets up the frontend, content_search,
 # and unrelated system-requirement checks.
@@ -14,7 +14,7 @@
 #
 # Usage (from smart-classroom/, or from anywhere -- paths are resolved
 # relative to this script's own location):
-#   .\components\llm\context_validation\setup_env.ps1
+#   .\components\llm\context_bench\setup_env.ps1
 #
 # If PowerShell blocks the script with an UnauthorizedAccess/SecurityError:
 #   Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass
@@ -25,7 +25,7 @@ $ScriptDir = Split-Path -Parent $MyInvocation.MyCommand.Definition
 if (-not $ScriptDir) { $ScriptDir = Get-Location }
 
 # smart-classroom/ is 3 levels up from this script's directory
-# (context_validation -> llm -> components -> smart-classroom).
+# (context_bench -> llm -> components -> smart-classroom).
 $SmartClassroomRoot = (Resolve-Path (Join-Path $ScriptDir "..\..\..")).Path
 $VenvPath = Join-Path (Split-Path $SmartClassroomRoot -Parent) "smartclassroom"
 $RequirementsPath = Join-Path $SmartClassroomRoot "requirements.txt"
@@ -62,5 +62,5 @@ if ($LASTEXITCODE -ne 0) {
 }
 
 Write-Host ""
-Write-Host "[OK] Environment ready. Run the validator with:" -ForegroundColor Green
-Write-Host "  & `"$VenvPython`" -m components.llm.context_validation.validate_long_context"
+Write-Host "[OK] Environment ready. Run the benchmark with:" -ForegroundColor Green
+Write-Host "  & `"$VenvPython`" -m components.llm.context_bench.benchmark"

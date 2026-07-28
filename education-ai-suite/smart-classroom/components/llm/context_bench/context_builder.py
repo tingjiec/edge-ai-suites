@@ -1,9 +1,9 @@
 # Copyright (C) 2026 Intel Corporation
 # SPDX-License-Identifier: Apache-2.0
-"""Synthetic classroom-transcript builder for the long-context capacity validator.
+"""Synthetic classroom-transcript builder for the long-context benchmark.
 
-Builds a chat prompt whose token count lands as close to a target size as the
-tokenizer's merge rules allow, so trial_runner.py can push the real OpenVINO
+Builds a chat prompt whose token count exactly matches a target size, or fails
+explicitly when the tokenizer cannot converge, so trial_runner.py can push the real OpenVINO
 pipeline up to a given context length and measure whether *this hardware* can
 prefill and decode it without running out of memory.
 
@@ -124,8 +124,8 @@ def measure_template_overhead(
     return len(tokenizer.encode(rendered))
 
 
-def build_context_prompt(tokenizer: Tokenizer, target_tokens: int) -> tuple:
-    """Build a rendered chat prompt whose token length is ~``target_tokens``.
+def build_benchmark_prompt(tokenizer: Tokenizer, target_tokens: int) -> tuple:
+    """Build a rendered chat prompt whose token length is exactly ``target_tokens``.
 
     Sizes the transcript content so that, once the system prompt and chat-template
     scaffolding are added back, the whole rendered prompt lands on the target.
@@ -147,11 +147,23 @@ def build_context_prompt(tokenizer: Tokenizer, target_tokens: int) -> tuple:
     )
     content_target = max(0, target_tokens - overhead)
 
-    content, _actual_content = build_text_of_token_length(tokenizer, content_target)
-    messages = [
-        {"role": "system", "content": SYSTEM_PROMPT},
-        {"role": "user", "content": _USER_PREFIX + content + _USER_SUFFIX},
-    ]
-    prompt = tokenizer.apply_chat_template(messages, tokenize=False, **template_kwargs)
-    prompt_tokens = len(tokenizer.encode(prompt))
-    return prompt, prompt_tokens
+    # Token merges at the transcript/template boundaries can make the first
+    # estimate differ by a token or two. Rebuild against the measured delta so
+    # the value sent to the pipeline is the configured context size, not merely
+    # a nearby value. Four corrections are ample for deterministic tokenizers;
+    # fail explicitly if a tokenizer cannot converge instead of misreporting it.
+    for _attempt in range(5):
+        content, _actual_content = build_text_of_token_length(tokenizer, content_target)
+        messages = [
+            {"role": "system", "content": SYSTEM_PROMPT},
+            {"role": "user", "content": _USER_PREFIX + content + _USER_SUFFIX},
+        ]
+        prompt = tokenizer.apply_chat_template(messages, tokenize=False, **template_kwargs)
+        prompt_tokens = len(tokenizer.encode(prompt))
+        if prompt_tokens == target_tokens:
+            return prompt, prompt_tokens
+        content_target = max(0, content_target + target_tokens - prompt_tokens)
+
+    raise ValueError(
+        f"Could not build an exact {target_tokens}-token prompt; last count was {prompt_tokens}"
+    )
