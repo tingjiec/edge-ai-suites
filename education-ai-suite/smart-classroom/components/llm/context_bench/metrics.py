@@ -11,7 +11,7 @@ Two throughput figures matter at 160K and they are not interchangeable.
 `prefill_throughput` (input tokens / TTFT) dominates the wall clock -- at these
 context lengths TTFT is ~96% of total generation time -- while
 `decode_throughput` is llm_bench's "2nd token" rate. `e2e_throughput` is the one
-number that ranks configurations end to end.
+number that summarizes end-to-end work; profile ranking uses TPOT, then TTFT.
 """
 
 from __future__ import annotations
@@ -74,7 +74,8 @@ def iteration_record(
     ttft = first_token_latency
     tpot = other_tokens_avg_latency
     if tpot is None and ttft is not None and output_size > 1:
-        tpot = round((total_ms - ttft) / (output_size - 1), 3)
+        post_ttft_ms = total_ms - ttft
+        tpot = round(post_ttft_ms / (output_size - 1), 3) if post_ttft_ms > 0 else None
 
     return {
         "iteration": iteration,

@@ -11,9 +11,119 @@ spread is carried alongside it.
 """
 
 import unittest
+from types import SimpleNamespace
 from unittest import mock
 
 from components.llm.context_bench import benchmark, metrics, trial_runner
+
+
+def _settings_args(**overrides):
+    values = {
+        "config": "benchmark.yaml",
+        "models": None,
+        "contexts": None,
+        "profiles": None,
+        "output_tokens": None,
+        "warmup": None,
+        "iterations": None,
+        "device": None,
+        "weight_format": None,
+        "output_dir": None,
+        "pipeline_config": None,
+        "scheduler_config": None,
+    }
+    values.update(overrides)
+    return SimpleNamespace(**values)
+
+
+def _settings_config(**benchmark_overrides):
+    benchmark_values = {
+        "models": ["Qwen/Qwen3.5-9B"],
+        "context_tokens": [160000],
+        "output_tokens": 64,
+        "warmup": 1,
+        "iterations": 3,
+        "timeout_sec": 2400,
+        "max_system_memory_pct": 80,
+        "gpu_memory_budget_gb": 59,
+        "cache_dir": None,
+        "output_dir": "monitoring/executionlogs/context_bench",
+    }
+    benchmark_values.update(benchmark_overrides)
+    return SimpleNamespace(
+        model=SimpleNamespace(
+            provider="openvino",
+            models_base_path="models",
+            device="GPU",
+            weight_format="int8",
+        ),
+        benchmark=SimpleNamespace(**benchmark_values),
+        profiles=[{"name": "default", "ov": {}, "scheduler": {}}],
+    )
+
+
+class TestSettingsValidation(unittest.TestCase):
+    def _load(self, config, **arg_overrides):
+        with mock.patch.object(benchmark, "load_config", return_value=config):
+            return benchmark._load_settings(_settings_args(**arg_overrides))
+
+    def test_output_too_short_for_tpot_is_rejected_instead_of_falling_back(self):
+        with self.assertRaisesRegex(SystemExit, "output_tokens must be at least 2"):
+            self._load(_settings_config(), output_tokens=0)
+
+    def test_malformed_context_list_has_an_actionable_error(self):
+        with self.assertRaisesRegex(SystemExit, "only positive integers"):
+            self._load(_settings_config(context_tokens=[160000, "bad"]))
+
+    def test_boolean_iterations_is_not_accepted_as_one(self):
+        with self.assertRaisesRegex(SystemExit, "iterations must be a positive integer"):
+            self._load(_settings_config(iterations=True))
+
+    def test_negative_warmup_is_rejected_before_running_a_case(self):
+        with self.assertRaisesRegex(SystemExit, "warmup must be a non-negative integer"):
+            self._load(_settings_config(warmup=-1))
+
+    def test_non_positive_timeout_is_rejected_before_running_a_case(self):
+        with self.assertRaisesRegex(SystemExit, "timeout_sec must be greater than 0"):
+            self._load(_settings_config(timeout_sec=0))
+
+    def test_empty_model_list_is_rejected(self):
+        with self.assertRaisesRegex(SystemExit, "at least one non-empty model name"):
+            self._load(_settings_config(models=[]))
+
+    def test_duplicate_profile_names_are_rejected(self):
+        config = _settings_config()
+        config.profiles.append({"name": "default", "ov": {}, "scheduler": {}})
+
+        with self.assertRaisesRegex(SystemExit, "profile names must be unique"):
+            self._load(config)
+
+    def test_prefix_caching_is_rejected_because_it_reuses_the_warmup_prompt(self):
+        config = _settings_config()
+        config.profiles[0]["scheduler"] = {"enable_prefix_caching": True}
+
+        with self.assertRaisesRegex(SystemExit, "must set enable_prefix_caching=false"):
+            self._load(config)
+
+    def test_numeric_prefix_caching_override_cannot_bypass_the_guard(self):
+        with self.assertRaisesRegex(SystemExit, "must set enable_prefix_caching=false"):
+            self._load(_settings_config(), scheduler_config=["enable_prefix_caching=1"])
+
+    def test_falsey_non_mapping_profile_values_are_rejected(self):
+        for key, value in (("ov", []), ("scheduler", ""), ("scheduler", 0)):
+            config = _settings_config()
+            config.profiles[0][key] = value
+            with self.subTest(key=key, value=value), self.assertRaisesRegex(
+                SystemExit, "ov and scheduler must be mappings"
+            ):
+                self._load(config)
+
+    def test_gpu_budget_must_be_finite_and_positive(self):
+        for value in (0, -1, float("nan"), float("inf"), "not-a-number"):
+            with self.subTest(value=value), self.assertRaisesRegex(
+                SystemExit, "gpu_memory_budget_gb must be a finite positive number"
+            ):
+                self._load(_settings_config(gpu_memory_budget_gb=value))
 
 
 def _record(iteration, generation_time, ttft_ms, warmup=False, output_size=64, input_size=160000):
@@ -84,6 +194,12 @@ class TestIterationRecord(unittest.TestCase):
         self.assertIsNone(record["other_tokens_avg_latency"])
         self.assertEqual(record["prefill_throughput"], 0.0)
         self.assertGreater(record["e2e_throughput"], 0)
+
+    def test_inconsistent_fallback_timings_do_not_produce_negative_tpot(self):
+        record = _record(1, generation_time=10.0, ttft_ms=11_000.0)
+
+        self.assertIsNone(record["other_tokens_avg_latency"])
+        self.assertEqual(record["decode_throughput"], 0.0)
 
 
 class TestWarmupIsExcluded(unittest.TestCase):
@@ -195,8 +311,91 @@ class TestProfileRanking(unittest.TestCase):
 
         self.assertEqual([case["profile"] for case in benchmark._leaderboard(cases)], ["usable"])
 
+    def test_missing_ttft_sorts_last_instead_of_comparing_none(self):
+        cases = [
+            {
+                "profile": "missing-ttft",
+                "status": "ok",
+                "other_tokens_avg_latency": 160.0,
+                "first_token_latency": None,
+            },
+            {
+                "profile": "measured-ttft",
+                "status": "ok",
+                "other_tokens_avg_latency": 160.0,
+                "first_token_latency": 250_000.0,
+            },
+        ]
+
+        self.assertEqual(
+            [case["profile"] for case in benchmark._leaderboard(cases)],
+            ["measured-ttft", "missing-ttft"],
+        )
+
+    def test_successful_case_without_ttft_formats_as_unavailable(self):
+        case = {
+            "status": "ok",
+            "other_tokens_avg_latency": 160.0,
+            "first_token_latency": None,
+            "decode_throughput": 6.25,
+            "e2e_throughput": 640.0,
+            "peak_ram_gb": 40.0,
+            "peak_ram_pct": 62.5,
+            "peak_gpu_gb": 26.0,
+            "peak_gpu_pct_of_budget": 44.1,
+        }
+
+        self.assertIn("TTFT --s", benchmark._format_case(case))
+
 
 class TestMemoryStatus(unittest.TestCase):
+    def test_unavailable_budget_measurement_is_not_usable(self):
+        case = {
+            "status": "ok",
+            "memory_measurement_error": True,
+            "gpu_budget_exceeded": False,
+            "system_memory_limit_exceeded": False,
+        }
+
+        self.assertEqual(benchmark._apply_memory_status(case)["status"], "measurement_error")
+
+    def test_run_case_fails_closed_when_memory_telemetry_is_unavailable(self):
+        result = {
+            "error": None,
+            "load_ok": True,
+            "stage_reached": trial_runner.STAGE_DECODED,
+            "iterations": [_record(1, 250.0, 240_000.0)],
+            "peak_ram_pct": None,
+            "peak_gpu_gb": None,
+        }
+        settings = {
+            "device": "GPU",
+            "cache_dir": None,
+            "output_tokens": 64,
+            "warmup": 0,
+            "iterations": 1,
+            "timeout_sec": 600,
+            "gpu_memory_budget_gb": 59.0,
+            "max_system_memory_pct": 100,
+            "weight_format": "int8",
+        }
+        static = {"model_config": None, "fixed_state_bytes": 0, "weight_disk_gb": 8.8}
+
+        with mock.patch.object(
+            benchmark, "_run_case_subprocess", return_value=result
+        ), mock.patch("builtins.print"):
+            case = benchmark._run_case(
+                "Qwen/Qwen3.5-9B",
+                "models/openvino/Qwen_Qwen3.5-9B_int8",
+                {"name": "optimized", "ov": {}, "scheduler": {}},
+                160000,
+                settings,
+                static,
+            )
+
+        self.assertTrue(case["memory_measurement_error"])
+        self.assertEqual(case["status"], "measurement_error")
+
     def test_gpu_budget_overrun_is_not_usable(self):
         case = {
             "status": "ok",
@@ -298,6 +497,51 @@ class TestPerfMetricsAreTheStandardSource(unittest.TestCase):
 
     def test_a_result_without_perf_metrics_falls_back_entirely(self):
         self.assertEqual(trial_runner.read_perf_metrics(object()), {})
+
+
+class TestGenerationConfigMatchesLlmBench(unittest.TestCase):
+    class _Config:
+        max_new_tokens = 0
+        max_length = 0
+        ignore_eos = False
+        do_sample = True
+        apply_chat_template = True
+
+    class _Pipeline:
+        def get_generation_config(self):
+            return TestGenerationConfigMatchesLlmBench._Config()
+
+    def test_forces_deterministic_fixed_length_generation(self):
+        config = trial_runner.generation_config(self._Pipeline(), 64)
+
+        self.assertEqual(config.max_new_tokens, 64)
+        self.assertEqual(config.max_length, 2**64 - 1)
+        self.assertTrue(config.ignore_eos)
+        self.assertFalse(config.do_sample)
+        self.assertFalse(config.apply_chat_template)
+
+
+class TestGeneratedTokenCount(unittest.TestCase):
+    class _Tokenizer:
+        def __init__(self):
+            self.encoded = None
+
+        def encode(self, text):
+            self.encoded = text
+            input_ids = type("InputIds", (), {"shape": (1, 7)})()
+            return type("Tokenized", (), {"input_ids": input_ids})()
+
+    def test_uses_encoded_tokens_without_detokenizing(self):
+        result = type("Result", (), {"tokens": [[1, 2, 3]]})()
+
+        self.assertEqual(trial_runner.generated_token_count(result, self._Tokenizer()), 3)
+
+    def test_vlm_fallback_encodes_generated_text_not_result_repr(self):
+        tokenizer = self._Tokenizer()
+        result = type("Result", (), {"texts": ["generated answer"]})()
+
+        self.assertEqual(trial_runner.generated_token_count(result, tokenizer), 7)
+        self.assertEqual(tokenizer.encoded, "generated answer")
 
 
 if __name__ == "__main__":

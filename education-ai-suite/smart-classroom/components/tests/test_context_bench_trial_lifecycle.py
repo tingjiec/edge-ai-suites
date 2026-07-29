@@ -31,10 +31,8 @@ from components.llm.context_bench import benchmark, trial_runner
 
 _FAKE_MEM = {
     "ram_gb": 10.0,
-    "ram_total_gb": 64.0,
     "ram_pct": 15.6,
     "available_ram_gb": 54.0,
-    "commit_available_gb": 60.0,
     "gpu_gb": 1.0,
 }
 
@@ -223,6 +221,15 @@ def _iteration(index, warmup=False, generation_time=250.0):
 
 
 class TestParentRecoversResultRacingChildExit(_ParentHarness):
+    def test_child_progress_refreshes_the_timeout(self):
+        code = _executable_source(benchmark._run_case_subprocess)
+
+        self.assertEqual(code.count("deadline = time.monotonic() + timeout_sec"), 2)
+        self.assertLess(
+            code.index("finished = _consume(msg, child_alive=True)"),
+            code.rindex("deadline = time.monotonic() + timeout_sec"),
+        )
+
     def test_completed_case_is_not_reported_as_a_crash(self):
         done = {
             "event": "done",
@@ -346,6 +353,21 @@ class TestGenuineFailuresAreStillNamed(_ParentHarness):
         self.assertEqual(len(result["iterations"]), 2)
         self.assertEqual(result["stage_reached"], trial_runner.STAGE_DECODED)
 
+    def test_first_token_milestone_identifies_a_native_decode_crash(self):
+        queue = _RacingQueue(
+            [
+                {"event": "loaded", "load_time_s": 13.1},
+                {"event": "prompt", "prompt_tokens": 160000},
+                {"event": "iteration_start", "iteration": 0, "warmup": False},
+                {"event": "prefilled", "iteration": 0},
+            ]
+        )
+
+        result = self._run(queue, _DeadProcess(exitcode=3221226505))
+
+        self.assertEqual(result["stage_reached"], trial_runner.STAGE_PREFILLED)
+        self.assertEqual(trial_runner.failing_stage(result["stage_reached"]), "decode")
+
     def test_status_distinguishes_the_failures_that_change_what_to_do_next(self):
         for error, expected in (
             ("timeout", "timeout"),
@@ -397,6 +419,20 @@ class TestMemorySettlesBeforeTheNextCase(unittest.TestCase):
             settled = benchmark._wait_for_memory_settle({"ram_gb": 10.0, "gpu_gb": 1.0}, timeout_sec=30)
 
         self.assertTrue(settled)
+
+    def test_unmeasurable_memory_does_not_stall_every_case(self):
+        # No psutil and no GPU counter means there is nothing to wait for. Blocking the
+        # full timeout per case would only slow a run down on a box where the numbers
+        # were already going to come back as `measurement_error`.
+        with mock.patch.object(
+            benchmark, "_read_mem", return_value={"ram_gb": None, "gpu_gb": None}
+        ), mock.patch.object(benchmark.time, "sleep") as no_sleep:
+            settled = benchmark._wait_for_memory_settle(
+                {"ram_gb": None, "gpu_gb": None}, timeout_sec=30
+            )
+
+        self.assertTrue(settled)
+        no_sleep.assert_not_called()
 
     def test_gives_up_instead_of_stalling_the_run(self):
         with mock.patch.object(

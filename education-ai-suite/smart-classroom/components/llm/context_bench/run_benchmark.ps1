@@ -11,7 +11,7 @@
 # Usage (any extra arguments are forwarded to benchmark.py):
 #   .\components\llm\context_bench\run_benchmark.ps1
 #   .\components\llm\context_bench\run_benchmark.ps1 --list-profiles
-#   .\components\llm\context_bench\run_benchmark.ps1 --profiles optimized-f16-32k --iterations 1
+#   .\components\llm\context_bench\run_benchmark.ps1 --profiles optimized --iterations 1
 #   .\components\llm\context_bench\run_benchmark.ps1 --config components/llm/context_bench/config_qwen3.6_35b_a3b.yaml
 #
 # If PowerShell blocks the script with an UnauthorizedAccess/SecurityError:
@@ -37,6 +37,9 @@ if (-not (Test-Path $VenvPython)) {
     Write-Host "Backend venv not found at $VenvPath -- preparing it first (one-time; installing " -ForegroundColor Yellow -NoNewline
     Write-Host "requirements.txt can take several minutes) ..." -ForegroundColor Yellow
     & (Join-Path $ScriptDir "setup_env.ps1")
+    if ($LASTEXITCODE -ne 0) {
+        exit $LASTEXITCODE
+    }
 }
 
 Write-Host "Activating backend venv ($VenvPath) ..." -ForegroundColor Gray

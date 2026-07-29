@@ -16,7 +16,7 @@ and report a TTFT that no first request will ever see.
 Each case runs in a fresh subprocess (see benchmark.py) so GPU/host memory from
 an OOM'd or aborted attempt cannot bleed into the next one -- the same rationale
 as components/vlm/vlm_openvino_serving/utils/utils.py::_convert_model_worker.
-Memory is sampled by the parent: RAM/GPU counters are process-wide, so the
+Memory is sampled by the parent: RAM/GPU counters are system-wide, so the
 parent sees this child's footprint and, crucially, its readings survive a child
 that gets killed on a timeout.
 
@@ -183,7 +183,8 @@ def _load_pipeline(model_dir: str, device: str, ov_config: dict, scheduler_confi
 
     optimum-cli decides whether a candidate exports as a plain causal LM
     (openvino_model.xml) or a multimodal/VLM layout (openvino_language_model.xml plus
-    vision components); both expose the same .generate() surface used below.
+    vision components). The returned flag records whether generate() accepts the
+    TokenizedInputs used by llm_bench; VLMPipeline only accepts text.
 
     An empty `scheduler_config` is meaningful, not a default: it leaves continuous
     batching off entirely and runs the stateful pipeline, which skips paged-attention
@@ -201,23 +202,50 @@ def _load_pipeline(model_dir: str, device: str, ov_config: dict, scheduler_confi
         pipeline_args["scheduler_config"] = scheduler
 
     if os.path.exists(os.path.join(model_dir, "openvino_language_model.xml")):
-        return ov_genai.VLMPipeline(model_dir, device=device, **pipeline_args)
+        return ov_genai.VLMPipeline(model_dir, device=device, **pipeline_args), False
     if os.path.exists(os.path.join(model_dir, "openvino_model.xml")):
-        return ov_genai.LLMPipeline(model_dir, device=device, **pipeline_args)
+        return ov_genai.LLMPipeline(model_dir, device=device, **pipeline_args), True
     raise RuntimeError(
         f"Unrecognized OpenVINO IR layout in {model_dir}: expected openvino_model.xml "
         "(plain LLM) or openvino_language_model.xml (multimodal/VLM export)"
     )
 
 
-def count_pipeline_prompt_tokens(pipe, prompt: str) -> int:
-    """Count with the tokenizer IR owned by the pipeline that will run inference.
+def prepare_pipeline_input(pipe, prompt: str, accepts_tokenized_input: bool):
+    """Tokenize once with the pipeline tokenizer and return the exact inference input.
 
-    Cross-checked against the HuggingFace count before anything is sent to the device:
-    a prompt that is 160,001 tokens where 160,000 was configured is a different
-    measurement, and the two tokenizers are separate artifacts that can disagree.
+    LLMPipeline accepts TokenizedInputs, matching llm_bench and guaranteeing that the
+    token sequence counted here is the sequence sent to the model. VLMPipeline only
+    accepts text, so its validated string is returned and the pipeline tokenizes it.
     """
-    return int(pipe.get_tokenizer().encode(prompt).input_ids.shape[-1])
+    tokenized = pipe.get_tokenizer().encode(prompt)
+    prompt_tokens = int(tokenized.input_ids.shape[-1])
+    return (tokenized if accepts_tokenized_input else prompt), prompt_tokens
+
+
+def generation_config(pipe, output_tokens: int):
+    """Use the same deterministic, fixed-length settings as llm_bench."""
+    config = pipe.get_generation_config()
+    config.max_new_tokens = output_tokens
+    config.max_length = 2**64 - 1
+    config.ignore_eos = True
+    config.do_sample = False
+    if hasattr(config, "apply_chat_template"):
+        config.apply_chat_template = False
+    return config
+
+
+def generated_token_count(result, tokenizer) -> int:
+    """Count encoded output tokens, falling back to pipeline-tokenizer text encoding."""
+    tokens = getattr(result, "tokens", None)
+    if tokens is not None:
+        try:
+            return len(tokens[0])
+        except (IndexError, TypeError):
+            pass
+    texts = getattr(result, "texts", None)
+    output_text = texts[0] if texts else str(result)
+    return int(tokenizer.encode(output_text).input_ids.shape[-1])
 
 
 def _mean_ms(pair) -> float | None:
@@ -320,6 +348,7 @@ def run_case(
       ``loaded``          pipeline constructed (parent snapshots post-load memory here)
       ``prompt``          context tokenized to exactly `context_tokens`
       ``iteration_start`` about to generate (parent opens a fresh memory window)
+    ``prefilled``       first token produced (parent can distinguish decode failures)
       ``iteration``       one completed generation, as a metrics.iteration_record
       ``done``            terminal: every record, plus any error
 
@@ -352,7 +381,9 @@ def run_case(
     try:
         t0 = time.perf_counter()
         tokenizer = _load_tokenizer(model_dir)
-        pipe = _load_pipeline(model_dir, device, ov_config, scheduler_config)
+        pipe, accepts_tokenized_input = _load_pipeline(
+            model_dir, device, ov_config, scheduler_config
+        )
         done["load_ok"] = True
         done["load_time_s"] = round(time.perf_counter() - t0, 3)
         done["stage_reached"] = STAGE_LOADED
@@ -368,7 +399,9 @@ def run_case(
         # Built once and reused across iterations, as llm_bench does. Requires prefix
         # caching to stay off, or iteration 1 inherits the warm-up's cached prefix.
         prompt, hf_tokens = build_benchmark_prompt(tokenizer, context_tokens)
-        prompt_tokens = count_pipeline_prompt_tokens(pipe, prompt)
+        pipeline_input, prompt_tokens = prepare_pipeline_input(
+            pipe, prompt, accepts_tokenized_input
+        )
         done["prompt_tokens"] = prompt_tokens
         if hf_tokens != context_tokens or prompt_tokens != context_tokens:
             raise ValueError(
@@ -381,7 +414,7 @@ def run_case(
         # Plain greedy decoding. Proving and timing prefill + decode is the whole goal, and
         # grammar-constrained decoding was observed to collapse into "!!!!" on some models,
         # which would score a false failure for a context the box handled.
-        gen_config = ov_genai.GenerationConfig(max_new_tokens=output_tokens, do_sample=False)
+        gen_config = generation_config(pipe, output_tokens)
 
         for index in range(warmup + iterations):
             is_warmup = index < warmup
@@ -390,7 +423,7 @@ def run_case(
             ttft_ms = None
             t1 = time.perf_counter()
 
-            def _on_token(_chunk: str):
+            def _on_token(_: str):
                 """First call = prefill is over; the whole context made it through the model.
 
                 Records only *when*, never asks generation to stop -- stopping early would
@@ -400,15 +433,18 @@ def run_case(
                 if ttft_ms is None:
                     ttft_ms = (time.perf_counter() - t1) * 1000.0
                     done["stage_reached"] = STAGE_PREFILLED
+                    result_queue.put({"event": "prefilled", "iteration": index})
                 return ov_genai.StreamingStatus.RUNNING
 
-            result = pipe.generate(prompt, generation_config=gen_config, streamer=_on_token)
+            result = pipe.generate(
+                pipeline_input, generation_config=gen_config, streamer=_on_token
+            )
             wall_seconds = time.perf_counter() - t1
             done["stage_reached"] = STAGE_DECODED
 
             perf = read_perf_metrics(result)
-            output_size = perf.get("output_size") or len(
-                tokenizer.encode(str(result), add_special_tokens=False)
+            output_size = perf.get("output_size") or generated_token_count(
+                result, pipe.get_tokenizer()
             )
             if not output_size:
                 raise RuntimeError("no_output: generate() produced no tokens")

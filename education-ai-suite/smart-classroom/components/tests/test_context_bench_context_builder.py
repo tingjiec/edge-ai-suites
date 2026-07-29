@@ -5,9 +5,9 @@ import unittest
 from components.llm.context_bench.context_builder import (
     build_benchmark_prompt,
     build_text_of_token_length,
-    measure_template_overhead,
+    render_prompt,
 )
-from components.llm.context_bench.trial_runner import count_pipeline_prompt_tokens
+from components.llm.context_bench.trial_runner import prepare_pipeline_input
 
 
 class FakeTokenizer:
@@ -42,41 +42,36 @@ class FakeTokenizer:
 
 class TestContextBuilder(unittest.TestCase):
     def test_zero_tokens(self):
-        tok = FakeTokenizer()
-        text, actual = build_text_of_token_length(tok, 0)
-        self.assertEqual(text, "")
-        self.assertEqual(actual, 0)
+        self.assertEqual(build_text_of_token_length(FakeTokenizer(), 0), "")
 
     def test_hits_exact_target_for_word_tokenizer(self):
         tok = FakeTokenizer()
         for target in (50, 500, 5000):
-            text, actual = build_text_of_token_length(tok, target)
+            text = build_text_of_token_length(tok, target)
             # A word-level tokenizer round-trips exactly.
-            self.assertEqual(actual, target, f"target={target}")
             self.assertEqual(len(tok.encode(text, add_special_tokens=False)), target)
 
     def test_large_target_beyond_single_corpus(self):
         tok = FakeTokenizer()
-        _text, actual = build_text_of_token_length(tok, 160000)
-        self.assertEqual(actual, 160000)
+        text = build_text_of_token_length(tok, 160000)
+        self.assertEqual(len(tok.encode(text, add_special_tokens=False)), 160000)
 
-    def test_template_overhead_ignores_user_content(self):
+    def test_empty_transcript_prices_only_the_scaffolding(self):
+        # This is how build_benchmark_prompt backs out the room left for content, so it
+        # must cover the template + system prompt + task text and nothing else.
         tok = FakeTokenizer()
-        messages = [
-            {"role": "system", "content": "one two three four"},
-            {"role": "user", "content": "should be ignored for overhead"},
-        ]
-        overhead = measure_template_overhead(tok, messages, add_generation_prompt=True)
-        empty_render = tok.apply_chat_template(
-            [
-                {"role": "system", "content": "one two three four"},
-                {"role": "user", "content": ""},
-            ],
-            tokenize=False,
-        )
-        self.assertEqual(overhead, len(tok.encode(empty_render)))
-        # User content must not inflate the overhead measurement.
-        self.assertLess(overhead, 10)
+        prompt, overhead = render_prompt(tok, "", add_generation_prompt=True)
+
+        self.assertEqual(overhead, len(tok.encode(prompt)))
+        self.assertIn("CLASSROOM TRANSCRIPT", prompt)
+        self.assertLess(overhead, 50)
+
+    def test_transcript_length_moves_the_rendered_count_one_for_one(self):
+        tok = FakeTokenizer()
+        _, overhead = render_prompt(tok, "")
+        _, with_content = render_prompt(tok, build_text_of_token_length(tok, 1000))
+
+        self.assertEqual(with_content - overhead, 1000)
 
     def test_build_benchmark_prompt_lands_on_target(self):
         tok = FakeTokenizer()
@@ -109,13 +104,32 @@ class TestContextBuilder(unittest.TestCase):
 
         class PipelineTokenizer:
             def encode(self, _prompt):
-                return type("Tokenized", (), {"input_ids": InputIds()})()
+                return tokenized
 
         class Pipeline:
             def get_tokenizer(self):
                 return PipelineTokenizer()
 
-        self.assertEqual(count_pipeline_prompt_tokens(Pipeline(), "prompt"), 160000)
+        tokenized = type("Tokenized", (), {"input_ids": InputIds()})()
+        pipeline_input, count = prepare_pipeline_input(Pipeline(), "prompt", True)
+
+        self.assertIs(pipeline_input, tokenized)
+        self.assertEqual(count, 160000)
+
+    def test_vlm_keeps_text_input_after_pipeline_token_count(self):
+        class PipelineTokenizer:
+            def encode(self, _prompt):
+                input_ids = type("InputIds", (), {"shape": (1, 160000)})()
+                return type("Tokenized", (), {"input_ids": input_ids})()
+
+        class Pipeline:
+            def get_tokenizer(self):
+                return PipelineTokenizer()
+
+        pipeline_input, count = prepare_pipeline_input(Pipeline(), "prompt", False)
+
+        self.assertEqual(pipeline_input, "prompt")
+        self.assertEqual(count, 160000)
 
 
 if __name__ == "__main__":

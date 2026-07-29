@@ -13,6 +13,7 @@ import unittest
 from pathlib import Path
 
 from components.llm.context_bench.benchmark import (
+    _ir_ready,
     auto_cache_size_gb,
     expected_kv_gb,
     fixed_state_cache_bytes,
@@ -65,6 +66,16 @@ class TestTheoreticalKvBytesPerToken(unittest.TestCase):
             "head_dim": 128,
             "layer_types": ["linear_attention"] * 4,
         }
+        self.assertIsNone(theoretical_kv_bytes_per_token(config))
+
+    def test_incomplete_layer_types_returns_none_instead_of_underestimating_kv(self):
+        config = {
+            "num_hidden_layers": 8,
+            "num_key_value_heads": 4,
+            "head_dim": 128,
+            "layer_types": ["full_attention"] * 2,
+        }
+
         self.assertIsNone(theoretical_kv_bytes_per_token(config))
 
     def test_compressed_cache_includes_scale_and_zero_point_per_row(self):
@@ -153,7 +164,7 @@ class TestAutoCacheSize(unittest.TestCase):
 
 
 class TestFixedCacheSizeValidation(unittest.TestCase):
-    def test_accepts_the_35b_160k_pool(self):
+    def test_accepts_a_fixed_pool_above_the_estimate(self):
         validate_fixed_cache_size(cache_size=3, kv_gb=1.61)
 
     def test_rejects_a_pool_smaller_than_persistent_kv(self):
@@ -165,37 +176,52 @@ class TestFixedCacheSizeValidation(unittest.TestCase):
         validate_fixed_cache_size(cache_size=1, kv_gb=None)
 
 
-class TestQwen36Config(unittest.TestCase):
-    def test_keeps_one_capacity_safe_profile(self):
-        path = Path(__file__).parents[1] / "llm" / "context_bench" / "config_qwen3.6_35b_a3b.yaml"
-        config = load_config(str(path))
+class TestShippedConfigs(unittest.TestCase):
+    """The shipped configs are the single source of truth for the run matrix, so these
+    assert the values as configured rather than the values history recommends -- the point
+    of the benchmark is to re-measure candidates. What they do pin is the invariants the
+    measurement depends on: one profile, exact 160K, no prefix caching."""
 
-        self.assertEqual(config.benchmark.models, ["Qwen/Qwen3.6-35B-A3B"])
-        self.assertEqual(config.benchmark.context_tokens, [160000])
-        self.assertEqual(len(config.profiles), 1)
-        profile = config.profiles[0]
-        self.assertEqual(profile["ov"]["KV_CACHE_PRECISION"], "u8")
-        self.assertEqual(profile["scheduler"]["max_num_seqs"], 1)
-        self.assertGreater(profile["scheduler"]["max_num_batched_tokens"], 0)
-        self.assertEqual(profile["scheduler"]["cache_size"], 4)
-        self.assertFalse(profile["scheduler"]["enable_prefix_caching"])
+    CONFIGS = {
+        "config_qwen3.5_9b.yaml": {
+            "model": "Qwen/Qwen3.5-9B",
+            "kv_cache_precision": "f16",
+            "max_num_batched_tokens": 16000,
+        },
+        "config_qwen3.6_35b_a3b.yaml": {
+            "model": "Qwen/Qwen3.6-35B-A3B",
+            "kv_cache_precision": "f16",
+            "max_num_batched_tokens": 80000,
+        },
+    }
 
+    def test_each_config_ships_one_measurable_160k_profile(self):
+        for filename, expected in self.CONFIGS.items():
+            with self.subTest(config=filename):
+                path = Path(__file__).parents[1] / "llm" / "context_bench" / filename
+                config = load_config(str(path))
 
-class TestQwen35Config(unittest.TestCase):
-    def test_keeps_one_ttft_optimized_profile(self):
-        path = Path(__file__).parents[1] / "llm" / "context_bench" / "config_qwen3.5_9b.yaml"
-        config = load_config(str(path))
+                self.assertEqual(config.benchmark.models, [expected["model"]])
+                self.assertEqual(config.benchmark.context_tokens, [160000])
+                # At least 2 output tokens, or there is no decode phase to average.
+                self.assertGreaterEqual(config.benchmark.output_tokens, 2)
+                self.assertEqual(len(config.profiles), 1)
 
-        self.assertEqual(config.benchmark.models, ["Qwen/Qwen3.5-9B"])
-        self.assertEqual(config.benchmark.context_tokens, [160000])
-        self.assertEqual(len(config.profiles), 1)
-        profile = config.profiles[0]
-        self.assertEqual(profile["name"], "optimized-f16-32k")
-        self.assertEqual(profile["ov"]["KV_CACHE_PRECISION"], "f16")
-        self.assertEqual(profile["scheduler"]["max_num_seqs"], 1)
-        self.assertEqual(profile["scheduler"]["max_num_batched_tokens"], 32768)
-        self.assertEqual(profile["scheduler"]["cache_size"], 7)
-        self.assertFalse(profile["scheduler"]["enable_prefix_caching"])
+                profile = config.profiles[0]
+                self.assertEqual(profile["name"], "optimized")
+                self.assertEqual(
+                    profile["ov"]["KV_CACHE_PRECISION"], expected["kv_cache_precision"]
+                )
+                self.assertEqual(profile["scheduler"]["max_num_seqs"], 1)
+                self.assertEqual(
+                    profile["scheduler"]["max_num_batched_tokens"],
+                    expected["max_num_batched_tokens"],
+                )
+                # Omitted, not `auto`: the pool is left to OpenVINO entirely.
+                self.assertNotIn("cache_size", profile["scheduler"])
+                # The prompt is reused across iterations, so a warm prefix cache would
+                # report a TTFT no first request ever sees.
+                self.assertFalse(profile["scheduler"]["enable_prefix_caching"])
 
 
 class TestFixedStateCacheBytes(unittest.TestCase):
@@ -216,6 +242,19 @@ class TestFixedStateCacheBytes(unittest.TestCase):
     def test_missing_ir_is_not_an_error(self):
         with tempfile.TemporaryDirectory() as model_dir:
             self.assertEqual(fixed_state_cache_bytes(model_dir), 0)
+
+
+class TestIrReadiness(unittest.TestCase):
+    def test_requires_a_supported_root_model_and_both_tokenizer_irs(self):
+        with tempfile.TemporaryDirectory() as model_dir:
+            root = Path(model_dir)
+            (root / "openvino_tokenizer.xml").touch()
+            (root / "openvino_detokenizer.xml").touch()
+            (root / "openvino_vision_model.xml").touch()
+            self.assertFalse(_ir_ready(model_dir))
+
+            (root / "openvino_language_model.xml").touch()
+            self.assertTrue(_ir_ready(model_dir))
 
 
 if __name__ == "__main__":

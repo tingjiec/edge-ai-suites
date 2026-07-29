@@ -12,8 +12,10 @@ questions for a candidate summarizer model at long context:
 2. **Which OpenVINO configuration does it fastest?**
 
 It benchmarks a matrix of named configuration *profiles* — KV cache precision, prefill
-chunk size and scheduler cache size — and ranks them by measured TPOT, using TTFT as the
-tie-breaker. Measurement follows the methodology of
+chunk size, scheduler cache size, continuous batching vs the stateful pipeline — and ranks
+them by measured TPOT, using TTFT as the tie-breaker. Each shipped config pins a single
+profile; add entries to `profiles` to A/B several in one run. Measurement follows the
+methodology of
 [llm_bench](https://github.com/openvinotoolkit/openvino.genai/tree/master/tools/llm_bench):
 one warm-up iteration excluded from every statistic, N measured iterations, and the
 **median** reported with min/max so run-to-run spread stays visible.
@@ -50,17 +52,28 @@ components/llm/context_bench/
 .\components\llm\context_bench\run_benchmark.ps1 --list-profiles
 
 # One profile, one short context -- the fast way to confirm the plumbing works
-.\components\llm\context_bench\run_benchmark.ps1 --profiles optimized-f16-32k --contexts 8000 --iterations 1
+.\components\llm\context_bench\run_benchmark.ps1 --profiles optimized --contexts 8000 --iterations 1
 
 # Select the 35B model matrix
 .\components\llm\context_bench\run_benchmark.ps1 --config components/llm/context_bench/config_qwen3.6_35b_a3b.yaml
 ```
 
-Budget the time before starting a full run: at 160K a single Qwen3.5-9B iteration takes
-roughly 245–300 s and a Qwen3.6-35B-A3B iteration roughly 400–500 s. Each model config
-intentionally contains one selected profile. Use `--warmup 0 --iterations 1` for a quick
-capacity check, then use the configured one warm-up and three measured iterations for the
-final median.
+Historical 160K runs took roughly 245–300 s per Qwen3.5-9B iteration and 400–500 s per
+Qwen3.6-35B-A3B iteration; use those only for rough scheduling because the current profiles
+differ from the fixed-cache configurations that produced them. Each model config contains one
+profile, named `optimized`, holding the **candidate** values to be measured:
+
+| Config | KV precision | `max_num_batched_tokens` | `cache_size` |
+|---|---|---:|---|
+| `config_qwen3.5_9b.yaml` | f16 | 16,000 | omitted — OpenVINO manages the pool |
+| `config_qwen3.6_35b_a3b.yaml` | f16 | 80,000 | omitted — OpenVINO manages the pool |
+
+The profile name is not a performance claim. Both prefill chunk sizes sit outside the range
+the historical sweep covered (16,000 is below the 32,768 that looked saturated for the 9B;
+80,000 is above the 64K attempt that the 35B abandoned without a first token), and the 35B's
+f16 KV replaces the u8 cache that its only capacity evidence used. Re-measuring them is the
+point. Use `--warmup 0 --iterations 1` for a quick capacity check, then the configured one
+warm-up and three measured iterations for the final median.
 
 Equivalent invocation if you already have the backend venv active — run from
 `smart-classroom/` so relative model paths resolve:
@@ -111,27 +124,43 @@ Each model-specific config has three sections.
 | Key | Notes |
 |---|---|
 | `models`, `context_tokens` | the run matrix, together with `profiles` |
-| `output_tokens` | decode length per iteration; 64 is enough to measure TPOT |
+| `output_tokens` | decode length per iteration; must be at least 2 to measure TPOT; 64 is the shipped value |
 | `warmup`, `iterations` | iteration 0 is the warm-up and never enters a statistic |
-| `timeout_sec` | hard per-case wall clock; the only time limit |
+| `timeout_sec` | maximum seconds **without a child progress event**, not a cap on the case; refreshed by every milestone. Both configs ship 600 s — see the note below |
 | `max_system_memory_pct` | set to 100 on this PTL run so successful 160K trials are not rejected on host-RAM percentage |
-| `gpu_memory_budget_gb` | **set this per machine** (see below) |
+| `gpu_memory_budget_gb` | finite positive GiB budget; **set this per machine** (see below) |
 | `cache_dir` | set to a path to cache compiled blobs; cuts repeated load time for the 33 GB 35B export |
 | `output_dir` | each run writes to a timestamped subdirectory |
 
 **`profiles`** — the configurations benchmarked in order. `ov` are OpenVINO plugin
 properties; `scheduler` are OpenVINO GenAI `SchedulerConfig` values.
 
-The shipped cache pools are model-specific. At 160K, model-derived persistent KV is
-2.53/4.93 GiB (u8/f16) for 9B and 1.61 GiB (u8) for 35B. The measured-stable 35B config
-reserves 4 GiB, leaving the rest of the 59 GB shared-GPU budget for its 32.8 GB weights and
-temporary prefill allocations. A fixed pool below the estimated persistent KV fails
-before model loading. A completed case above 59 GB keeps its measurements but is marked
-`gpu_memory_limit` and excluded from ranking.
+The current profiles omit `cache_size`; this is distinct from `cache_size: auto`. An omitted
+value leaves pool sizing entirely to OpenVINO. Setting `cache_size: auto` asks this tool to
+derive a pool from the model architecture and configured GPU budget, while a numeric value
+uses a fixed GiB pool and is rejected before loading when it is below the estimated
+persistent KV requirement. A completed case above the configured GPU budget keeps its
+measurements but is marked `gpu_memory_limit` and excluded from ranking.
+
+### `timeout_sec` is a TTFT ceiling in practice
+
+Because the timer resets on every child event, the longest silent interval in a case is one
+prefill — so `timeout_sec` effectively bounds TTFT, not the whole case. Both configs ship
+600 s. Historical 160K TTFTs were 237–350 s for the 9B and 432 s for the 35B, and a **warm-up
+iteration is slower than that** because it also pays first-run kernel compilation. If a run
+reports `timeout` with `stage_reached: prompt_built`, the box was still prefilling: raise
+`timeout_sec` rather than concluding the context length failed.
 
 `enable_prefix_caching` must stay `false`. The same prompt is reused across iterations (as
 llm_bench does), so a warm prefix cache would make every iteration after the warm-up report a
-TTFT that no first request will ever see.
+TTFT that no first request will ever see. Configuration loading rejects profiles or CLI
+overrides that enable it.
+
+Configuration is validated before model loading: contexts and iteration counts must be
+positive integers, warm-up must be non-negative, profile names must be unique, model names
+must be non-empty, timeout must be positive, and profile `ov` / `scheduler` values must be
+mappings. `enable_prefix_caching`, when present, must be the boolean `false`. Invalid values
+fail once with an actionable message instead of failing every case.
 
 ### `gpu_memory_budget_gb` is a per-machine value
 
@@ -180,10 +209,12 @@ An incomplete run is marked as such rather than leaving a stale report that look
 |---|---|
 | `ok` | measured successfully within budget |
 | `memory_limit` | measured, but peak system RAM exceeded `max_system_memory_pct` — numbers kept, ranked out |
+| `gpu_memory_limit` | measured, but peak GPU memory exceeded `gpu_memory_budget_gb` — numbers kept, ranked out |
+| `measurement_error` | generation completed, but RAM or GPU budget telemetry was unavailable — timing kept, ranked out |
 | `oom` | an explicit allocation failure, including the scheduler refusing an oversized `cache_size` |
 | `gpu_abort` | the device aborted a queued command (OpenCL −14 and friends); at the ceiling this is usually memory, but a driver reset looks identical from inside the process |
 | `unsupported` | this runtime build does not implement a requested property (e.g. int4 KV on an older OpenVINO) — skipped, not a hardware verdict |
-| `timeout` | exceeded `timeout_sec` |
+| `timeout` | no child progress event arrived within `timeout_sec` |
 | `crashed` | the child died without reporting; native abort exit codes are decoded in the error text |
 | `no_output` | the case ran without error but produced no measured iteration |
 | `load_error`, `error` | anything else, with `stage_reached` naming the phase that was running |
@@ -200,10 +231,17 @@ generates `warmup + iterations` times over the same prompt — reloading 33 GB o
 iteration would dominate the measurement, and the warm-up is what absorbs lazy weight paging
 and first-run kernel compilation.
 
-Memory is sampled by the **parent**: RAM and GPU counters are process-wide, so the parent sees
+Memory is sampled by the **parent**: RAM and GPU counters are system-wide, so the parent sees
 the child's footprint and its readings survive a child killed on a timeout — exactly the case
 where memory matters most. The parent opens a fresh sampling window per iteration so a
 warm-up's allocation spike is not charged to the measured iterations.
+Unavailable counters remain unavailable rather than becoming zero. A completed generation
+without both peak RAM percentage and peak GPU usage is marked `measurement_error`; otherwise
+the tool could claim that a profile passed a budget it never measured.
+
+The child emits a `prefilled` event on the first streamed token. This refreshes the progress
+timeout and lets the parent report a later native abort as a decode failure even when the
+child dies before it can send its final `done` record.
 
 The child posts its result and then calls `os._exit(0)` **without** running OpenVINO's
 teardown. Destroying a GPU pipeline that has just prefilled a very long context can throw an
@@ -246,4 +284,4 @@ If PowerShell blocks either script:
 ## See also
 
 - [`context_bench_design.md`](context_bench_design.md) — internal design, control
-  flow, and the recorded tuning evidence behind the shipped profiles.
+  flow, current profile contract, and historical tuning evidence.

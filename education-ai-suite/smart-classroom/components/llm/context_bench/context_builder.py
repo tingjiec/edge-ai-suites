@@ -75,16 +75,17 @@ def _corpus_text() -> str:
     return "\n".join(_CORPUS_LINES) + "\n"
 
 
-def build_text_of_token_length(tokenizer: Tokenizer, target_tokens: int) -> tuple:
-    """Return synthetic transcript text whose token count is as close to
-    ``target_tokens`` as the tokenizer's merge rules allow.
+def build_text_of_token_length(tokenizer: Tokenizer, target_tokens: int) -> str:
+    """Synthetic transcript text of ``target_tokens`` tokens, as close as the
+    tokenizer's merge rules allow.
 
-    Returns ``(text, actual_token_count)``. ``actual_token_count`` is measured by
-    re-encoding the decoded text (round-tripped), so it reflects exactly what the
-    downstream pipeline will see, not the pre-truncation id list.
+    Only ever "as close as": decoding a sliced id list can re-merge at the seams, so
+    the exact figure is whatever the *rendered prompt* measures. `build_benchmark_prompt`
+    owns that measurement and corrects against it, which is why nothing here re-encodes
+    the result -- a second pass over 160K tokens per correction round buys no accuracy.
     """
     if target_tokens <= 0:
-        return "", 0
+        return ""
 
     corpus = _corpus_text()
     corpus_ids = tokenizer.encode(corpus, add_special_tokens=False)
@@ -94,34 +95,23 @@ def build_text_of_token_length(tokenizer: Tokenizer, target_tokens: int) -> tupl
     # Repeat the corpus until we have at least the requested number of tokens,
     # then slice the id list to the exact target and decode back to text.
     reps = (target_tokens // len(corpus_ids)) + 1
-    text = corpus * reps
-    ids = tokenizer.encode(text, add_special_tokens=False)[:target_tokens]
-    text = tokenizer.decode(ids, skip_special_tokens=True)
-    actual = len(tokenizer.encode(text, add_special_tokens=False))
-    return text, actual
+    ids = tokenizer.encode(corpus * reps, add_special_tokens=False)[:target_tokens]
+    return tokenizer.decode(ids, skip_special_tokens=True)
 
 
-def measure_template_overhead(
-    tokenizer: Tokenizer,
-    messages: list,
-    empty_user_content: str = "",
-    **template_kwargs,
-) -> int:
-    """Token cost of the chat template + system prompt with an *empty* user turn.
+def render_prompt(tokenizer: Tokenizer, transcript: str, **template_kwargs) -> tuple:
+    """Render the benchmark chat prompt around ``transcript`` and measure it.
 
-    Used to back out how much room is left for transcript content so the final
-    rendered prompt lands on a target size. The last user turn's content is
-    blanked for the measurement so the transcript itself doesn't inflate it.
+    Returns ``(prompt_text, prompt_tokens)``, where the count includes the chat template
+    and special tokens -- the real prefill size the pipeline will see. Passing an empty
+    transcript measures the scaffolding overhead alone.
     """
-    probe = [dict(m) for m in messages]
-    user_idx = next(
-        (i for i in range(len(probe) - 1, -1, -1) if probe[i].get("role") == "user"),
-        None,
-    )
-    if user_idx is not None:
-        probe[user_idx]["content"] = empty_user_content
-    rendered = tokenizer.apply_chat_template(probe, tokenize=False, **template_kwargs)
-    return len(tokenizer.encode(rendered))
+    messages = [
+        {"role": "system", "content": SYSTEM_PROMPT},
+        {"role": "user", "content": _USER_PREFIX + transcript + _USER_SUFFIX},
+    ]
+    prompt = tokenizer.apply_chat_template(messages, tokenize=False, **template_kwargs)
+    return prompt, len(tokenizer.encode(prompt))
 
 
 def build_benchmark_prompt(tokenizer: Tokenizer, target_tokens: int) -> tuple:
@@ -129,22 +119,13 @@ def build_benchmark_prompt(tokenizer: Tokenizer, target_tokens: int) -> tuple:
 
     Sizes the transcript content so that, once the system prompt and chat-template
     scaffolding are added back, the whole rendered prompt lands on the target.
-    Returns ``(prompt_text, prompt_tokens)`` where ``prompt_tokens`` is the real
-    prefill size the pipeline will see (special tokens included).
+    Returns ``(prompt_text, prompt_tokens)``.
     """
     template_kwargs = dict(add_generation_prompt=True, enable_thinking=False)
 
-    empty_messages = [
-        {"role": "system", "content": SYSTEM_PROMPT},
-        {"role": "user", "content": ""},
-    ]
-    fixed_user_content = _USER_PREFIX + _USER_SUFFIX
-    overhead = measure_template_overhead(
-        tokenizer,
-        empty_messages,
-        empty_user_content=fixed_user_content,
-        **template_kwargs,
-    )
+    # An empty transcript prices the template + system prompt + task instructions, which
+    # is the room the content cannot have.
+    _, overhead = render_prompt(tokenizer, "", **template_kwargs)
     content_target = max(0, target_tokens - overhead)
 
     # Token merges at the transcript/template boundaries can make the first
@@ -152,14 +133,10 @@ def build_benchmark_prompt(tokenizer: Tokenizer, target_tokens: int) -> tuple:
     # the value sent to the pipeline is the configured context size, not merely
     # a nearby value. Four corrections are ample for deterministic tokenizers;
     # fail explicitly if a tokenizer cannot converge instead of misreporting it.
-    for _attempt in range(5):
-        content, _actual_content = build_text_of_token_length(tokenizer, content_target)
-        messages = [
-            {"role": "system", "content": SYSTEM_PROMPT},
-            {"role": "user", "content": _USER_PREFIX + content + _USER_SUFFIX},
-        ]
-        prompt = tokenizer.apply_chat_template(messages, tokenize=False, **template_kwargs)
-        prompt_tokens = len(tokenizer.encode(prompt))
+    for _ in range(5):
+        prompt, prompt_tokens = render_prompt(
+            tokenizer, build_text_of_token_length(tokenizer, content_target), **template_kwargs
+        )
         if prompt_tokens == target_tokens:
             return prompt, prompt_tokens
         content_target = max(0, content_target + target_tokens - prompt_tokens)

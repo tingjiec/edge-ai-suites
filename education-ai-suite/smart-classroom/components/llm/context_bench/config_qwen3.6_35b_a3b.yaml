@@ -2,8 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 #
 # PTL 64 GB / 59 GB shared-GPU configuration for Qwen3.6-35B-A3B int8 at 160K.
-# This single profile is the lowest measured TTFT that completed 160K while
-# retaining enough shared-memory headroom for stable decode.
+# One profile: the current candidate, to be measured by this benchmark.
 
 model:
   provider: openvino
@@ -15,28 +14,41 @@ benchmark:
   models: [Qwen/Qwen3.6-35B-A3B]
   context_tokens: [160000]
   output_tokens: 64
-  warmup: 1
-  iterations: 3
-  timeout_sec: 3600
+  warmup: 0
+  iterations: 1
+  # Seconds without ANY progress event from the child, not a wall-clock cap on the case.
+  # The longest silent interval is one prefill, so this is effectively a TTFT ceiling. The
+  # historical 160K TTFT for this model was 432s, so the margin here is thin: a cold
+  # warm-up iteration also pays first-run kernel compilation. Raise this if a warm-up is
+  # reported as `timeout`.
+  timeout_sec: 600
   max_system_memory_pct: 100
   gpu_memory_budget_gb: 59
   cache_dir: null
   output_dir: monitoring/executionlogs/context_bench/qwen3.6_35b_a3b
 
-# Tuning rationale from the 160K screening run:
-# - 32K reduced TTFT by 8.0% versus 16K: 432.34s vs 470.15s.
-# - 64K/cache3 was rejected after it passed 449s without a first token while
-#   system RAM reached 59.26/63.56 GB (93.2%); it was slower and less stable.
-# - u8 KV keeps the persistent 160K cache at 1.61 GiB. cache_size=4 GiB is the
-#   measured stable pool and leaves 15.23 GB under the 59 GB GPU budget.
+# Settings whose rationale is fixed by the benchmark's design, not by tuning:
 # - max_num_seqs=1 avoids concurrency overhead for this single long request.
+# - dynamic_split_fuse=true keeps prefill/decode scheduling fused.
 # - prefix caching stays off so repeated runs cannot report a fictional TTFT.
+# - cache_size omitted: OpenVINO manages the KV pool. The historical baseline used a fixed
+#   4 GiB pool sized for a u8 cache, which does not carry over to either f16 or a
+#   runtime-managed pool.
+#
+# KV precision and prefill chunk size are the candidate values under test, and BOTH differ
+# from anything measured: the historical baseline was u8 KV at 4096, and the best screened
+# run was 32K (TTFT 432.34s, 8.0% better than 16K). f16 doubles bytes-per-token against
+# u8's 1.61 GiB persistent 160K cache on top of 33 GB of weights, and
+# max_num_batched_tokens=80000 is above the 64K attempt that was abandoned after 449s with
+# no first token and system RAM at 93.2%. Treat both as unproven until this run reports a
+# median. See docs/dev-guide/context-bench/.
 profiles:
-  - name: optimized-u8
-    ov: {GPU_ENABLE_LARGE_ALLOCATIONS: "YES", KV_CACHE_PRECISION: u8}
+  - name: optimized
+    ov:
+      GPU_ENABLE_LARGE_ALLOCATIONS: "YES"
+      KV_CACHE_PRECISION: f16
     scheduler:
       max_num_seqs: 1
-      max_num_batched_tokens: 65536
-      cache_size: 4
+      max_num_batched_tokens: 80000
       dynamic_split_fuse: true
       enable_prefix_caching: false

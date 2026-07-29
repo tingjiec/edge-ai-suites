@@ -9,8 +9,8 @@ Answers two questions per (model, context length):
 
 The second question is why this exists in its current form. It benchmarks a
 matrix of named `profiles` -- KV precision, prefill chunk size, continuous
-batching vs the stateful pipeline -- and ranks them by measured end-to-end
-throughput, following llm_bench's methodology: one warm-up iteration that is
+batching vs the stateful pipeline -- and ranks them by TPOT, then TTFT,
+following llm_bench's methodology: one warm-up iteration that is
 excluded from every statistic, N measured iterations, and the median reported
 with min/max so run-to-run spread is visible. The same 160K configuration was
 previously measured at 247.0s and 349.5s on two single-shot runs; a single
@@ -24,7 +24,7 @@ Standalone diagnostic: reads its own bundled model config, never
 smart-classroom/config.yaml, and running it never affects the application.
 
     .\\components\\llm\\context_bench\\run_benchmark.ps1
-    .\\components\\llm\\context_bench\\run_benchmark.ps1 --profiles optimized-f16-32k --iterations 1
+    .\\components\\llm\\context_bench\\run_benchmark.ps1 --profiles optimized --iterations 1
     .\\components\\llm\\context_bench\\run_benchmark.ps1 --list-profiles
 
 Equivalent with the right interpreter already active, run from smart-classroom/
@@ -38,7 +38,6 @@ See docs/dev-guide/context-bench/context_bench_guide.md.
 from __future__ import annotations
 
 import argparse
-import ctypes
 import importlib.util
 import json
 import math
@@ -74,10 +73,6 @@ _SETUP_SCRIPT = os.path.join(_TOOL_DIR, "setup_env.ps1")
 
 _REQUIRED_MODULES = ("openvino_genai", "transformers", "psutil")
 
-# A converted candidate can be a plain causal LM (openvino_model.xml) or a multimodal
-# export (openvino_language_model.xml), so match either layout.
-_MODEL_IR_RE = re.compile(r"(.*)?openvino(.*)?_model(.*)?\.xml$")
-
 # Windows exit codes meaning "a native runtime aborted", decoded so that
 # `crashed:exitcode=3221226505` is not an opaque number.
 _NATIVE_ABORT_EXIT_CODES = {
@@ -111,6 +106,11 @@ _AUTO_CACHE_SAFETY = 1.3
 _AUTO_CACHE_RESERVE_GB = 8.0
 _AUTO_CACHE_MIN_GB = 2.0
 
+# Statuses whose numbers are real measurements and are printed as such. The two
+# memory-limit ones are measurements of a configuration this box cannot use, so they keep
+# every figure and are only excluded from the ranking -- see `_leaderboard`.
+_USABLE_STATUSES = ("ok", "memory_limit", "gpu_memory_limit")
+
 CASE_FIELDS = [
     "model", "profile", "context_tokens", "device", "weight_format",
     "status", "error", "stage_reached",
@@ -125,7 +125,7 @@ CASE_FIELDS = [
     "peak_ram_gb", "peak_ram_pct", "min_available_ram_gb", "post_load_peak_ram_gb",
     "peak_gpu_gb", "post_load_peak_gpu_gb",
     "gpu_budget_gb", "gpu_budget_driver_gb", "peak_gpu_pct_of_budget",
-    "system_memory_limit_exceeded", "gpu_budget_exceeded",
+    "memory_measurement_error", "system_memory_limit_exceeded", "gpu_budget_exceeded",
 ]
 
 ITERATION_CSV_FIELDS = [
@@ -137,50 +137,26 @@ ITERATION_CSV_FIELDS = [
 # ---------------------------------------------------------------------------
 # Memory sampling (parent side)
 #
-# RAM / GPU counters are process-wide, so sampling from the orchestrator captures the
+# RAM / GPU counters are system-wide, so sampling from the orchestrator captures the
 # child's footprint -- and unlike sampling inside the child, these readings survive a
 # child that is killed on a timeout, exactly the case where memory matters most.
 # ---------------------------------------------------------------------------
 def _read_mem() -> dict:
-    ram_used = ram_total = 0.0
-    ram_pct = available_ram = None
+    ram_used = ram_pct = available_ram = None
     try:
         import psutil
 
         vm = psutil.virtual_memory()
-        ram_used, ram_total, ram_pct = vm.used / (1024 ** 3), vm.total / (1024 ** 3), vm.percent
+        ram_used, ram_pct = vm.used / (1024 ** 3), vm.percent
         available_ram = vm.available / (1024 ** 3)
     except Exception:  # noqa: BLE001
         pass
 
-    commit_available = None
-    if sys.platform == "win32":
-        try:
-            class _MemoryStatusEx(ctypes.Structure):
-                _fields_ = [
-                    ("dwLength", ctypes.c_ulong),
-                    ("dwMemoryLoad", ctypes.c_ulong),
-                    ("ullTotalPhys", ctypes.c_ulonglong),
-                    ("ullAvailPhys", ctypes.c_ulonglong),
-                    ("ullTotalPageFile", ctypes.c_ulonglong),
-                    ("ullAvailPageFile", ctypes.c_ulonglong),
-                    ("ullTotalVirtual", ctypes.c_ulonglong),
-                    ("ullAvailVirtual", ctypes.c_ulonglong),
-                    ("ullAvailExtendedVirtual", ctypes.c_ulonglong),
-                ]
-
-            status = _MemoryStatusEx()
-            status.dwLength = ctypes.sizeof(status)
-            if ctypes.windll.kernel32.GlobalMemoryStatusEx(ctypes.byref(status)):
-                commit_available = status.ullAvailPageFile / (1024 ** 3)
-        except (AttributeError, OSError):
-            pass
-
-    gpu_gb = 0.0
+    gpu_gb = None
     try:
         from monitoring.scripts.windows.collect_gpu import get_gpu_memory_total
 
-        used_mb, _dedicated, _shared = get_gpu_memory_total()
+        used_mb = get_gpu_memory_total()[0]
         if used_mb is not None:
             gpu_gb = used_mb / 1024
     except Exception:  # noqa: BLE001
@@ -188,10 +164,8 @@ def _read_mem() -> dict:
 
     return {
         "ram_gb": ram_used,
-        "ram_total_gb": ram_total,
         "ram_pct": ram_pct,
         "available_ram_gb": available_ram,
-        "commit_available_gb": commit_available,
         "gpu_gb": gpu_gb,
     }
 
@@ -212,35 +186,34 @@ class _MemorySampler(threading.Thread):
         super().__init__(daemon=True)
         self._stop_event = threading.Event()
         self.interval = interval
-        self.peak_ram = 0.0
+        self.peak_ram = None
         self.peak_ram_pct = None
-        self.peak_gpu = 0.0
+        self.peak_gpu = None
         self.min_available_ram = None
-        self.min_commit_available = None
-        self._window_ram = 0.0
-        self._window_gpu = 0.0
+        self._window_ram = None
+        self._window_gpu = None
         self.latest = _read_mem()
         self._observe(self.latest)
 
+    def _fold(self, m: dict, pick, key: str, attr: str) -> None:
+        """Fold one reading into a running max/min. An unavailable counter stays absent
+        rather than folding in as 0, which would read as "measured, and it was zero"."""
+        value = m.get(key)
+        if value is None:
+            return
+        current = getattr(self, attr)
+        setattr(self, attr, value if current is None else pick(current, value))
+
     def _observe(self, m: dict) -> None:
-        self.peak_ram = max(self.peak_ram, m["ram_gb"])
-        self.peak_gpu = max(self.peak_gpu, m["gpu_gb"])
-        self._window_ram = max(self._window_ram, m["ram_gb"])
-        self._window_gpu = max(self._window_gpu, m["gpu_gb"])
-        if m.get("ram_pct") is not None:
-            self.peak_ram_pct = (
-                m["ram_pct"] if self.peak_ram_pct is None
-                else max(self.peak_ram_pct, m["ram_pct"])
-            )
         for key, attr in (
-            ("available_ram_gb", "min_available_ram"),
-            ("commit_available_gb", "min_commit_available"),
+            ("ram_gb", "peak_ram"),
+            ("gpu_gb", "peak_gpu"),
+            ("ram_pct", "peak_ram_pct"),
+            ("ram_gb", "_window_ram"),
+            ("gpu_gb", "_window_gpu"),
         ):
-            value = m.get(key)
-            if value is None:
-                continue
-            current = getattr(self, attr)
-            setattr(self, attr, value if current is None else min(current, value))
+            self._fold(m, max, key, attr)
+        self._fold(m, min, "available_ram_gb", "min_available_ram")
 
     def reset_window(self) -> None:
         current = _read_mem()
@@ -248,7 +221,7 @@ class _MemorySampler(threading.Thread):
         self._window_gpu = current["gpu_gb"]
 
     def window(self) -> tuple:
-        return round(self._window_ram, 2), round(self._window_gpu, 2)
+        return _round_optional(self._window_ram), _round_optional(self._window_gpu)
 
     def run(self):
         while not self._stop_event.is_set():
@@ -261,7 +234,13 @@ class _MemorySampler(threading.Thread):
         self._stop_event.set()
 
 
-def _delta(higher: float, lower: float) -> float:
+def _round_optional(value: float | None, digits: int = 2) -> float | None:
+    return round(value, digits) if value is not None else None
+
+
+def _delta(higher: float | None, lower: float | None) -> float | None:
+    if higher is None or lower is None:
+        return None
     return round(max(0.0, higher - lower), 2)
 
 
@@ -275,9 +254,13 @@ def _wait_for_memory_settle(baseline: dict, timeout_sec: float = _MEMORY_SETTLE_
     deadline = time.monotonic() + timeout_sec
     while True:
         current = _read_mem()
-        if (
-            current["ram_gb"] <= baseline["ram_gb"] + _MEMORY_SETTLE_TOLERANCE_GB
-            and current["gpu_gb"] <= baseline["gpu_gb"] + _MEMORY_SETTLE_TOLERANCE_GB
+        # Vacuously true when neither counter is readable: with nothing to compare there is
+        # nothing to wait for, and blocking the full timeout on every case would only slow
+        # a run down on a box where memory is already unmeasurable.
+        if all(
+            current[key] <= baseline[key] + _MEMORY_SETTLE_TOLERANCE_GB
+            for key in ("ram_gb", "gpu_gb")
+            if current.get(key) is not None and baseline.get(key) is not None
         ):
             return True
         if time.monotonic() >= deadline:
@@ -292,7 +275,7 @@ def _weight_disk_gb(model_dir: str) -> float:
     """Weight footprint from the on-disk IR .bin files. For an int8/int4 export this
     closely tracks resident weight memory and is available even if a case OOMs first."""
     total = 0
-    for root, _dirs, files in os.walk(model_dir):
+    for root, _, files in os.walk(model_dir):
         for name in files:
             if name.endswith(".bin"):
                 try:
@@ -339,6 +322,10 @@ def theoretical_kv_bytes_per_token(
     if not num_layers or not num_kv_heads or not head_dim:
         return None
     layer_types = text_cfg.get("layer_types")
+    if layer_types is not None and (
+        not isinstance(layer_types, (list, tuple)) or len(layer_types) != num_layers
+    ):
+        return None
     growing_layers = (
         sum(1 for t in layer_types if t == "full_attention") if layer_types else num_layers
     )
@@ -364,7 +351,7 @@ def fixed_state_cache_bytes(model_dir: str) -> int:
     total = 0
     seen = set()
     try:
-        for _event, elem in ET.iterparse(model_xml, events=("start",)):
+        for _, elem in ET.iterparse(model_xml, events=("start",)):
             variable_id = elem.attrib.get("variable_id", "")
             if not re.search(r"cache_params\.past\.(?:conv|ssm)\.", variable_id):
                 continue
@@ -518,16 +505,38 @@ def _resolve_profiles(raw_profiles, names_filter, ov_overrides, sched_overrides)
 
     resolved = []
     for entry in profiles:
+        if not isinstance(entry, dict):
+            raise SystemExit("every profile must be a {name, ov, scheduler} mapping")
         name = str(entry.get("name") or "").strip()
         if not name:
             raise SystemExit("every profile needs a `name`")
+        sections = {}
+        for key in ("ov", "scheduler"):
+            value = entry.get(key)
+            if value is not None and not isinstance(value, dict):
+                raise SystemExit(f"profile {name!r} ov and scheduler must be mappings")
+            sections[key] = value or {}
+        resolved_scheduler = _apply_overrides(sections["scheduler"], sched_overrides, coerce=True)
+        if (
+            "enable_prefix_caching" in resolved_scheduler
+            and resolved_scheduler["enable_prefix_caching"] is not False
+        ):
+            raise SystemExit(
+                f"profile {name!r} enables prefix caching; repeated-prompt benchmark "
+                "profiles must set enable_prefix_caching=false"
+            )
         resolved.append({
             "name": name,
-            "ov": _apply_overrides(entry.get("ov") or {}, ov_overrides, coerce=False),
+            "ov": _apply_overrides(sections["ov"], ov_overrides, coerce=False),
             # `scheduler: {}` is meaningful -- it selects the stateful pipeline -- so an
             # empty mapping is preserved rather than treated as "unset".
-            "scheduler": _apply_overrides(entry.get("scheduler") or {}, sched_overrides, coerce=True),
+            "scheduler": resolved_scheduler,
         })
+
+    names = [profile["name"] for profile in resolved]
+    duplicates = sorted({name for name in names if names.count(name) > 1})
+    if duplicates:
+        raise SystemExit(f"profile names must be unique; duplicated: {', '.join(duplicates)}")
 
     if names_filter:
         wanted = {n.strip() for n in names_filter}
@@ -575,6 +584,13 @@ def _parse_args():
     return parser.parse_args()
 
 
+def _whole_number(value, message: str, minimum: int = 1) -> int:
+    """A config integer, rejecting bool: a stray `true` is not 1 iteration."""
+    if not isinstance(value, int) or isinstance(value, bool) or value < minimum:
+        raise SystemExit(message)
+    return value
+
+
 def _load_settings(args) -> dict:
     cfg = load_config(args.config)
     model = getattr(cfg, "model", None)
@@ -585,31 +601,67 @@ def _load_settings(args) -> dict:
             "See docs/dev-guide/context-bench/context_bench_guide.md."
         )
 
-    contexts = sorted(set(args.contexts or bench.context_tokens))
-    if not contexts or any(not isinstance(c, int) or isinstance(c, bool) or c <= 0 for c in contexts):
+    configured_contexts = args.contexts if args.contexts is not None else bench.context_tokens
+    if not isinstance(configured_contexts, list) or not configured_contexts or any(
+        not isinstance(context, int) or isinstance(context, bool) or context <= 0
+        for context in configured_contexts
+    ):
         raise SystemExit("benchmark.context_tokens must contain only positive integers")
+    contexts = sorted(set(configured_contexts))
 
     max_ram_pct = getattr(bench, "max_system_memory_pct", 80)
-    if not 0 < max_ram_pct <= 100:
+    if (
+        not isinstance(max_ram_pct, (int, float))
+        or isinstance(max_ram_pct, bool)
+        or not 0 < max_ram_pct <= 100
+    ):
         raise SystemExit("benchmark.max_system_memory_pct must be in (0, 100]")
 
-    iterations = args.iterations if args.iterations is not None else bench.iterations
-    if iterations < 1:
-        raise SystemExit("benchmark.iterations must be at least 1")
+    iterations = _whole_number(
+        args.iterations if args.iterations is not None else bench.iterations,
+        "benchmark.iterations must be a positive integer",
+    )
+    # At least 2 output tokens: TPOT divides by output_size - 1, so a 1-token generation
+    # has no decode phase to measure at all.
+    output_tokens = _whole_number(
+        args.output_tokens if args.output_tokens is not None else bench.output_tokens,
+        "benchmark.output_tokens must be at least 2 to measure TPOT", minimum=2,
+    )
+    warmup = _whole_number(
+        args.warmup if args.warmup is not None else bench.warmup,
+        "benchmark.warmup must be a non-negative integer", minimum=0,
+    )
+
+    models = args.models if args.models is not None else bench.models
+    if not isinstance(models, list) or not models or any(
+        not isinstance(name, str) or not name.strip() for name in models
+    ):
+        raise SystemExit("benchmark.models must contain at least one non-empty model name")
+
+    timeout_sec = bench.timeout_sec
+    if not isinstance(timeout_sec, (int, float)) or isinstance(timeout_sec, bool) or timeout_sec <= 0:
+        raise SystemExit("benchmark.timeout_sec must be greater than 0")
+
+    try:
+        gpu_memory_budget_gb = float(bench.gpu_memory_budget_gb)
+    except (AttributeError, TypeError, ValueError) as exc:
+        raise SystemExit("benchmark.gpu_memory_budget_gb must be a finite positive number") from exc
+    if not math.isfinite(gpu_memory_budget_gb) or gpu_memory_budget_gb <= 0:
+        raise SystemExit("benchmark.gpu_memory_budget_gb must be a finite positive number")
 
     return {
         "provider": model.provider,
         "models_base_path": model.models_base_path,
         "device": args.device or model.device,
         "weight_format": args.weight_format or model.weight_format,
-        "models": args.models or bench.models,
+        "models": models,
         "context_tokens": contexts,
-        "output_tokens": args.output_tokens or bench.output_tokens,
-        "warmup": args.warmup if args.warmup is not None else bench.warmup,
+        "output_tokens": output_tokens,
+        "warmup": warmup,
         "iterations": iterations,
-        "timeout_sec": bench.timeout_sec,
+        "timeout_sec": timeout_sec,
         "max_system_memory_pct": max_ram_pct,
-        "gpu_memory_budget_gb": float(getattr(bench, "gpu_memory_budget_gb", 0) or 0),
+        "gpu_memory_budget_gb": gpu_memory_budget_gb,
         "cache_dir": getattr(bench, "cache_dir", None),
         "output_dir": args.output_dir or bench.output_dir,
         "profiles": _resolve_profiles(
@@ -629,13 +681,13 @@ def _model_ir_dir(base: str, provider: str, model_name: str, weight_format: str)
 def _ir_ready(model_dir: str) -> bool:
     if not os.path.isdir(model_dir):
         return False
-    names = []
-    for _root, _dirs, files in os.walk(model_dir):
-        names.extend(files)
     return (
-        any(_MODEL_IR_RE.search(n) for n in names)
-        and "openvino_tokenizer.xml" in names
-        and "openvino_detokenizer.xml" in names
+        any(
+            os.path.isfile(os.path.join(model_dir, name))
+            for name in ("openvino_model.xml", "openvino_language_model.xml")
+        )
+        and os.path.isfile(os.path.join(model_dir, "openvino_tokenizer.xml"))
+        and os.path.isfile(os.path.join(model_dir, "openvino_detokenizer.xml"))
     )
 
 
@@ -699,7 +751,7 @@ def _run_case_subprocess(
     poll_interval: float = 0.25,
     drain_timeout: float = 5.0,
 ) -> dict:
-    """Run one case to completion, OOM, native abort, or the hard timeout.
+    """Run one case to completion, OOM, native abort, or a progress timeout.
 
     Nothing stops the child on a memory threshold: the point is to find where this box
     actually breaks. Subprocess isolation is what makes that safe -- a native GPU abort
@@ -753,6 +805,8 @@ def _run_case_subprocess(
             state["prompt_tokens"] = msg.get("prompt_tokens", 0)
         elif event == "iteration_start":
             sampler.reset_window()
+        elif event == "prefilled":
+            state["stage_reached"] = trial_runner.STAGE_PREFILLED
         elif event == "iteration":
             state["stage_reached"] = trial_runner.STAGE_DECODED
             record = {k: v for k, v in msg.items() if k != "event"}
@@ -774,7 +828,9 @@ def _run_case_subprocess(
             if not process.is_alive():
                 break  # anything it queued is recovered by the drain below
         else:
-            if _consume(msg, child_alive=True):
+            finished = _consume(msg, child_alive=True)
+            deadline = time.monotonic() + timeout_sec
+            if finished:
                 break
 
     timed_out = result is None and time.monotonic() >= deadline
@@ -800,34 +856,34 @@ def _run_case_subprocess(
 
     if not _wait_for_memory_settle(baseline):
         current = _read_mem()
+        def _mem_text(value):
+            return f"{value:.1f}" if value is not None else "unavailable"
+
         print(
             f"  [warn] memory has not returned to baseline after {_MEMORY_SETTLE_TIMEOUT_SEC:g}s "
-            f"(RAM {current['ram_gb']:.1f} vs {baseline['ram_gb']:.1f} GB, GPU "
-            f"{current['gpu_gb']:.1f} vs {baseline['gpu_gb']:.1f} GB); the next case's "
+            f"(RAM {_mem_text(current['ram_gb'])} vs {_mem_text(baseline['ram_gb'])} GB, GPU "
+            f"{_mem_text(current['gpu_gb'])} vs {_mem_text(baseline['gpu_gb'])} GB); the next case's "
             "weights/KV split may be charged with the leftover",
             flush=True,
         )
 
     mem = {
-        "peak_ram_gb": round(sampler.peak_ram, 2),
-        "peak_ram_pct": round(sampler.peak_ram_pct, 1) if sampler.peak_ram_pct is not None else None,
-        "min_available_ram_gb": (
-            round(sampler.min_available_ram, 2) if sampler.min_available_ram is not None else None
-        ),
-        "peak_gpu_gb": round(sampler.peak_gpu, 2),
+        "peak_ram_gb": _round_optional(sampler.peak_ram),
+        "peak_ram_pct": _round_optional(sampler.peak_ram_pct, 1),
+        "min_available_ram_gb": _round_optional(sampler.min_available_ram),
+        "peak_gpu_gb": _round_optional(sampler.peak_gpu),
         "post_load_peak_ram_gb": _delta(sampler.peak_ram, loaded_mem["ram_gb"]) if loaded_mem else None,
         "post_load_peak_gpu_gb": _delta(sampler.peak_gpu, loaded_mem["gpu_gb"]) if loaded_mem else None,
-        "ram_total_gb": round(baseline["ram_total_gb"], 2),
     }
 
     if result is not None:
         result.pop("event", None)
         # The parent's per-iteration records carry the memory windows the child cannot see.
         result["iterations"] = state["iterations"] or result.get("iterations") or []
-        result["gpu_budget_driver_gb"] = (
-            state["gpu_budget_driver_gb"] or result.pop("gpu_budget_gb", None)
-        )
-        result.pop("gpu_budget_gb", None)
+        # Renamed on the way out: the driver's own figure must not sit under a name that
+        # could be mistaken for the configured budget the tool actually enforces.
+        from_done = result.pop("gpu_budget_gb", None)
+        result["gpu_budget_driver_gb"] = state["gpu_budget_driver_gb"] or from_done
         result.update(mem)
         return result
 
@@ -872,7 +928,9 @@ def _apply_memory_status(case: dict) -> dict:
     """Demote a completed measurement that exceeded a configured memory limit."""
     if case.get("status") != "ok":
         return case
-    if case.get("gpu_budget_exceeded"):
+    if case.get("memory_measurement_error"):
+        case["status"] = "measurement_error"
+    elif case.get("gpu_budget_exceeded"):
         case["status"] = "gpu_memory_limit"
     elif case.get("system_memory_limit_exceeded"):
         case["status"] = "memory_limit"
@@ -930,7 +988,7 @@ def _run_case(model_name, model_dir, profile, context_tokens, settings, static) 
         traceback.print_exc()
         result = {"error": f"orchestrator:error:{exc}", "iterations": [], "load_ok": False}
 
-    peak_gpu = result.get("peak_gpu_gb") or 0.0
+    peak_gpu = result.get("peak_gpu_gb")
     budget = settings["gpu_memory_budget_gb"]
     ram_pct = result.get("peak_ram_pct")
 
@@ -952,13 +1010,16 @@ def _run_case(model_name, model_dir, profile, context_tokens, settings, static) 
         "prompt_tokens": result.get("prompt_tokens"),
         "weight_disk_gb": static["weight_disk_gb"],
         "expected_kv_gb": kv_gb,
-        "gpu_budget_gb": budget or None,
+        "gpu_budget_gb": budget,
         "gpu_budget_driver_gb": result.get("gpu_budget_driver_gb"),
-        "peak_gpu_pct_of_budget": round(peak_gpu / budget * 100, 1) if peak_gpu and budget else None,
+        "peak_gpu_pct_of_budget": (
+            round(peak_gpu / budget * 100, 1) if peak_gpu is not None else None
+        ),
+        "memory_measurement_error": ram_pct is None or peak_gpu is None,
         "system_memory_limit_exceeded": bool(
             ram_pct is not None and ram_pct > settings["max_system_memory_pct"]
         ),
-        "gpu_budget_exceeded": bool(budget and peak_gpu > budget),
+        "gpu_budget_exceeded": bool(peak_gpu is not None and peak_gpu > budget),
         **{k: result.get(k) for k in (
             "peak_ram_gb", "peak_ram_pct", "min_available_ram_gb",
             "post_load_peak_ram_gb", "post_load_peak_gpu_gb", "peak_gpu_gb",
@@ -973,7 +1034,7 @@ def _run_case(model_name, model_dir, profile, context_tokens, settings, static) 
 
 
 def _format_case(case: dict) -> str:
-    if case["status"] not in ("ok", "memory_limit", "gpu_memory_limit"):
+    if case["status"] not in _USABLE_STATUSES:
         detail = f" ({case['error']})" if case.get("error") else ""
         stage = case.get("stage_reached")
         where = (
@@ -982,13 +1043,13 @@ def _format_case(case: dict) -> str:
         )
         return f"  => {case['status'].upper()}{where}{detail}"
     return (
-        f"  => {case['status'].upper()} | TPOT {case.get('other_tokens_avg_latency', 0):.1f} ms/token "
-        f"| TTFT {case.get('first_token_latency', 0) / 1000:.1f}s "
-        f"| decode {case.get('decode_throughput', 0):.2f} tok/s "
-        f"| e2e {case.get('e2e_throughput', 0):.1f} tok/s "
-        f"| peak RAM {case.get('peak_ram_gb', 0):.1f} GB ({case.get('peak_ram_pct') or 0:.1f}%) "
-        f"| peak GPU {case.get('peak_gpu_gb', 0):.1f} GB "
-        f"({case.get('peak_gpu_pct_of_budget') or 0:.1f}% of budget)"
+        f"  => {case['status'].upper()} | TPOT {_fmt(case.get('other_tokens_avg_latency'))} ms/token "
+        f"| TTFT {_ttft_seconds(case)}s "
+        f"| decode {_fmt(case.get('decode_throughput'), '{:.2f}')} tok/s "
+        f"| e2e {_fmt(case.get('e2e_throughput'))} tok/s "
+        f"| peak RAM {_fmt(case.get('peak_ram_gb'))} GB ({_fmt(case.get('peak_ram_pct'))}%) "
+        f"| peak GPU {_fmt(case.get('peak_gpu_gb'))} GB "
+        f"({_fmt(case.get('peak_gpu_pct_of_budget'))}% of budget)"
     )
 
 
@@ -997,6 +1058,21 @@ def _format_case(case: dict) -> str:
 # ---------------------------------------------------------------------------
 def _fmt(value, spec="{:.1f}") -> str:
     return spec.format(value) if isinstance(value, (int, float)) else "--"
+
+
+def _ttft_seconds(case: dict) -> str:
+    """TTFT is recorded in milliseconds (llm_bench's unit) but read in seconds."""
+    ttft = case.get("first_token_latency")
+    return _fmt(ttft / 1000) if isinstance(ttft, (int, float)) else "--"
+
+
+def _best_summary(case: dict) -> str:
+    """The winning profile's one-liner, shared by summary.md and the console tail."""
+    return (
+        f"TPOT {_fmt(case.get('other_tokens_avg_latency'))} ms/token "
+        f"({_fmt(case.get('decode_throughput'), '{:.2f}')} decode tok/s), "
+        f"TTFT {_ttft_seconds(case)}s"
+    )
 
 
 def _leaderboard(cases: list) -> list:
@@ -1008,7 +1084,9 @@ def _leaderboard(cases: list) -> list:
         ),
         key=lambda c: (
             c["other_tokens_avg_latency"],
-            c.get("first_token_latency", float("inf")),
+            c.get("first_token_latency")
+            if isinstance(c.get("first_token_latency"), (int, float))
+            else float("inf"),
         ),
     )
 
@@ -1040,12 +1118,12 @@ def write_reports(output_dir: str, settings: dict, cases: list, platform_info: d
     with open(os.path.join(output_dir, "summary.json"), "w", encoding="utf-8") as f:
         json.dump(summary, f, indent=2, ensure_ascii=False)
 
-    for case in cases:
+    for index, case in enumerate(cases):
         StorageManager.save_csv(
             os.path.join(output_dir, "summary.csv"),
             {field: case.get(field) for field in CASE_FIELDS},
             headers=CASE_FIELDS,
-            append=False if case is cases[0] else True,
+            append=index > 0,  # the first row truncates whatever the last rewrite left
         )
 
     banner = [] if completed else [
@@ -1081,7 +1159,8 @@ def write_reports(output_dir: str, settings: dict, cases: list, platform_info: d
             f"## {context:,} tokens",
             "",
             "| Model | Profile | Status | TPOT ms/token | TTFT s | Decode tok/s | "
-            "E2E tok/s | Prefill tok/s | Peak RAM | Peak GPU (% of 59 GB) | Expected KV | cache_size |",
+            f"E2E tok/s | Prefill tok/s | Peak RAM | Peak GPU "
+            f"(% of {settings['gpu_memory_budget_gb']:g} GB) | Expected KV | cache_size |",
             "|---|---|---|---|---|---|---|---|---|---|---|---|",
         ]
         ranked = _leaderboard(at_context)
@@ -1090,43 +1169,42 @@ def write_reports(output_dir: str, settings: dict, cases: list, platform_info: d
         ranked_ids = {id(c) for c in ranked}
         rest = [c for c in at_context if id(c) not in ranked_ids]
         for case in ranked + rest:
-            usable = case["status"] in ("ok", "memory_limit", "gpu_memory_limit")
-            ttft = case.get("first_token_latency")
-            gpu = _fmt(case.get('peak_gpu_gb'))
-            gpu_pct = _fmt(case.get('peak_gpu_pct_of_budget'))
+            # A case that never produced a measurement still gets a row -- its status is
+            # the finding -- but its timing columns stay blank rather than reading as zeros.
+            timings = [
+                _fmt(case.get("other_tokens_avg_latency")),
+                _ttft_seconds(case),
+                _fmt(case.get("decode_throughput"), "{:.2f}"),
+                _fmt(case.get("e2e_throughput")),
+                _fmt(case.get("prefill_throughput")),
+            ]
+            if case["status"] not in _USABLE_STATUSES:
+                timings = ["--"] * len(timings)
             lines.append(
                 f"| {case['model']} | {case['profile']} | {case['status']} | "
-                f"{_fmt(case.get('other_tokens_avg_latency')) if usable else '--'} | "
-                f"{_fmt(ttft / 1000) if usable and ttft else '--'} | "
-                f"{_fmt(case.get('decode_throughput'), '{:.2f}') if usable else '--'} | "
-                f"{_fmt(case.get('e2e_throughput')) if usable else '--'} | "
-                f"{_fmt(case.get('prefill_throughput')) if usable else '--'} | "
-                f"{_fmt(case.get('peak_ram_gb'))} GB | {gpu} GB ({gpu_pct}%) | "
-                f"{_fmt(case.get('expected_kv_gb'), '{:.2f}')} GB | "
-                f"{_fmt(case.get('cache_size_gb'), '{:g}')} |"
+                + " | ".join(timings)
+                + f" | {_fmt(case.get('peak_ram_gb'))} GB "
+                f"| {_fmt(case.get('peak_gpu_gb'))} GB "
+                f"({_fmt(case.get('peak_gpu_pct_of_budget'))}%) "
+                f"| {_fmt(case.get('expected_kv_gb'), '{:.2f}')} GB "
+                f"| {_fmt(case.get('cache_size_gb'), '{:g}')} |"
             )
         lines.append("")
 
-        best = ranked[0] if ranked else None
-        if best:
+        if ranked:
+            best = ranked[0]
             lines += [
                 f"**Best TPOT at {context:,} tokens: `{best['profile']}`** on {best['model']} -- "
-                f"TPOT {best['other_tokens_avg_latency']:.1f} ms/token "
-                f"({best['decode_throughput']:.2f} decode tok/s), TTFT "
-                f"{best['first_token_latency'] / 1000:.1f}s, e2e "
-                f"{best['e2e_throughput']:.1f} tok/s, peak GPU "
-                f"{best.get('peak_gpu_gb', 0):.1f} GB "
-                f"({best.get('peak_gpu_pct_of_budget', 0):.1f}% of configured budget).",
+                f"{_best_summary(best)}, e2e {_fmt(best.get('e2e_throughput'))} tok/s, peak GPU "
+                f"{_fmt(best.get('peak_gpu_gb'))} GB "
+                f"({_fmt(best.get('peak_gpu_pct_of_budget'))}% of configured budget).",
                 "",
                 f"    ov:        {best['ov_config']}",
                 f"    scheduler: {best['scheduler_config']}",
                 "",
             ]
 
-    failures = [
-        c for c in cases
-        if c["status"] not in ("ok", "memory_limit", "gpu_memory_limit")
-    ]
+    failures = [c for c in cases if c["status"] not in _USABLE_STATUSES]
     if failures:
         lines += ["## Cases that did not produce a measurement", "",
                   "| Model | Profile | Context | Status | Error |", "|---|---|---|---|---|"]
@@ -1232,16 +1310,15 @@ def main() -> None:
                 settings["weight_format"],
             )
             if not _ir_ready(model_dir):
+                export = _prep_command(model_name, model_dir, settings["weight_format"])
                 print(
-                    f"\n[{model_name}] IR not found at {model_dir}\n"
-                    f"  Run first: {_prep_command(model_name, model_dir, settings['weight_format'])}",
+                    f"\n[{model_name}] IR not found at {model_dir}\n  Run first: {export}",
                     flush=True,
                 )
                 cases.append({
                     "model": model_name, "profile": "-", "context_tokens": 0,
                     "device": settings["device"], "weight_format": settings["weight_format"],
-                    "status": "missing_ir",
-                    "error": _prep_command(model_name, model_dir, settings["weight_format"]),
+                    "status": "missing_ir", "error": export,
                 })
                 continue
 
@@ -1272,17 +1349,16 @@ def main() -> None:
         except Exception:  # noqa: BLE001 - must not mask whatever is already unwinding
             traceback.print_exc()
         else:
-            best = _leaderboard(cases)
-            if best:
-                top = best[0]
-                print(
-                    f"\nBest TPOT: {top['profile']} on {top['model']} at "
-                    f"{top['context_tokens']:,} tokens -- "
-                    f"{top['other_tokens_avg_latency']:.1f} ms/token, "
-                    f"{top['decode_throughput']:.2f} decode tok/s, "
-                    f"TTFT {top['first_token_latency'] / 1000:.1f}s",
-                    flush=True,
+            for context in settings["context_tokens"]:
+                ranked = _leaderboard(
+                    [case for case in cases if case.get("context_tokens") == context]
                 )
+                if ranked:
+                    print(
+                        f"\nBest TPOT at {context:,} tokens: {ranked[0]['profile']} on "
+                        f"{ranked[0]['model']} -- {_best_summary(ranked[0])}",
+                        flush=True,
+                    )
             print(
                 f"Reports written to {output_dir} (iterations.csv, summary.csv, summary.md, "
                 "summary.json)" + ("" if completed else " -- run ended early, marked incomplete"),
