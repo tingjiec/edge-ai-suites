@@ -300,6 +300,29 @@ class TestParentRecoversResultRacingChildExit(_ParentHarness):
         self.assertEqual(result["iterations"][0]["peak_ram_gb"], _FAKE_MEM["ram_gb"])
         self.assertEqual(result["iterations"][0]["peak_gpu_gb"], _FAKE_MEM["gpu_gb"])
 
+    def test_window_restarts_at_the_reset_while_the_case_peak_persists(self):
+        """A warm-up's spike must not be charged to the measured iteration, and clearing the
+        window must not clear the case-wide peak. Does not reproduce the fold/reset race
+        itself -- that needs an interleaving inside `_fold`, which the lock added there
+        excludes by construction -- but it pins the two accumulators' separation."""
+        sampler = benchmark._MemorySampler(interval=3600)  # never ticks on its own
+
+        spike = {"ram_gb": 60.0, "gpu_gb": 50.0, "ram_pct": 95.0, "available_ram_gb": 1.0}
+        sampler._observe(spike)
+        self.assertEqual(sampler.window(), (60.0, 50.0))
+
+        quiet = {"ram_gb": 20.0, "gpu_gb": 10.0, "ram_pct": 30.0, "available_ram_gb": 40.0}
+        with mock.patch.object(benchmark, "_read_mem", return_value=quiet):
+            sampler.reset_window()
+        # A sample arriving after the reset folds against the *reset* baseline, so the
+        # window reports this iteration's peak, not the previous one's.
+        sampler._observe(quiet)
+
+        self.assertEqual(sampler.window(), (20.0, 10.0))
+        # The case-wide peak is a separate accumulator and must still remember the spike.
+        self.assertEqual(sampler.peak_ram, 60.0)
+        self.assertEqual(sampler.peak_gpu, 50.0)
+
     def test_post_mortem_loaded_event_sets_load_ok_without_a_memory_snapshot(self):
         # A post-load snapshot taken after the child is gone would measure a dead
         # process, so the drain records loading and leaves growth columns empty.

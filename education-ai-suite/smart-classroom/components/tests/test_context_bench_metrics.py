@@ -471,6 +471,11 @@ class TestPerfMetricsAreTheStandardSource(unittest.TestCase):
                 raise RuntimeError("not available")
             return self._values["generated"]
 
+        def get_num_input_tokens(self):
+            if "consumed" not in self._values:
+                raise RuntimeError("not available")
+            return self._values["consumed"]
+
     class _Result:
         def __init__(self, perf):
             self.perf_metrics = perf
@@ -494,6 +499,25 @@ class TestPerfMetricsAreTheStandardSource(unittest.TestCase):
         self.assertEqual(read["first_token_latency"], 237_000.0)
         self.assertNotIn("generation_time", read)
         self.assertNotIn("output_size", read)
+        self.assertNotIn("input_size", read)
+
+    def test_reads_the_prefilled_token_count_the_runtime_reports(self):
+        """What the pipeline actually prefilled, which the VLMPipeline path cannot get
+        from the prompt it measured -- prefill/e2e throughput divide by this."""
+        read = trial_runner.read_perf_metrics(
+            self._Result(self._Perf(ttft=237_000.0, consumed=160_000))
+        )
+
+        self.assertEqual(read["input_size"], 160_000)
+
+    def test_a_zero_input_count_does_not_displace_the_measured_prompt(self):
+        """A runtime that leaves the counter at 0 must fall through to the counted prompt,
+        or every throughput divides by zero."""
+        read = trial_runner.read_perf_metrics(
+            self._Result(self._Perf(ttft=237_000.0, consumed=0))
+        )
+
+        self.assertNotIn("input_size", read)
 
     def test_a_result_without_perf_metrics_falls_back_entirely(self):
         self.assertEqual(trial_runner.read_perf_metrics(object()), {})

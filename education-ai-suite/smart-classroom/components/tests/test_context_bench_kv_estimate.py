@@ -186,12 +186,10 @@ class TestShippedConfigs(unittest.TestCase):
         "config_qwen3.5_9b.yaml": {
             "model": "Qwen/Qwen3.5-9B",
             "kv_cache_precision": "f16",
-            "max_num_batched_tokens": 16000,
         },
         "config_qwen3.6_35b_a3b.yaml": {
             "model": "Qwen/Qwen3.6-35B-A3B",
             "kv_cache_precision": "f16",
-            "max_num_batched_tokens": 80000,
         },
     }
 
@@ -213,10 +211,12 @@ class TestShippedConfigs(unittest.TestCase):
                     profile["ov"]["KV_CACHE_PRECISION"], expected["kv_cache_precision"]
                 )
                 self.assertEqual(profile["scheduler"]["max_num_seqs"], 1)
-                self.assertEqual(
-                    profile["scheduler"]["max_num_batched_tokens"],
-                    expected["max_num_batched_tokens"],
-                )
+                # A positive prefill chunk, not a specific one: this is the value the
+                # benchmark exists to sweep, so pinning it here would make every
+                # measurement of a new candidate a test failure.
+                chunk = profile["scheduler"]["max_num_batched_tokens"]
+                self.assertIsInstance(chunk, int)
+                self.assertGreater(chunk, 0)
                 # Omitted, not `auto`: the pool is left to OpenVINO entirely.
                 self.assertNotIn("cache_size", profile["scheduler"])
                 # The prompt is reused across iterations, so a warm prefix cache would

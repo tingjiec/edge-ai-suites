@@ -180,6 +180,13 @@ class _MemorySampler(threading.Thread):
 
     `reset_window()` / `window()` carve the same stream into per-iteration slices so a
     warm-up's allocation spike is not charged to the measured iterations.
+
+    The fold and the reset are locked against each other. Without that they race: this
+    thread reads `_window_ram`, the orchestrator resets it to the current reading, and then
+    this thread writes back `max(pre-reset peak, sample)` -- restoring the peak the reset
+    just cleared and charging the previous iteration's spike to the next one, which is the
+    one thing `reset_window()` exists to prevent. `_read_mem()` is a PDH query taking tens
+    of milliseconds, so the window in which that interleaving can happen is wide.
     """
 
     def __init__(self, interval: float = 0.5):
@@ -192,6 +199,7 @@ class _MemorySampler(threading.Thread):
         self.min_available_ram = None
         self._window_ram = None
         self._window_gpu = None
+        self._lock = threading.Lock()
         self.latest = _read_mem()
         self._observe(self.latest)
 
@@ -205,23 +213,28 @@ class _MemorySampler(threading.Thread):
         setattr(self, attr, value if current is None else pick(current, value))
 
     def _observe(self, m: dict) -> None:
-        for key, attr in (
-            ("ram_gb", "peak_ram"),
-            ("gpu_gb", "peak_gpu"),
-            ("ram_pct", "peak_ram_pct"),
-            ("ram_gb", "_window_ram"),
-            ("gpu_gb", "_window_gpu"),
-        ):
-            self._fold(m, max, key, attr)
-        self._fold(m, min, "available_ram_gb", "min_available_ram")
+        with self._lock:
+            for key, attr in (
+                ("ram_gb", "peak_ram"),
+                ("gpu_gb", "peak_gpu"),
+                ("ram_pct", "peak_ram_pct"),
+                ("ram_gb", "_window_ram"),
+                ("gpu_gb", "_window_gpu"),
+            ):
+                self._fold(m, max, key, attr)
+            self._fold(m, min, "available_ram_gb", "min_available_ram")
 
     def reset_window(self) -> None:
+        # Sampled before taking the lock: holding it across a PDH query would stall the
+        # sampler thread for as long as the query takes.
         current = _read_mem()
-        self._window_ram = current["ram_gb"]
-        self._window_gpu = current["gpu_gb"]
+        with self._lock:
+            self._window_ram = current["ram_gb"]
+            self._window_gpu = current["gpu_gb"]
 
     def window(self) -> tuple:
-        return _round_optional(self._window_ram), _round_optional(self._window_gpu)
+        with self._lock:
+            return _round_optional(self._window_ram), _round_optional(self._window_gpu)
 
     def run(self):
         while not self._stop_event.is_set():
@@ -782,7 +795,8 @@ def _run_case_subprocess(
     state = {
         "load_ok": False,
         "stage_reached": trial_runner.STAGE_START,
-        "prompt_tokens": 0,
+        # Unknown until a prompt milestone arrives from the child.
+        "prompt_tokens": None,
         "gpu_budget_driver_gb": None,
         "iterations": [],
     }
@@ -972,6 +986,12 @@ def _run_case(model_name, model_dir, profile, context_tokens, settings, static) 
     print(f"  ov: {format_config(ov_config)}", flush=True)
     print(f"  scheduler: {format_config(scheduler_config) if scheduler_config else '(stateful)'}",
           flush=True)
+    if "cache_size" not in scheduler_config:
+        print(
+            "  note: cache_size is unset; OpenVINO runtime manages the KV pool. "
+            "Peak GPU memory can look flatter across contexts when the pool is pre-allocated.",
+            flush=True,
+        )
 
     def _echo(record):
         print("  " + metrics.format_iteration(record), flush=True)

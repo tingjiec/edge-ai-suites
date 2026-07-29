@@ -261,6 +261,12 @@ def read_perf_metrics(result) -> dict:
     wall-clock timing wherever the runtime provides it. Every field is optional: older
     or partial runtime builds leave some unset, and the caller falls back per field
     rather than discarding the whole record.
+
+    `input_size` is the runtime's own count of the tokens it prefilled, which is not
+    redundant with the prompt measured before the call: on the VLMPipeline path the
+    pipeline tokenizes the string itself (see prepare_pipeline_input), so the count taken
+    here is what was requested, not necessarily what ran -- and prefill/e2e throughput
+    divide by it.
     """
     out = {}
     perf = getattr(result, "perf_metrics", None)
@@ -282,6 +288,12 @@ def read_perf_metrics(result) -> dict:
         generated = perf.get_num_generated_tokens()
         if isinstance(generated, int) and generated > 0:
             out["output_size"] = generated
+    except Exception:  # noqa: BLE001
+        pass
+    try:
+        consumed = perf.get_num_input_tokens()
+        if isinstance(consumed, int) and consumed > 0:
+            out["input_size"] = consumed
     except Exception:  # noqa: BLE001
         pass
     try:
@@ -361,7 +373,8 @@ def run_case(
         "context_tokens": context_tokens,
         "load_ok": False,
         "load_time_s": None,
-        "prompt_tokens": 0,
+        # Unknown until the prompt has been built and tokenized.
+        "prompt_tokens": None,
         "iterations": [],
         "stage_reached": STAGE_START,
         "error": None,
@@ -416,6 +429,10 @@ def run_case(
         # which would score a false failure for a context the box handled.
         gen_config = generation_config(pipe, output_tokens)
 
+        # Warned about once per case, not once per iteration: every iteration reuses the
+        # one prompt, so a divergence is a property of the case.
+        input_size_reported = False
+
         for index in range(warmup + iterations):
             is_warmup = index < warmup
             result_queue.put({"event": "iteration_start", "iteration": index, "warmup": is_warmup})
@@ -449,9 +466,25 @@ def run_case(
             if not output_size:
                 raise RuntimeError("no_output: generate() produced no tokens")
 
+            # Prefer what the runtime says it prefilled over what was asked for: on the
+            # VLMPipeline path the pipeline re-tokenizes the prompt string, so the two can
+            # differ, and reporting a throughput per *requested* token would divide by a
+            # number no forward pass ever saw. Not fatal -- the measurement is real either
+            # way, and iterations.csv's input_size now says which context length it is of.
+            input_size = perf.get("input_size") or prompt_tokens
+            if input_size != prompt_tokens and not input_size_reported:
+                input_size_reported = True
+                print(
+                    f"[trial_runner] runtime prefilled {input_size:,} tokens where the "
+                    f"prompt measured {prompt_tokens:,}; throughputs use the runtime's "
+                    "count. Expected on the VLMPipeline path, which tokenizes the string "
+                    "itself rather than accepting TokenizedInputs.",
+                    file=sys.stderr,
+                )
+
             record = metrics.iteration_record(
                 iteration=index,
-                input_size=prompt_tokens,
+                input_size=input_size,
                 output_size=output_size,
                 generation_time=perf.get("generation_time", wall_seconds),
                 first_token_latency=perf.get("first_token_latency", ttft_ms),

@@ -46,9 +46,9 @@ profiles:
   - name: optimized
     ov:
       GPU_ENABLE_LARGE_ALLOCATIONS: "YES"
-      KV_CACHE_PRECISION: f16
+      KV_CACHE_PRECISION: u8
     scheduler:
       max_num_seqs: 1
-      max_num_batched_tokens: 80000
+      max_num_batched_tokens: 64000
       dynamic_split_fuse: true
       enable_prefix_caching: false

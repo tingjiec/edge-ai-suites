@@ -38,7 +38,7 @@ benchmark:
 #
 # KV precision and prefill chunk size are the candidate values under test. f16 KV has
 # historical support -- it beat u8 on TTFT by ~32% on this model -- while
-# max_num_batched_tokens=16000 is BELOW the 32768 that historically looked saturated
+# max_num_batched_tokens=8000 is BELOW the 32768 that historically looked saturated
 # (4096 -> 16384 -> 32768 improved total time ~3.4% then ~8.0% cumulative; 65536 was
 # slower). That earlier sweep was single-shot per point, which is exactly what this tool's
 # warm-up + median iterations exist to re-check. See docs/dev-guide/context-bench/.
@@ -49,6 +49,7 @@ profiles:
       KV_CACHE_PRECISION: f16
     scheduler:
       max_num_seqs: 1
-      max_num_batched_tokens: 16000
+      max_num_batched_tokens: 64000
+      cache_size: auto
       dynamic_split_fuse: true
       enable_prefix_caching: false
