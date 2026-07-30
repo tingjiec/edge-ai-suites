@@ -12,6 +12,10 @@ Two throughput figures matter at 160K and they are not interchangeable.
 context lengths TTFT is ~96% of total generation time -- while
 `decode_throughput` is llm_bench's "2nd token" rate. `e2e_throughput` is the one
 number that summarizes end-to-end work; profile ranking uses TPOT, then TTFT.
+
+The `mean_*_gb` memory fields are the exception to "one record, one generate": they
+are measured by the orchestrator, not the child, and merged into each record before
+aggregation. See `benchmark._MemorySampler` for why peak and mean are both reported.
 """
 
 from __future__ import annotations
@@ -45,6 +49,15 @@ AGGREGATED_METRICS = [
     "prefill_throughput",
     "decode_throughput",
     "e2e_throughput",
+]
+
+# Median only, no _min/_max. These are the orchestrator's per-iteration memory windows,
+# merged into each record before aggregation (see benchmark._MemorySampler): the case-level
+# `peak_*` is already the whole-case high-water mark, so a min/max *of the means* would add
+# columns that answer nothing the peak does not.
+MEDIAN_ONLY_METRICS = [
+    "mean_ram_gb",
+    "mean_gpu_gb",
 ]
 
 
@@ -119,6 +132,10 @@ def aggregate(records: list) -> dict:
         out[metric] = round(statistics.median(values), 3)
         out[f"{metric}_min"] = round(min(values), 3)
         out[f"{metric}_max"] = round(max(values), 3)
+    for metric in MEDIAN_ONLY_METRICS:
+        values = [r[metric] for r in rows if r.get(metric) is not None]
+        if values:
+            out[metric] = round(statistics.median(values), 2)
     for field in ("input_size", "output_size"):
         out[field] = rows[-1].get(field)
     return out

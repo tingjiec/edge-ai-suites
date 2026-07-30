@@ -2,7 +2,8 @@
 # SPDX-License-Identifier: Apache-2.0
 #
 # PTL 64 GB / 59 GB shared-GPU configuration for Qwen3.6-35B-A3B int8 at 160K.
-# One profile: the current candidate, to be measured by this benchmark.
+# Two profiles that differ ONLY in the pipeline: stateful (SDPA) vs paged attention with a
+# capped KV pool. TTFT is the figure under test.
 
 model:
   provider: openvino
@@ -18,37 +19,60 @@ benchmark:
   iterations: 1
   # Seconds without ANY progress event from the child, not a wall-clock cap on the case.
   # The longest silent interval is one prefill, so this is effectively a TTFT ceiling. The
-  # historical 160K TTFT for this model was 432s, so the margin here is thin: a cold
-  # warm-up iteration also pays first-run kernel compilation. Raise this if a warm-up is
-  # reported as `timeout`.
-  timeout_sec: 600
+  # historical 160K TTFT here was 432s with paged attention and a fixed pool, on top of 33 GB
+  # of weights; the stateful single-pass prefill has never been measured on this box. 1800s
+  # keeps a slow-but-real TTFT reportable instead of collapsing it into `timeout`.
+  timeout_sec: 1800
   max_system_memory_pct: 100
   gpu_memory_budget_gb: 59
   cache_dir: null
   output_dir: monitoring/executionlogs/context_bench/qwen3.6_35b_a3b
 
-# Settings whose rationale is fixed by the benchmark's design, not by tuning:
-# - max_num_seqs=1 avoids concurrency overhead for this single long request.
-# - dynamic_split_fuse=true keeps prefill/decode scheduling fused.
-# - prefix caching stays off so repeated runs cannot report a fictional TTFT.
-# - cache_size omitted: OpenVINO manages the KV pool. The historical baseline used a fixed
-#   4 GiB pool sized for a u8 cache, which does not carry over to either f16 or a
-#   runtime-managed pool.
+# Both profiles carry the SAME `ov` block, so the pipeline is the only variable between them
+# and the two TTFTs are comparable. u8 KV is kept because it is what this model's only
+# capacity evidence used (1.61 GiB persistent 160K cache); with 33 GB of weights in the same
+# shared 59 GB budget, doubling cache bytes is a separate experiment from this one.
 #
-# KV precision and prefill chunk size are the candidate values under test, and BOTH differ
-# from anything measured: the historical baseline was u8 KV at 4096, and the best screened
-# run was 32K (TTFT 432.34s, 8.0% better than 16K). f16 doubles bytes-per-token against
-# u8's 1.61 GiB persistent 160K cache on top of 33 GB of weights, and
-# max_num_batched_tokens=80000 is above the 64K attempt that was abandoned after 449s with
-# no first token and system RAM at 93.2%. Treat both as unproven until this run reports a
-# median. See docs/dev-guide/context-bench/.
+# `cache_size` is a SchedulerConfig property, and passing any SchedulerConfig selects
+# continuous batching, so a capped KV pool and the stateful pipeline are alternatives, not
+# settings to combine: on genai 2026.4 nothing in the GPU plugin's 51 properties bounds the
+# cache on the stateful path. Hence two profiles rather than one.
+# See docs/dev-guide/context-bench/.
 profiles:
-  - name: optimized
+  # No scheduler section at all -> the stateful (SDPA) pipeline. Prefill is one pass over the
+  # whole 160K context, and the KV cache is model state that grows with it. This is the riskier
+  # of the two here: the single-pass attention workspace is added to 33 GB of resident weights,
+  # so `oom` or `gpu_abort` is a plausible outcome and is itself the finding.
+  - name: stateful
     ov:
       GPU_ENABLE_LARGE_ALLOCATIONS: "YES"
       KV_CACHE_PRECISION: u8
+
+  # Continuous batching with the KV pool capped, and nothing else hand-tuned. cache_size=4 GiB
+  # is the pool the historical 8K-224K baseline ran on with u8 KV, comfortably above the
+  # 1.61 GiB the persistent cache needs at 160K.
+  #
+  # max_num_batched_tokens is set rather than left at OpenVINO's default because that default
+  # is 256: with dynamic_split_fuse on, a 160K prefill would run as ~625 chunks and the
+  # comparison against the stateful pass would measure the chunk count, not the pipeline.
+  # 32768 is the best value ever screened on this model (TTFT 432.34s, 8.0% better than 16K);
+  # 64K was abandoned after 449s with no first token and system RAM at 93.2%.
+  # dynamic_split_fuse is left at its default of true -- one 160K request does not need it
+  # tuned.
+  - name: paged_min
+    ov:
+      GPU_ENABLE_LARGE_ALLOCATIONS: "YES"
+      KV_CACHE_PRECISION: f16
     scheduler:
+      max_num_batched_tokens: 65536
+      # NOT a concurrency setting on this model, and not safe to leave at genai's default of
+      # 256. Qwen3.6-35B-A3B is hybrid (10 full_attention + 30 linear_attention layers), and
+      # the paged backend reserves one whole linear-attention state -- 63.75 MiB here -- per
+      # schedulable sequence, out of the same `cache_size` pool the KV blocks come from. At 256
+      # that reservation is 15.9 GB, which on its own is four times this pool: the 160K request
+      # is then dropped as out-of-memory *after* 33 GB of weights have loaded. Confirmed on the
+      # 9B, where the same default produced exactly that failure at 160K.
       max_num_seqs: 1
-      max_num_batched_tokens: 64000
-      dynamic_split_fuse: true
+      # Mandatory, not tuning: iterations reuse one prompt, so a warm prefix cache would
+      # report a TTFT no first request ever sees.
       enable_prefix_caching: false

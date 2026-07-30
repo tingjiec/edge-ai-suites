@@ -118,6 +118,29 @@ class TestSettingsValidation(unittest.TestCase):
             ):
                 self._load(config)
 
+    def test_profile_level_cache_size_is_rejected_with_a_pointer_to_scheduler(self):
+        # The mistake this exists for: `cache_size` written next to `ov` in the belief that it
+        # caps the stateful pipeline's cache. It does not exist there, and silently ignoring it
+        # would run hours of measurement on a configuration the author did not ask for.
+        config = _settings_config()
+        config.profiles[0]["cache_size"] = 8
+
+        with self.assertRaisesRegex(SystemExit, "unknown key"):
+            self._load(config)
+
+    def test_scheduler_override_on_a_stateful_profile_announces_the_pipeline_change(self):
+        with mock.patch("builtins.print") as printed:
+            settings = self._load(_settings_config(), scheduler_config=["cache_size=8"])
+
+        self.assertEqual(
+            benchmark.pipeline_mode(settings["profiles"][0]["scheduler"]),
+            benchmark.PIPELINE_PAGED,
+        )
+        self.assertTrue(
+            any("moved profile" in str(call) for call in printed.call_args_list),
+            "switching a profile off the stateful pipeline must not be silent",
+        )
+
     def test_gpu_budget_must_be_finite_and_positive(self):
         for value in (0, -1, float("nan"), float("inf"), "not-a-number"):
             with self.subTest(value=value), self.assertRaisesRegex(
@@ -332,6 +355,41 @@ class TestProfileRanking(unittest.TestCase):
             ["measured-ttft", "missing-ttft"],
         )
 
+    def test_ttft_leaderboard_ignores_tpot_so_a_prefill_win_is_visible(self):
+        # The stateful-vs-paged question is decided in prefill. Ranking only by TPOT would
+        # report the paged profile as the winner even when it takes 100s longer to first token.
+        cases = [
+            {
+                "profile": "paged_min",
+                "status": "ok",
+                "other_tokens_avg_latency": 160.0,
+                "first_token_latency": 300_000.0,
+            },
+            {
+                "profile": "stateful",
+                "status": "ok",
+                "other_tokens_avg_latency": 170.0,
+                "first_token_latency": 200_000.0,
+            },
+        ]
+
+        self.assertEqual(
+            [case["profile"] for case in benchmark._ttft_leaderboard(cases)],
+            ["stateful", "paged_min"],
+        )
+        self.assertEqual(benchmark._leaderboard(cases)[0]["profile"], "paged_min")
+
+    def test_ttft_leaderboard_drops_unusable_and_unmeasured_cases(self):
+        cases = [
+            {"profile": "over-budget", "status": "gpu_memory_limit", "first_token_latency": 1.0},
+            {"profile": "no-ttft", "status": "ok", "first_token_latency": None},
+            {"profile": "usable", "status": "ok", "first_token_latency": 250_000.0},
+        ]
+
+        self.assertEqual(
+            [case["profile"] for case in benchmark._ttft_leaderboard(cases)], ["usable"]
+        )
+
     def test_successful_case_without_ttft_formats_as_unavailable(self):
         case = {
             "status": "ok",
@@ -422,6 +480,157 @@ class TestMemoryStatus(unittest.TestCase):
         }
 
         self.assertEqual(benchmark._apply_memory_status(case)["status"], "gpu_abort")
+
+
+class TestTimeWeightedMean(unittest.TestCase):
+    """Peak alone cannot distinguish a workload that touches 40 GB for a second from one that
+    holds it for six minutes, and on a shared 59 GB budget that is the difference that
+    matters. These pin the weighting, because an unweighted sample average would be biased by
+    the sampler's own jitter -- `_read_mem()` is a PDH query whose cost varies with load."""
+
+    def test_weights_each_reading_by_how_long_it_stood(self):
+        mean = benchmark._TimeWeightedMean(10.0, 0.0)
+        mean.observe(20.0, 1.0)  # 10.0 stood for 1s
+
+        # 20.0 then stands for 9s: (10*1 + 20*9) / 10 = 19.0, not the 15.0 of a flat average.
+        self.assertAlmostEqual(mean.mean(10.0), 19.0)
+
+    def test_an_unavailable_counter_contributes_nothing_rather_than_zero(self):
+        mean = benchmark._TimeWeightedMean(None, 0.0)
+        mean.observe(30.0, 5.0)  # the unreadable stretch must not be averaged in as 0 GB
+
+        self.assertAlmostEqual(mean.mean(10.0), 30.0)
+
+    def test_a_counter_never_available_reports_no_measurement(self):
+        self.assertIsNone(benchmark._TimeWeightedMean(None, 0.0).mean(10.0))
+
+    def test_a_window_shorter_than_one_sample_reports_the_standing_reading(self):
+        # No elapsed time to weight, but one sample is still a measurement.
+        self.assertEqual(benchmark._TimeWeightedMean(42.0, 0.0).mean(0.0), 42.0)
+
+    def test_reading_the_mean_twice_does_not_double_count(self):
+        mean = benchmark._TimeWeightedMean(10.0, 0.0)
+
+        self.assertAlmostEqual(mean.mean(10.0), 10.0)
+        self.assertAlmostEqual(mean.mean(10.0), 10.0)
+        mean.observe(20.0, 10.0)
+        self.assertAlmostEqual(mean.mean(20.0), 15.0)
+
+    def test_the_sampling_rate_does_not_change_the_answer(self):
+        """The property that makes the number comparable across runs: doubling the sample
+        count over the same 10s at the same levels must not move the mean."""
+        coarse = benchmark._TimeWeightedMean(10.0, 0.0)
+        coarse.observe(30.0, 5.0)
+
+        fine = benchmark._TimeWeightedMean(10.0, 0.0)
+        for at, value in ((2.5, 10.0), (5.0, 30.0), (7.5, 30.0)):
+            fine.observe(value, at)
+
+        self.assertAlmostEqual(coarse.mean(10.0), fine.mean(10.0))
+
+
+class TestMeanOccupancyReachesTheReport(unittest.TestCase):
+    def test_aggregated_as_the_median_of_the_measured_windows(self):
+        rows = [
+            {"warmup": True, "mean_ram_gb": 99.0, "mean_gpu_gb": 99.0},
+            {"warmup": False, "mean_ram_gb": 40.0, "mean_gpu_gb": 20.0},
+            {"warmup": False, "mean_ram_gb": 42.0, "mean_gpu_gb": 24.0},
+            {"warmup": False, "mean_ram_gb": 41.0, "mean_gpu_gb": 22.0},
+        ]
+
+        aggregate = metrics.aggregate(rows)
+
+        self.assertEqual(aggregate["mean_ram_gb"], 41.0)
+        self.assertEqual(aggregate["mean_gpu_gb"], 22.0)
+        # Median only: the case-level `peak_*` already reports the high end, so a min/max
+        # of the means would be columns that answer nothing new.
+        self.assertNotIn("mean_gpu_gb_max", aggregate)
+
+    def test_a_run_without_memory_telemetry_omits_the_means(self):
+        aggregate = metrics.aggregate([{"warmup": False, "generation_time": 250.0}])
+
+        self.assertNotIn("mean_ram_gb", aggregate)
+        self.assertNotIn("mean_gpu_gb", aggregate)
+
+    def test_both_csvs_carry_the_new_columns(self):
+        for field in ("mean_ram_gb", "mean_gpu_gb"):
+            self.assertIn(field, benchmark.CASE_FIELDS)
+            self.assertIn(field, benchmark.ITERATION_CSV_FIELDS)
+        self.assertIn("mean_gpu_pct_of_budget", benchmark.CASE_FIELDS)
+
+
+class TestPipelineModeIsRecorded(unittest.TestCase):
+    """Which pipeline ran is a measured variable, not a footnote.
+
+    `cache_size` only exists on SchedulerConfig and any SchedulerConfig selects continuous
+    batching, so the two configurations a config ships are told apart by the presence of a
+    scheduler alone. If that never reached the report, two rows with very different TTFTs
+    would be indistinguishable after the run.
+    """
+
+    SETTINGS = {
+        "device": "GPU",
+        "cache_dir": None,
+        "output_tokens": 64,
+        "warmup": 0,
+        "iterations": 1,
+        "timeout_sec": 600,
+        "gpu_memory_budget_gb": 59.0,
+        "max_system_memory_pct": 100,
+        "weight_format": "int8",
+    }
+
+    def test_empty_and_absent_schedulers_are_the_stateful_pipeline(self):
+        self.assertEqual(benchmark.pipeline_mode({}), benchmark.PIPELINE_STATEFUL)
+        self.assertEqual(benchmark.pipeline_mode(None), benchmark.PIPELINE_STATEFUL)
+
+    def test_any_scheduler_key_at_all_is_the_paged_pipeline(self):
+        self.assertEqual(
+            benchmark.pipeline_mode({"cache_size": 8}), benchmark.PIPELINE_PAGED
+        )
+        self.assertEqual(
+            benchmark.pipeline_mode({"enable_prefix_caching": False}), benchmark.PIPELINE_PAGED
+        )
+
+    def _case(self, scheduler):
+        result = {
+            "error": None,
+            "load_ok": True,
+            "stage_reached": trial_runner.STAGE_DECODED,
+            "iterations": [_record(1, 250.0, 240_000.0)],
+            "peak_ram_pct": 62.5,
+            "peak_gpu_gb": 26.0,
+        }
+        static = {"model_config": None, "fixed_state_bytes": 0, "weight_disk_gb": 8.8}
+        with mock.patch.object(
+            benchmark, "_run_case_subprocess", return_value=result
+        ), mock.patch("builtins.print"):
+            return benchmark._run_case(
+                "Qwen/Qwen3.5-9B",
+                "models/openvino/Qwen_Qwen3.5-9B_int8",
+                {"name": "profile", "ov": {}, "scheduler": scheduler},
+                160000,
+                dict(self.SETTINGS),
+                static,
+            )
+
+    def test_run_case_records_the_mode_for_both_pipelines(self):
+        self.assertEqual(self._case({})["pipeline_mode"], benchmark.PIPELINE_STATEFUL)
+        self.assertEqual(
+            self._case({"cache_size": 8})["pipeline_mode"], benchmark.PIPELINE_PAGED
+        )
+
+    def test_an_underivable_auto_cache_size_reports_the_pipeline_that_actually_ran(self):
+        # `cache_size: auto` on an architecture the tool cannot size drops the key, and if it
+        # was the only scheduler key the case runs stateful after all. Naming the mode before
+        # that resolution would describe a pipeline that never ran.
+        case = self._case({"cache_size": "auto"})
+
+        self.assertEqual(case["pipeline_mode"], benchmark.PIPELINE_STATEFUL)
+        self.assertIsNone(case["cache_size_gb"])
+
+    def test_the_mode_reaches_summary_csv(self):
+        self.assertIn("pipeline_mode", benchmark.CASE_FIELDS)
 
 
 class TestSafePlatformInfo(unittest.TestCase):

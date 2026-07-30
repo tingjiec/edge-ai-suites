@@ -11,7 +11,7 @@
 # Usage (any extra arguments are forwarded to benchmark.py):
 #   .\components\llm\context_bench\run_benchmark.ps1
 #   .\components\llm\context_bench\run_benchmark.ps1 --list-profiles
-#   .\components\llm\context_bench\run_benchmark.ps1 --profiles optimized --iterations 1
+#   .\components\llm\context_bench\run_benchmark.ps1 --profiles stateful --iterations 1
 #   .\components\llm\context_bench\run_benchmark.ps1 --config components/llm/context_bench/config_qwen3.6_35b_a3b.yaml
 #
 # If PowerShell blocks the script with an UnauthorizedAccess/SecurityError:

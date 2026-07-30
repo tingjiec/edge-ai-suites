@@ -189,6 +189,10 @@ def _load_pipeline(model_dir: str, device: str, ov_config: dict, scheduler_confi
     An empty `scheduler_config` is meaningful, not a default: it leaves continuous
     batching off entirely and runs the stateful pipeline, which skips paged-attention
     block management. That is a distinct configuration to benchmark, not an omission.
+    The choice is all-or-nothing -- passing a SchedulerConfig with a single key in it is
+    still the paged backend -- which is why a bounded KV pool (`cache_size`, a
+    SchedulerConfig-only property) and the stateful pipeline are separate profiles rather
+    than one configuration. See benchmark.pipeline_mode.
     """
     import openvino_genai as ov_genai
 

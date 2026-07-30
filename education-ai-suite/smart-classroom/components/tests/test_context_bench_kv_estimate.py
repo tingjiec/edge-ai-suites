@@ -12,13 +12,18 @@ import tempfile
 import unittest
 from pathlib import Path
 
+from components.llm.context_bench import benchmark
 from components.llm.context_bench.benchmark import (
     _ir_ready,
+    _KV_PRECISION_BYTES,
+    PIPELINE_PAGED,
+    PIPELINE_STATEFUL,
     auto_cache_size_gb,
     expected_kv_gb,
     fixed_state_cache_bytes,
     kv_cache_dtype_bytes,
     kv_quantization_param_bytes,
+    pipeline_mode,
     theoretical_kv_bytes_per_token,
     validate_fixed_cache_size,
 )
@@ -119,6 +124,42 @@ class TestPrecisionDrivesTheEstimate(unittest.TestCase):
         self.assertIsNone(expected_kv_gb({"num_hidden_layers": 4}, 0, {}, 160000))
 
 
+class TestLinearAttentionReservationIsPerSequence(unittest.TestCase):
+    """The paged backend reserves one linear-attention state per schedulable sequence out of
+    the same `cache_size` pool as the KV blocks, so `max_num_seqs` is a cache-sizing knob on a
+    hybrid model. Leaving it at genai's default of 256 is what dropped a 160K request as
+    out-of-memory against an 8 GiB pool -- 256 x 51 MiB is 12.75 GB of reservation alone."""
+
+    # Qwen3.5-9B's real conv+ssm state, as fixed_state_cache_bytes() reads it from the IR.
+    FIXED_BYTES = 53477376  # 51 MiB
+
+    def _kv_gb(self, sequences):
+        return expected_kv_gb(
+            _QWEN35_9B, self.FIXED_BYTES, {"KV_CACHE_PRECISION": "f16"}, 160000,
+            sequences=sequences,
+        )
+
+    def test_one_sequence_adds_a_single_reservation(self):
+        self.assertAlmostEqual(self._kv_gb(1), 4.88 + 51 / 1024, places=2)
+
+    def test_the_genai_default_of_256_dwarfs_the_kv_itself(self):
+        # The regression this guards: an estimate blind to max_num_seqs called an 8 GiB pool
+        # sufficient for a configuration needing ~17.6 GB, and the run failed after loading.
+        self.assertGreater(self._kv_gb(256), 17)
+        with self.assertRaises(ValueError):
+            validate_fixed_cache_size(8, self._kv_gb(256))
+        validate_fixed_cache_size(8, self._kv_gb(1))
+
+    def test_a_dense_model_is_unaffected_by_the_sequence_count(self):
+        # No linear-attention layers means no fixed state to reserve, so max_num_seqs stays
+        # a pure batch-size knob and the estimate must not inflate with it.
+        dense = {"num_hidden_layers": 8, "num_key_value_heads": 4, "head_dim": 128}
+        self.assertEqual(
+            expected_kv_gb(dense, 0, {}, 160000, sequences=256),
+            expected_kv_gb(dense, 0, {}, 160000, sequences=1),
+        )
+
+
 class TestAutoCacheSize(unittest.TestCase):
     def test_lands_near_the_hand_tuned_value_for_qwen35_9b_f16_at_160k(self):
         kv_gb = expected_kv_gb(_QWEN35_9B, 0, {"KV_CACHE_PRECISION": "f16"}, 160000)
@@ -176,52 +217,142 @@ class TestFixedCacheSizeValidation(unittest.TestCase):
         validate_fixed_cache_size(cache_size=1, kv_gb=None)
 
 
+class TestCacheSizePreflight(unittest.TestCase):
+    """The same check, hoisted ahead of the model. Enforced only per case it would abort a
+    six-case run during case three, after hours already spent -- the worst of both fail-fast
+    and keep-going, for a configuration rejectable by arithmetic in the first second."""
+
+    STATIC = {
+        "model_config": _QWEN35_9B,
+        "fixed_state_bytes": 0,
+        "weight_disk_gb": 8.8,
+    }
+
+    def _settings(self, scheduler, contexts=(160000,)):
+        return {
+            "context_tokens": list(contexts),
+            "profiles": [{"name": "paged_min", "ov": {"KV_CACHE_PRECISION": "f16"},
+                          "scheduler": scheduler}],
+        }
+
+    def test_an_undersized_fixed_pool_names_the_profile_model_and_context(self):
+        settings = self._settings({"cache_size": 2, "max_num_seqs": 1})
+
+        with self.assertRaises(SystemExit) as caught:
+            benchmark._preflight_cache_sizes(settings, self.STATIC, "Qwen/Qwen3.5-9B")
+
+        message = str(caught.exception)
+        for expected in ("Qwen/Qwen3.5-9B", "paged_min", "160,000", "cache_size=2"):
+            self.assertIn(expected, message)
+
+    def test_a_context_that_only_the_longest_case_overflows_is_still_caught(self):
+        # The short case would pass and the long one abort mid-run, so every context in the
+        # matrix has to be checked, not just the first.
+        settings = self._settings({"cache_size": 6, "max_num_seqs": 1}, contexts=(8000, 256000))
+
+        with self.assertRaises(SystemExit) as caught:
+            benchmark._preflight_cache_sizes(settings, self.STATIC, "Qwen/Qwen3.5-9B")
+
+        self.assertIn("256,000", str(caught.exception))
+
+    def test_the_max_num_seqs_reservation_counts_against_the_pool(self):
+        # 8 GiB covers the 4.88 GiB of KV, but not 256 linear-attention reservations on top.
+        static = dict(self.STATIC, fixed_state_bytes=53477376)
+
+        benchmark._preflight_cache_sizes(
+            self._settings({"cache_size": 8, "max_num_seqs": 1}), static, "Qwen/Qwen3.5-9B"
+        )
+        with self.assertRaises(SystemExit):
+            benchmark._preflight_cache_sizes(
+                self._settings({"cache_size": 8, "max_num_seqs": 256}), static, "Qwen/Qwen3.5-9B"
+            )
+
+    def test_auto_and_stateful_profiles_have_nothing_to_preflight(self):
+        for scheduler in ({"cache_size": "auto"}, {}, {"max_num_batched_tokens": 32768}):
+            with self.subTest(scheduler=scheduler):
+                benchmark._preflight_cache_sizes(
+                    self._settings(scheduler), self.STATIC, "Qwen/Qwen3.5-9B"
+                )
+
+
 class TestShippedConfigs(unittest.TestCase):
     """The shipped configs are the single source of truth for the run matrix, so these
     assert the values as configured rather than the values history recommends -- the point
     of the benchmark is to re-measure candidates. What they do pin is the invariants the
-    measurement depends on: one profile, exact 160K, no prefix caching."""
+    measurement depends on: exact 160K, no prefix caching, and -- now that each config ships a
+    stateful/paged pair -- that the pipeline really is the *only* difference between the two.
+    A stray KV-precision edit to one of the pair would silently turn the comparison into a
+    two-variable experiment whose TTFT gap nothing in the report could attribute."""
 
     CONFIGS = {
-        "config_qwen3.5_9b.yaml": {
-            "model": "Qwen/Qwen3.5-9B",
-            "kv_cache_precision": "f16",
-        },
-        "config_qwen3.6_35b_a3b.yaml": {
-            "model": "Qwen/Qwen3.6-35B-A3B",
-            "kv_cache_precision": "f16",
-        },
+        "config_qwen3.5_9b.yaml": "Qwen/Qwen3.5-9B",
+        "config_qwen3.6_35b_a3b.yaml": "Qwen/Qwen3.6-35B-A3B",
     }
 
-    def test_each_config_ships_one_measurable_160k_profile(self):
-        for filename, expected in self.CONFIGS.items():
+    def _profiles(self, filename) -> list:
+        path = Path(__file__).parents[1] / "llm" / "context_bench" / filename
+        return load_config(str(path)).profiles
+
+    def test_each_config_ships_a_measurable_160k_pipeline_pair(self):
+        for filename, model in self.CONFIGS.items():
             with self.subTest(config=filename):
                 path = Path(__file__).parents[1] / "llm" / "context_bench" / filename
                 config = load_config(str(path))
 
-                self.assertEqual(config.benchmark.models, [expected["model"]])
+                self.assertEqual(config.benchmark.models, [model])
                 self.assertEqual(config.benchmark.context_tokens, [160000])
                 # At least 2 output tokens, or there is no decode phase to average.
                 self.assertGreaterEqual(config.benchmark.output_tokens, 2)
-                self.assertEqual(len(config.profiles), 1)
-
-                profile = config.profiles[0]
-                self.assertEqual(profile["name"], "optimized")
                 self.assertEqual(
-                    profile["ov"]["KV_CACHE_PRECISION"], expected["kv_cache_precision"]
+                    [profile["name"] for profile in config.profiles], ["stateful", "paged_min"]
                 )
-                self.assertEqual(profile["scheduler"]["max_num_seqs"], 1)
+
+    def test_only_the_pipeline_differs_between_the_two_profiles(self):
+        for filename in self.CONFIGS:
+            with self.subTest(config=filename):
+                stateful, paged = self._profiles(filename)
+
+                self.assertEqual(stateful["ov"], paged["ov"])
+                # A precision this tool can size, so `expected_kv_gb` is not silently
+                # falling back to fp16 for both rows of the comparison.
+                self.assertIn(stateful["ov"]["KV_CACHE_PRECISION"], _KV_PRECISION_BYTES)
+
+    def test_the_stateful_profile_configures_no_scheduler_at_all(self):
+        # Any SchedulerConfig selects continuous batching, so a single scheduler key here
+        # would quietly make both profiles paged and the pair meaningless.
+        for filename in self.CONFIGS:
+            with self.subTest(config=filename):
+                stateful = self._profiles(filename)[0]
+
+                self.assertFalse(stateful.get("scheduler"))
+                self.assertEqual(pipeline_mode(stateful.get("scheduler")), PIPELINE_STATEFUL)
+
+    def test_the_paged_profile_caps_the_pool_and_leaves_prefix_caching_off(self):
+        for filename in self.CONFIGS:
+            with self.subTest(config=filename):
+                scheduler = self._profiles(filename)[1]["scheduler"]
+
+                self.assertEqual(pipeline_mode(scheduler), PIPELINE_PAGED)
+                # A fixed cap, not `auto` and not omitted: bounding the KV pool is the whole
+                # reason this profile is paged rather than stateful.
+                cache_size = scheduler["cache_size"]
+                self.assertIsInstance(cache_size, (int, float))
+                self.assertGreater(cache_size, 0)
                 # A positive prefill chunk, not a specific one: this is the value the
                 # benchmark exists to sweep, so pinning it here would make every
-                # measurement of a new candidate a test failure.
-                chunk = profile["scheduler"]["max_num_batched_tokens"]
+                # measurement of a new candidate a test failure. What matters is that it is
+                # set at all -- OpenVINO's default of 256 would prefill 160K in ~625 chunks.
+                chunk = scheduler["max_num_batched_tokens"]
                 self.assertIsInstance(chunk, int)
-                self.assertGreater(chunk, 0)
-                # Omitted, not `auto`: the pool is left to OpenVINO entirely.
-                self.assertNotIn("cache_size", profile["scheduler"])
+                self.assertGreater(chunk, 256)
+                # Pinned, not tuning: both shipped models are hybrid, and on the paged path
+                # every schedulable sequence costs one full linear-attention reservation out
+                # of `cache_size`. genai's default of 256 reserves 12.75 GB on the 9B alone
+                # and the 160K request is dropped after the model has loaded.
+                self.assertEqual(scheduler["max_num_seqs"], 1)
                 # The prompt is reused across iterations, so a warm prefix cache would
                 # report a TTFT no first request ever sees.
-                self.assertFalse(profile["scheduler"]["enable_prefix_caching"])
+                self.assertFalse(scheduler["enable_prefix_caching"])
 
 
 class TestFixedStateCacheBytes(unittest.TestCase):

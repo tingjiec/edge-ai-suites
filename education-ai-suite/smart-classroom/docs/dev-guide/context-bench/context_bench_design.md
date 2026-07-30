@@ -16,7 +16,9 @@ SPDX-License-Identifier: Apache-2.0
 > 2. **哪一组 OpenVINO 配置最快？**
 
 第二个问题是组件当前形态的原因。它对一组具名 *profile*（KV 精度、prefill 分块大小、
-continuous batching 与 stateful pipeline）做基准测试，按 TPOT 优先、TTFT 次优排序，方法学参照
+continuous batching 与 stateful pipeline）做基准测试，按 TPOT 优先、TTFT 次优排序，并额外单独
+点名 TTFT 最快的 profile（§9）——当前两份配置各自比较的正是 stateful 与 paged 两条管线，而它们
+的差异几乎全部发生在 prefill。方法学参照
 [llm_bench](https://github.com/openvinotoolkit/openvino.genai/tree/master/tools/llm_bench)：
 1 次不计入统计的 warmup，N 次测量迭代，报告中位数并附带 min/max。
 
@@ -54,8 +56,8 @@ continuous batching 与 stateful pipeline）做基准测试，按 TPOT 优先、
 
 ```text
 components/llm/context_bench/
-├── config_qwen3.5_9b.yaml       9B 的单一 160K TTFT 优化 profile
-├── config_qwen3.6_35b_a3b.yaml  35B 的单一 160K TTFT 优化 profile
+├── config_qwen3.5_9b.yaml       9B @160K：stateful 与 paged_min 两个 profile
+├── config_qwen3.6_35b_a3b.yaml  35B @160K：stateful 与 paged_min 两个 profile
 ├── context_builder.py   按目标 token 数精确构造合成课堂转录
 ├── metrics.py           llm_bench 口径的单次迭代记录与聚合
 ├── trial_runner.py      单个 (model, profile, context) case 的子进程执行器
@@ -110,23 +112,66 @@ components/llm/context_bench/
 | 224K | 923.0s | 78.9% | 40.5 GB | PASS |
 
 33 GB 权重加上 KV，160K 时系统 RAM 已达 75.9%。这是 35B 唯一有实测容量背书的档位，而它用的是
-u8 KV；当前 profile 改用 f16 会把每 token 的 KV 字节数翻倍（§4.3）。本轮 PTL 配置不限制系统
+u8 KV，因此两个 profile 都沿用 u8——改 f16 会把每 token 的 KV 字节数翻倍（§4.3）。本轮 PTL 配置不限制系统
 内存百分比（`max_system_memory_pct: 100`），但始终报告峰值。
 
 ### 4.3 当前 profile 与历史证据边界
 
+每份配置现在都是一对 profile，两者 `ov` 完全相同，**唯一变量是管线**：
+
 | 当前 profile | 生效参数 | 与历史证据的关系 |
 |---|---|---|
-| `optimized`（9B） | f16 KV、`max_num_batched_tokens=16000`、不设置 `cache_size` | f16 优于 u8 有历史支持；但 16000 **低于** §4.1 认为已饱和的 32768，且历史最佳用的是固定 cache，不能代表 runtime-managed pool。 |
-| `optimized`（35B） | f16 KV、`max_num_batched_tokens=80000`、不设置 `cache_size` | 两项都无实测背书：唯一的容量证据来自 u8/4096/cache4，而 80000 **高于**曾在 449s 无首 token、RAM 93.2% 时被放弃的 64K 尝试。 |
+| `stateful`（9B / 35B） | 不写 `scheduler` 段；KV 精度 9B f16、35B u8 | **本机无任何实测**。prefill 变成对 160K 的单次 SDPA pass，没有分页 block 管理也没有可设的池上限；35B 还要在 33 GB 常驻权重之上再放这一次 pass 的注意力工作区，`oom` / `gpu_abort` 本身就是有效结论。 |
+| `paged_min`（9B） | f16 KV、`cache_size=8`、`max_num_batched_tokens=32768`、`max_num_seqs=1` | 全部取历史证据最强的点：§4.1 中 f16/32768/cache8 是实测最优（TTFT 237–350s），16 达 34.2 GB、24 直接 load 失败。 |
+| `paged_min`（35B） | u8 KV、`cache_size=4`、`max_num_batched_tokens=32768`、`max_num_seqs=1` | u8/cache4 是 §4.2 唯一有容量背书的组合；32768 是该模型筛选过的最佳值（TTFT 432.34s），而 64000 的那次在 `max_num_batched_tokens=64000` 下超时收场（peak RAM 63.5 GB、GPU 59.0 GB / 99.9%）。 |
+
+`max_num_batched_tokens` 在 `paged_min` 中**必须显式写出**：`SchedulerConfig` 的默认值是 **256**，
+配合默认开启的 `dynamic_split_fuse`，160K prefill 会被切成约 625 个 chunk——那样测出的差异是
+chunk 数量而不是管线差异。
+
+`max_num_seqs: 1` 同样**必须显式写出**，而且理由与并发无关。在 hybrid 模型的分页路径上，
+genai 会**按可调度序列数**各预留一份完整的 linear-attention 状态，且这些字节与 KV block 出自
+同一个 `cache_size` 池（§5.2）。9B 的该状态为 51 MiB，默认 `max_num_seqs=256` 意味着单是预留就
+要 12.75 GB——8 GiB 的池连一个 KV block 都放不下，160K 请求会在**模型加载完成之后**才被判为
+`GenerationStatus::IGNORED`（"did not fit in the available cache budget"）。本机 24K 实测：
+`cache_size=7` 在 `max_num_seqs=256` 下失败、在 16 下通过，而 `max_num_seqs=1` 时 `cache_size=1`
+就够；`cache_size` 低到 1–2 时甚至在构造期就抛 `reserved_la_bytes <= budget_in_bytes`。
+`dynamic_split_fuse` 保持默认 true：单条 160K 请求不需要调它。
 
 配置文件是运行矩阵的唯一事实来源；本节只说明证据覆盖到哪里。**profile 的名称不等于性能结论**
-——`optimized` 只表示"当前候选"。上表两行都与历史最优点不同，正是需要用当次 warmup + 中位数
-迭代去证实或否证的对象；只有报告落地后才能比较 TPOT、TTFT 和内存占用。
+——`stateful` 只表示"用哪条管线"，不表示它更快；`paged_min` 的 `min` 指"scheduler 只写必需项"。
+只有报告落地后才能比较 TPOT、TTFT 和内存占用。
 
-测试只断言配置文件"当前写着什么"以及测量赖以成立的不变量（单一 profile、精确 160K、
-`enable_prefix_caching=false`），不断言历史推荐值——否则调参会以测试失败的形式出现，
-而基准存在的意义恰恰是允许调参。
+测试只断言配置文件"当前写着什么"以及测量赖以成立的不变量（精确 160K、
+`enable_prefix_caching=false`、两个 profile 的 `ov` 必须逐字相同），不断言历史推荐值——否则调参
+会以测试失败的形式出现，而基准存在的意义恰恰是允许调参。其中"`ov` 必须相同"是这一对 profile
+特有的不变量：只改其中一个的 KV 精度会让比较悄悄变成双变量实验，而报告无法归因那段 TTFT 差距。
+
+### 4.4 为什么是两个 profile：`cache_size` 与 stateful 不能共存
+
+意图是"用 stateful pipeline，但限制 KV cache 大小"，而在 openvino-genai 2026.4 上这两件事无法
+同时成立，核实结果如下：
+
+- `cache_size` 只是 `SchedulerConfig` 的属性（`SchedulerConfig()` 的默认值为
+  `cache_size=0` / `num_kv_blocks=0`，即交给 runtime 自管理）。
+- 而只要把 `scheduler_config` 传进 `LLMPipeline`/`VLMPipeline`，genai 就切到
+  continuous batching / paged attention 后端（`ATTENTION_BACKEND=PA`）。不存在"带
+  `SchedulerConfig` 的 stateful pipeline"。
+- stateful（SDPA）路径下没有任何可设的 cache 容量上限：本机 GPU 插件
+  `SUPPORTED_PROPERTIES` 共 51 项，其中与 KV cache 相关的只有 `KV_CACHE_PRECISION`——它改变的是
+  每 token 的字节数，不是总量。KV cache 在这条路径上是随上下文增长的模型 state。
+
+因此"限制 cache_size"和"跑 stateful"是**两个候选配置**，不是一个配置的两项设置，组件把它们做成
+一对 profile 一次跑完对比。落到代码上的三处约束：
+
+1. `pipeline_mode(scheduler_config)` 是唯一判据——**scheduler 段是否为空**决定 `stateful` /
+   `paged`，该值写入 `summary.csv`、`summary.json` 与 `summary.md` 的 `Pipeline` 列。没有它，
+   报告里两行 TTFT 差 100s 却无法说明差在哪。
+2. profile 只接受 `{name, ov, scheduler}`，多余的键直接报错。被专门点名的错误是把 `cache_size`
+   写在 profile 顶层（以为它能限制 stateful 的 cache）：静默忽略会让几小时的测量跑在作者没有
+   要求的配置上。
+3. `--scheduler-config` 作用于**每个** profile，会把 `stateful` profile 拖到 paged 后端。这不是
+   同一测量的微调而是换了管线，因此显式告警（要扫 scheduler 参数应加 `--profiles paged_min`）。
 
 `requirements.txt` 固定 `openvino==2026.2.1`，而上述数据产生于 `2026.4.0.0.dev20260723`。
 `int4kv` 与 `PERFORMANCE_HINT` 的可用性以实机 runtime 为准，跳过逻辑覆盖版本差异。
@@ -139,7 +184,7 @@ flowchart TB
     CFG[model-specific config] --> ORCH
     ORCH --> PRE[环境预检 + IR 就绪检查]
     PRE --> LOOP[model -> context -> profile 三层循环]
-    LOOP --> RESOLVE[解析 ov / scheduler<br/>校验 fixed / 推导 auto / 保留 omitted]
+    LOOP --> RESOLVE[解析 ov / scheduler<br/>判定 pipeline_mode<br/>校验 fixed / 推导 auto / 保留 omitted]
     RESOLVE --> SAMPLE[MemorySampler 父进程采样线程]
     RESOLVE --> CHILD[trial_runner.run_case<br/>独立 spawn 子进程]
     CHILD --> LOAD[加载一次 tokenizer + pipeline]
@@ -168,9 +213,17 @@ flowchart TB
 - 1.3 的余量覆盖 block 分配的碎片；减去 8 GB 预留 prefill 工作区与 runtime 自身分配。
 - 架构未知时返回 None，`cache_size` 被移除、交由 OpenVINO 自管理——猜一个数字比承认不知道更糟。
 
-只有 profile 明确写 `cache_size: auto` 时才执行上述推导。当前两个 profile 都省略该字段，
-因此直接交给 OpenVINO 管理；这与自动推导出数值不是同一种模式。作为历史参照，9B / f16 /
-160K 的公式结果为 7，而固定值 16 曾达到 34.2 GB、24 直接 load 失败（§4.1）。
+只有 profile 明确写 `cache_size: auto` 时才执行上述推导。当前 `paged_min` 写的是固定值
+（9B 为 8、35B 为 4），`stateful` 根本没有 `scheduler` 段——`cache_size` 在那条路径上不存在
+（§4.4）。三种状态互不等价：固定值、`auto` 推导、省略后交给 OpenVINO 自管理（后者是第三种可测
+配置，而非中性默认：160K 下曾出现 372s 仍无首 token）。作为历史参照，9B / f16 / 160K 的公式
+结果为 7，而固定值 16 曾达到 34.2 GB、24 直接 load 失败（§4.1）。
+
+固定值由 `validate_fixed_cache_size()` 校验，且校验点被提到模型之前：`_preflight_cache_sizes()`
+在读到该模型 `config.json`、第一个 case 开始加载之前，就把 (profile × context) 全矩阵的固定
+`cache_size` 过一遍。只在 `_run_case` 里逐 case 校验会得到两头都不占的结果——一个本来就跑不了的
+profile 会在第三个 case 才抛错，而前两个已经花掉几小时；而它是纯算术，第一秒就能判。`auto`
+不参与预检：推导出的值不可能小于估算值。
 
 ### 5.2 KV 估算只计入 full_attention 层
 
@@ -181,6 +234,13 @@ config.json 的标签，已直接对照导出 IR 确认——只有 full_attenti
 `cache_params.past.{conv,ssm}.N` 在任何上下文长度下形状固定（后者由
 `fixed_state_cache_bytes()` 从 IR 单独读出）。Qwen3.5-9B 的 32 层中只有 8 层增长，
 按 32 层计会高估 4 倍。
+
+**"不随长度增长"不等于"可以忽略"**：该固定状态不随 context 变大，但在分页路径上按
+**可调度序列数**成倍预留，并与 KV block 共享 `cache_size` 池。因此
+`expected_kv_gb(..., sequences=)` 会把 `fixed_bytes` 乘以 `max_num_seqs`（stateful 路径恒为
+1），`auto_cache_size_gb()` 与 `validate_fixed_cache_size()` 都建立在这个含预留的估算上——这样
+"池装不下"能在 load 之前就报错，而不是在模型加载完、prefill 阶段才被 scheduler 丢弃（§4.3）。
+9B 的固定状态是 51 MiB，35B-A3B 是 63.75 MiB。
 
 VLM 导出把因果 LM 配置嵌在 `text_config` 下，普通 LLM 在顶层，两种布局都读。
 
@@ -204,15 +264,17 @@ warmup 之后的每次迭代命中缓存，报告一个任何首次请求都不�
 | `prompt` | context 完成 tokenize | 记录 `prompt_tokens` |
 | `iteration_start` | 每次 generate 前 | `sampler.reset_window()` 开新采样窗口 |
 | `prefilled` | streamer 收到首 token | 标记 prefill 完成、刷新 timeout；native crash 后仍能定位到 decode |
-| `iteration` | 每次 generate 后 | 附加该窗口的 peak RAM/GPU，回显日志行 |
+| `iteration` | 每次 generate 后 | 附加该窗口的 peak 与时间加权 mean RAM/GPU（§7.4），回显日志行 |
 | `done` | 终态 | 全部记录 + error |
 
 milestone 在到达时即被父进程记录，而非从最终结果读出：被 timeout kill 或 native abort 的
 子进程根本不会发 `done`，而"卡在 prefill"与"卡在 decode"是关于同一 context 长度的不同结论。
 `timeout_sec` 是无进度时限；收到任一事件后都会重新计时，避免多次正常长耗时 iteration 被
 错误地当成单个超时 case。反过来说，一个 case 里最长的静默区间就是**一次 prefill**，因此
-`timeout_sec` 实际上是 TTFT 上限而非整例上限。两份配置当前都取 600s，而历史 160K TTFT 为
-9B 237–350s、35B 432s，且 warmup 迭代还要额外承担首次 kernel 编译——余量很薄。
+`timeout_sec` 实际上是 TTFT 上限而非整例上限。历史 160K TTFT 为 9B 237–350s、35B 432s（均为
+paged + 固定池），warmup 迭代还要额外承担首次 kernel 编译，而 `stateful` 的单次 pass 在本机
+毫无实测。因此两份配置的上限刻意放宽（9B 1200s、35B 1800s）：`timeout` 判定只能说明"TTFT 超过
+我们随手选的那个数"，对本轮要测的东西没有信息量。
 `timeout` 且 `stage_reached: prompt_built` 说明机器仍在 prefill，应先放宽 `timeout_sec`，
 而不是判定该 context 长度不可行。
 
@@ -288,6 +350,31 @@ prompt 的实测差值发现，多跑一次 160K 量级的 encode 换不来精�
 同一采样流通过 `reset_window()` / `window()` 切分成逐迭代切片，使 warmup 的分配尖峰不会被
 计入测量迭代。
 
+### 7.4 峰值与均值：两个不可互换的问题
+
+只报峰值无法区分"碰了一下 40 GB"与"整整六分钟压着 40 GB"，而在 59 GB 共享预算里这恰恰是最关键
+的区别。因此每个 case 同时报告两组数字：
+
+| 指标 | 覆盖范围 | 回答的问题 |
+|---|---|---|
+| `peak_ram_gb` / `peak_gpu_gb` | 整个 case（含 load） | 这台机器**能不能**跑这个配置。由 prefill 的瞬时工作区决定，是判定 `gpu_budget_exceeded` 的依据 |
+| `mean_ram_gb` / `mean_gpu_gb` | 仅测量迭代（不含 load、不含 warmup） | 这个配置在**真正运行的那几分钟里**占多少。当同一预算还要装应用其余部分时，这才是可用的数字 |
+
+均值是**按时间加权**的（`_TimeWeightedMean`），不是样本算术平均。原因是采样并非等间隔：
+`_read_mem()` 是一次 PDH 查询，耗时数十毫秒且随负载波动，算术平均会让"恰好返回得快"的读数
+拿到与"停留了两倍时长"的读数相同的权重。按时间加权同时带来一个必要性质——**结果与采样间隔
+无关**，改 `interval` 不会改变数字，否则跨运行无法比较。
+
+计数器不可用时不计入权重（而非按 0 计入），与 `_fold` 一致；窗口短于一个采样间隔时没有时长可
+加权，此时报告当前读数——一个样本仍然是一次测量。
+
+case 级的 `mean_*` 取各测量迭代窗口均值的**中位数**，与其余指标的聚合方式一致；`peak_*` 保持为
+整个 case 的高水位，两者不是同一个 accumulator。**不提供整个 case 的均值**：那会把 load 阶段
+平均进来，描述的既不是加载也不是推理。
+
+`mean_gpu_pct_of_budget` 与 `peak_gpu_pct_of_budget` 对称。峰均差距大说明负载尖锐，**不等于**
+它便宜。
+
 ## 8. 判定与状态
 
 有两个配置内存上限：`max_system_memory_pct` 与 `gpu_memory_budget_gb`。后者必须是有限正数。
@@ -322,9 +409,13 @@ RAM 或 GPU 采样不可用时保持 None，不伪装成 0。即使 generation �
 | 文件 | 内容 |
 |---|---|
 | `iterations.csv` | 每迭代一行，warmup 含在内并标记，附该迭代的内存窗口 |
-| `summary.csv` | 每 (model, profile, context) 一行聚合值 |
-| `summary.md` | 按 context 分组的排行榜 + 冠军配置原文 |
+| `summary.csv` | 每 (model, profile, context) 一行聚合值，含 `pipeline_mode` 与 `cache_size_gb` |
+| `summary.md` | 按 context 分组的排行榜（带 `Pipeline` 列）+ TTFT 最快项单独点名 + TPOT 冠军配置原文 |
 | `summary.json` | 同数据的结构化版本，含硬件信息 |
+
+TPOT 排行第一名与 TTFT 最快项**可以是不同的 profile**，两者都打印正是为此：160K 下 TTFT 约占墙钟
+96%，一个 TPOT 略优但首 token 慢 100s 的 profile 不是该上线的那个（`_leaderboard` /
+`_ttft_leaderboard`）。
 
 报告在**每个 case 之后**重写而非最后一次性写出：工具的职责就是把机器推到崩溃，而它可能崩得
 足以带走编排器。旧版发生过这种情况——没有写出任何 summary，磁盘上仍是上一次 `--dry-run` 的
@@ -336,8 +427,8 @@ RAM 或 GPU 采样不可用时保持 None，不伪装成 0。即使 generation �
 | 文件 | 覆盖 |
 |---|---|
 | `test_context_bench_context_builder.py` | 精确 token 数构造、模板开销扣除、边界漂移校正、pipeline tokenizer 计数 |
-| `test_context_bench_kv_estimate.py` | 架构级 KV 估算（hybrid / VLM / 压缩精度）、`cache_size: auto` 上下界、两份配置的不变量（§4.3） |
-| `test_context_bench_metrics.py` | llm_bench 字段与单位、配置校验、TPOT 优先排序、中位数、`perf_metrics` 逐字段回退 |
+| `test_context_bench_kv_estimate.py` | 架构级 KV 估算（hybrid / VLM / 压缩精度）、linear-attention 状态按 `max_num_seqs` 预留、`cache_size: auto` 上下界、两份配置的不变量（§4.3：profile 对、`ov` 逐字相同、stateful 无 scheduler、paged 有池上限且 `max_num_seqs=1`） |
+| `test_context_bench_metrics.py` | llm_bench 字段与单位、配置校验（含 profile 未知键、override 换管线告警）、TPOT 优先排序与 TTFT 排序、`pipeline_mode` 落库、中位数、时间加权均值（权重、缺失计数器、采样率无关性）、`perf_metrics` 逐字段回退 |
 | `test_context_bench_trial_lifecycle.py` | 子进程退出顺序、prefill milestone、父进程回收竞态结果、失败分类、内存沉降 |
 
 全部不依赖 GPU、模型或 OpenVINO 栈。测试策略上有意包含若干**源码结构断言**（例如
@@ -359,6 +450,7 @@ RAM 或 GPU 采样不可用时保持 None，不伪装成 0。即使 generation �
 | 主题 | 符号 |
 |---|---|
 | CLI 与配置 | `benchmark.main`, `_parse_args`, `_load_settings`, `_resolve_profiles` |
+| 管线选择 | `pipeline_mode`, `PIPELINE_STATEFUL`, `PIPELINE_PAGED`, `trial_runner._load_pipeline` |
 | 运行矩阵 | `benchmark.main` 三层循环, `_run_case` |
 | 子进程控制 | `_run_case_subprocess`, `_crash_reason` |
 | 子进程执行 | `trial_runner.run_case`, `_load_pipeline`, `_load_tokenizer` |
@@ -368,4 +460,4 @@ RAM 或 GPU 采样不可用时保持 None，不伪装成 0。即使 generation �
 | KV 估算与 cache_size | `theoretical_kv_bytes_per_token`, `fixed_state_cache_bytes`, `auto_cache_size_gb` |
 | 状态判定 | `benchmark._status`, `trial_runner.classify_error`, `trial_runner.failing_stage` |
 | Prompt 定长 | `context_builder.build_benchmark_prompt`, `render_prompt` |
-| 报告输出 | `write_reports`, `_append_iterations`, `_leaderboard` |
+| 报告输出 | `write_reports`, `_append_iterations`, `_leaderboard`, `_ttft_leaderboard` |

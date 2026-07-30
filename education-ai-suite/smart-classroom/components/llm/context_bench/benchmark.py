@@ -24,7 +24,7 @@ Standalone diagnostic: reads its own bundled model config, never
 smart-classroom/config.yaml, and running it never affects the application.
 
     .\\components\\llm\\context_bench\\run_benchmark.ps1
-    .\\components\\llm\\context_bench\\run_benchmark.ps1 --profiles optimized --iterations 1
+    .\\components\\llm\\context_bench\\run_benchmark.ps1 --profiles stateful --iterations 1
     .\\components\\llm\\context_bench\\run_benchmark.ps1 --list-profiles
 
 Equivalent with the right interpreter already active, run from smart-classroom/
@@ -106,13 +106,30 @@ _AUTO_CACHE_SAFETY = 1.3
 _AUTO_CACHE_RESERVE_GB = 8.0
 _AUTO_CACHE_MIN_GB = 2.0
 
+# `SchedulerConfig.max_num_seqs` when a profile leaves it out. On a hybrid model this is not
+# just a batch-size default: the paged backend reserves one full linear-attention state per
+# schedulable sequence out of the same `cache_size` pool the KV blocks come from -- see
+# `expected_kv_gb`.
+_GENAI_DEFAULT_MAX_NUM_SEQS = 256
+
 # Statuses whose numbers are real measurements and are printed as such. The two
 # memory-limit ones are measurements of a configuration this box cannot use, so they keep
 # every figure and are only excluded from the ranking -- see `_leaderboard`.
 _USABLE_STATUSES = ("ok", "memory_limit", "gpu_memory_limit")
 
+# Measured by the orchestrator's sampler, not the child, and named once so the three places
+# that move them -- the sampler's result, the case row and the CSV header -- cannot drift.
+_CASE_MEMORY_FIELDS = (
+    "peak_ram_gb", "peak_ram_pct", "min_available_ram_gb", "post_load_peak_ram_gb",
+    "peak_gpu_gb", "post_load_peak_gpu_gb",
+)
+
+# Per iteration, from `_MemorySampler.window()`. Peak says whether the box can run the
+# configuration; mean says what it costs for the minutes it runs (see `_MemorySampler`).
+_ITERATION_MEMORY_FIELDS = ("peak_ram_gb", "peak_gpu_gb", *metrics.MEDIAN_ONLY_METRICS)
+
 CASE_FIELDS = [
-    "model", "profile", "context_tokens", "device", "weight_format",
+    "model", "profile", "context_tokens", "device", "weight_format", "pipeline_mode",
     "status", "error", "stage_reached",
     "kv_cache_precision", "cache_size_gb", "ov_config", "scheduler_config",
     "load_ok", "load_time_s", "prompt_tokens", "iterations_measured",
@@ -122,15 +139,15 @@ CASE_FIELDS = [
     "prefill_throughput", "prefill_throughput_min", "prefill_throughput_max",
     "decode_throughput", "e2e_throughput", "e2e_throughput_min", "e2e_throughput_max",
     "weight_disk_gb", "expected_kv_gb",
-    "peak_ram_gb", "peak_ram_pct", "min_available_ram_gb", "post_load_peak_ram_gb",
-    "peak_gpu_gb", "post_load_peak_gpu_gb",
-    "gpu_budget_gb", "gpu_budget_driver_gb", "peak_gpu_pct_of_budget",
+    *_CASE_MEMORY_FIELDS, *metrics.MEDIAN_ONLY_METRICS,
+    "gpu_budget_gb", "gpu_budget_driver_gb",
+    "peak_gpu_pct_of_budget", "mean_gpu_pct_of_budget",
     "memory_measurement_error", "system_memory_limit_exceeded", "gpu_budget_exceeded",
 ]
 
 ITERATION_CSV_FIELDS = [
     "model", "profile", "context_tokens", *metrics.ITERATION_FIELDS,
-    "peak_ram_gb", "peak_gpu_gb",
+    *_ITERATION_MEMORY_FIELDS,
 ]
 
 
@@ -170,8 +187,59 @@ def _read_mem() -> dict:
     }
 
 
+class _TimeWeightedMean:
+    """Mean of one counter over a window, weighted by how long each reading stood.
+
+    A plain average of the samples would be biased by the sampler's own jitter: `_read_mem()`
+    is a PDH query costing tens of milliseconds and that cost varies with load, so samples are
+    not evenly spaced and the readings that happened to come back fast would carry the same
+    weight as ones that stood for twice as long. Crediting each reading with the time until
+    the next one also makes the result independent of `interval`, so changing the sampling
+    rate does not change the number.
+
+    An unavailable counter contributes nothing rather than folding in as 0, matching
+    `_MemorySampler._fold`.
+    """
+
+    __slots__ = ("_weighted", "_seconds", "_value", "_since")
+
+    def __init__(self, value: float | None, now: float):
+        self._weighted = 0.0
+        self._seconds = 0.0
+        self._value = value
+        self._since = now
+
+    def _settle(self, now: float) -> None:
+        """Credit the standing reading with the time it stood, then open a new interval.
+        Idempotent: once it has run there is no outstanding interval left to credit."""
+        elapsed = now - self._since
+        if self._value is not None and elapsed > 0:
+            self._weighted += self._value * elapsed
+            self._seconds += elapsed
+        self._since = now
+
+    def observe(self, value: float | None, now: float) -> None:
+        self._settle(now)
+        self._value = value
+
+    def mean(self, now: float) -> float | None:
+        """None only if no reading was ever available. A window shorter than one sample
+        interval has no elapsed time to weight, so it reports the standing reading rather
+        than nothing -- one sample is still a measurement."""
+        self._settle(now)
+        return self._weighted / self._seconds if self._seconds > 0 else self._value
+
+
 class _MemorySampler(threading.Thread):
-    """Peak RAM/GPU and the low-water mark of free RAM, for the case and per iteration.
+    """Peak and mean RAM/GPU and the low-water mark of free RAM, per case and per iteration.
+
+    Peak and mean answer different questions and the report needs both. Peak is one 0.5 s
+    sample and decides whether the box can run the configuration at all -- it is set by the
+    transient prefill workspace. The time-weighted mean is what the configuration actually
+    costs while it runs, which is the number that matters when the 59 GB GPU budget is shared
+    with the rest of the application: at 160K a case spends minutes in decode holding far less
+    than its peak, and ranking configurations by peak alone would call two very differently
+    sized workloads equivalent.
 
     The low-water mark is instrumentation, not a trigger: nothing cancels a case on it.
     A case that passes with 7 GB still free has real headroom above it; one that passes
@@ -179,7 +247,9 @@ class _MemorySampler(threading.Thread):
     threshold would make it unanswerable.
 
     `reset_window()` / `window()` carve the same stream into per-iteration slices so a
-    warm-up's allocation spike is not charged to the measured iterations.
+    warm-up's allocation spike is not charged to the measured iterations. The mean is
+    per-window only, deliberately: a whole-case mean would average the load phase in with
+    inference and describe neither.
 
     The fold and the reset are locked against each other. Without that they race: this
     thread reads `_window_ram`, the orchestrator resets it to the current reading, and then
@@ -189,7 +259,7 @@ class _MemorySampler(threading.Thread):
     of milliseconds, so the window in which that interleaving can happen is wide.
     """
 
-    def __init__(self, interval: float = 0.5):
+    def __init__(self, interval: float = 0.5, baseline: dict | None = None):
         super().__init__(daemon=True)
         self._stop_event = threading.Event()
         self.interval = interval
@@ -199,9 +269,13 @@ class _MemorySampler(threading.Thread):
         self.min_available_ram = None
         self._window_ram = None
         self._window_gpu = None
+        self._window_mean = {}
         self._lock = threading.Lock()
-        self.latest = _read_mem()
-        self._observe(self.latest)
+        # The caller's pre-case baseline is reused when it has one: `_read_mem()` is the
+        # expensive part of a sample and querying it twice in a row at case start buys nothing.
+        first = baseline if baseline is not None else _read_mem()
+        self._open_window(first)
+        self._observe(first)
 
     def _fold(self, m: dict, pick, key: str, attr: str) -> None:
         """Fold one reading into a running max/min. An unavailable counter stays absent
@@ -212,7 +286,22 @@ class _MemorySampler(threading.Thread):
         current = getattr(self, attr)
         setattr(self, attr, value if current is None else pick(current, value))
 
+    def _open_window(self, m: dict) -> None:
+        """Discard the previous per-iteration window and start a new one at reading `m`.
+
+        Window state only -- the case-wide peaks are never rewound, which is the whole point
+        of keeping the two separate.
+        """
+        now = time.monotonic()
+        with self._lock:
+            self._window_ram = m.get("ram_gb")
+            self._window_gpu = m.get("gpu_gb")
+            self._window_mean = {
+                key: _TimeWeightedMean(m.get(key), now) for key in ("ram_gb", "gpu_gb")
+            }
+
     def _observe(self, m: dict) -> None:
+        now = time.monotonic()
         with self._lock:
             for key, attr in (
                 ("ram_gb", "peak_ram"),
@@ -223,24 +312,28 @@ class _MemorySampler(threading.Thread):
             ):
                 self._fold(m, max, key, attr)
             self._fold(m, min, "available_ram_gb", "min_available_ram")
+            for key, accumulator in self._window_mean.items():
+                accumulator.observe(m.get(key), now)
 
     def reset_window(self) -> None:
         # Sampled before taking the lock: holding it across a PDH query would stall the
         # sampler thread for as long as the query takes.
-        current = _read_mem()
-        with self._lock:
-            self._window_ram = current["ram_gb"]
-            self._window_gpu = current["gpu_gb"]
+        self._open_window(_read_mem())
 
-    def window(self) -> tuple:
+    def window(self) -> dict:
+        """This iteration's memory window, keyed as the iteration record's own fields."""
+        now = time.monotonic()
         with self._lock:
-            return _round_optional(self._window_ram), _round_optional(self._window_gpu)
+            return {
+                "peak_ram_gb": _round_optional(self._window_ram),
+                "peak_gpu_gb": _round_optional(self._window_gpu),
+                "mean_ram_gb": _round_optional(self._window_mean["ram_gb"].mean(now)),
+                "mean_gpu_gb": _round_optional(self._window_mean["gpu_gb"].mean(now)),
+            }
 
     def run(self):
         while not self._stop_event.is_set():
-            m = _read_mem()
-            self.latest = m
-            self._observe(m)
+            self._observe(_read_mem())
             self._stop_event.wait(self.interval)
 
     def stop(self):
@@ -395,11 +488,22 @@ def kv_quantization_param_bytes(ov_config: dict) -> int:
 
 
 def expected_kv_gb(model_config: dict | None, fixed_bytes: int, ov_config: dict,
-                   context_tokens: int) -> float | None:
-    """Persistent KV cache this model needs at `context_tokens` under `ov_config`'s precision.
+                   context_tokens: int, sequences: int = 1) -> float | None:
+    """Cache this model needs at `context_tokens` under `ov_config`'s precision.
 
     Recomputed per profile rather than once per model: KV_CACHE_PRECISION changes
     bytes-per-token, and the `cache_size: auto` derived from this has to follow it.
+
+    `fixed_bytes` is multiplied by `sequences`, which is `max_num_seqs` on the paged path and
+    1 on the stateful one. The linear-attention state of a hybrid model does not grow with the
+    context (§5.2), but the paged backend reserves one *per schedulable sequence* out of the
+    same `cache_size` pool that holds the KV blocks -- so `max_num_seqs` is a cache-sizing
+    knob here, not only a batch-size one. Measured on this box: Qwen3.5-9B carries 51 MiB of
+    linear-attention state, so genai's default `max_num_seqs=256` reserves 12.75 GB and leaves
+    a `cache_size=7` pool with no room for a single KV block -- the 160K request is then
+    dropped as `GenerationStatus::IGNORED` after the model has already loaded. Counting the
+    reservation here is what lets `auto_cache_size_gb` and `validate_fixed_cache_size` reject
+    that arrangement up front instead of after a full load.
     """
     if not model_config:
         return None
@@ -408,7 +512,8 @@ def expected_kv_gb(model_config: dict | None, fixed_bytes: int, ov_config: dict,
     )
     if bytes_per_token is None:
         return None
-    return round((bytes_per_token * context_tokens + fixed_bytes) / (1024 ** 3), 2)
+    reserved = fixed_bytes * max(1, sequences)
+    return round((bytes_per_token * context_tokens + reserved) / (1024 ** 3), 2)
 
 
 def auto_cache_size_gb(
@@ -443,8 +548,10 @@ def validate_fixed_cache_size(cache_size, kv_gb: float | None) -> None:
         raise ValueError(f"cache_size must be a number or 'auto', got {cache_size!r}") from exc
     if fixed_gb < kv_gb:
         raise ValueError(
-            f"cache_size={fixed_gb:g} GB is below the estimated {kv_gb:g} GB persistent KV; "
-            "increase cache_size or use 'auto'"
+            f"cache_size={fixed_gb:g} GB is below the estimated {kv_gb:g} GB persistent cache; "
+            "increase cache_size, use 'auto', or -- on a hybrid model, where the estimate "
+            "includes one linear-attention reservation per schedulable sequence -- lower "
+            "max_num_seqs"
         )
 
 
@@ -511,6 +618,28 @@ def format_config(config: dict) -> str:
     return " ".join(f"{key}={value}" for key, value in sorted(config.items()))
 
 
+# The two pipelines OpenVINO GenAI can run a case on, and the reason they are two profiles
+# rather than one. Passing a SchedulerConfig at all selects continuous batching / paged
+# attention -- there is no "stateful pipeline with a SchedulerConfig". And `cache_size` exists
+# only on SchedulerConfig: on genai 2026.4 the GPU plugin advertises 51 properties and not one
+# of them bounds the KV cache (`KV_CACHE_PRECISION` changes bytes per token, not the total).
+# So "stateful, with the cache capped" is not a configuration that exists: capping the pool
+# and running stateful are alternatives, and the shipped configs measure both.
+PIPELINE_STATEFUL = "stateful"
+PIPELINE_PAGED = "paged"
+
+_PROFILE_KEYS = ("name", "ov", "scheduler")
+
+
+def pipeline_mode(scheduler_config: dict | None) -> str:
+    """Which pipeline a resolved profile selects, named for the report.
+
+    Recorded per case because it is now a measured variable, not a footnote: reading a TTFT
+    without knowing whether prefill ran as one SDPA pass or as paged chunks explains nothing.
+    """
+    return PIPELINE_PAGED if scheduler_config else PIPELINE_STATEFUL
+
+
 def _resolve_profiles(raw_profiles, names_filter, ov_overrides, sched_overrides) -> list:
     profiles = _namespace_to_dict(raw_profiles) or []
     if not isinstance(profiles, list) or not profiles:
@@ -523,6 +652,21 @@ def _resolve_profiles(raw_profiles, names_filter, ov_overrides, sched_overrides)
         name = str(entry.get("name") or "").strip()
         if not name:
             raise SystemExit("every profile needs a `name`")
+        # Rejected rather than ignored: a misplaced key is a profile that does not measure what
+        # its author meant, and the whole run is hours long. `cache_size` at profile level is
+        # the specific mistake worth naming -- see `pipeline_mode`.
+        unknown = [key for key in entry if key not in _PROFILE_KEYS]
+        if unknown:
+            hint = (
+                " `cache_size` goes under `scheduler`, and putting it there selects the "
+                "continuous-batching pipeline: it is a SchedulerConfig property, and the "
+                "stateful pipeline has no KV pool to cap."
+                if "cache_size" in unknown else ""
+            )
+            raise SystemExit(
+                f"profile {name!r} has unknown key(s): {', '.join(sorted(unknown))}. "
+                f"A profile is {{{', '.join(_PROFILE_KEYS)}}}.{hint}"
+            )
         sections = {}
         for key in ("ov", "scheduler"):
             value = entry.get(key)
@@ -537,6 +681,16 @@ def _resolve_profiles(raw_profiles, names_filter, ov_overrides, sched_overrides)
             raise SystemExit(
                 f"profile {name!r} enables prefix caching; repeated-prompt benchmark "
                 "profiles must set enable_prefix_caching=false"
+            )
+        # Warned about after the rejections above, so a profile that is about to fail
+        # validation does not also get advice. Said out loud because it is not a tweak of the
+        # same measurement: the override just moved this profile onto the other backend.
+        if not sections["scheduler"] and resolved_scheduler:
+            print(
+                f"[warn] --scheduler-config moved profile {name!r} from the {PIPELINE_STATEFUL} "
+                f"pipeline to {PIPELINE_PAGED} attention -- any SchedulerConfig selects "
+                "continuous batching",
+                flush=True,
             )
         resolved.append({
             "name": name,
@@ -776,7 +930,7 @@ def _run_case_subprocess(
     and "hung in decode" are different findings about the same context length.
     """
     baseline = _read_mem()
-    sampler = _MemorySampler(interval=sample_interval)
+    sampler = _MemorySampler(interval=sample_interval, baseline=baseline)
     sampler.start()
 
     ctx = multiprocessing.get_context("spawn")
@@ -824,8 +978,7 @@ def _run_case_subprocess(
         elif event == "iteration":
             state["stage_reached"] = trial_runner.STAGE_DECODED
             record = {k: v for k, v in msg.items() if k != "event"}
-            peak_ram, peak_gpu = sampler.window()
-            record["peak_ram_gb"], record["peak_gpu_gb"] = peak_ram, peak_gpu
+            record.update(sampler.window())
             state["iterations"].append(record)
             if on_iteration:
                 on_iteration(record)
@@ -938,6 +1091,38 @@ def _status(result: dict) -> str:
     return "load_error" if not result.get("load_ok") else "error"
 
 
+def _preflight_cache_sizes(settings: dict, static: dict, model_name: str) -> None:
+    """Reject a fixed `cache_size` too small for the cache it has to hold, before loading.
+
+    `validate_fixed_cache_size` is enforced per case inside `_run_case`, which on its own means
+    a profile that could never have run aborts the whole run *after* the earlier cases have
+    already spent hours -- the worst of both fail-fast and keep-going. Checking the model's
+    whole (profile x context) matrix here costs nothing: the estimate is pure arithmetic over
+    `config.json`, and the first case of this model has not started yet.
+
+    Only fixed values are checked; `cache_size: auto` derives a value that cannot be too small
+    by construction and warns for itself when the budget leaves no room.
+    """
+    for profile in settings["profiles"]:
+        scheduler = profile["scheduler"]
+        cache_size = scheduler.get("cache_size")
+        if cache_size is None or str(cache_size).lower() == "auto":
+            continue
+        for context_tokens in settings["context_tokens"]:
+            kv_gb = expected_kv_gb(
+                static["model_config"], static["fixed_state_bytes"], profile["ov"],
+                context_tokens,
+                sequences=scheduler.get("max_num_seqs", _GENAI_DEFAULT_MAX_NUM_SEQS),
+            )
+            try:
+                validate_fixed_cache_size(cache_size, kv_gb)
+            except ValueError as exc:
+                raise SystemExit(
+                    f"{model_name}, profile {profile['name']!r} at {context_tokens:,} "
+                    f"tokens: {exc}"
+                ) from exc
+
+
 def _apply_memory_status(case: dict) -> dict:
     """Demote a completed measurement that exceeded a configured memory limit."""
     if case.get("status") != "ok":
@@ -958,11 +1143,17 @@ def _run_case(model_name, model_dir, profile, context_tokens, settings, static) 
     if settings.get("cache_dir"):
         ov_config.setdefault("CACHE_DIR", str(settings["cache_dir"]))
 
+    # Scheduler first, because the estimate depends on it: on the paged path `max_num_seqs`
+    # decides how many linear-attention reservations come out of the pool being sized.
+    scheduler_config = dict(profile["scheduler"])
     kv_gb = expected_kv_gb(
-        static["model_config"], static["fixed_state_bytes"], ov_config, context_tokens
+        static["model_config"], static["fixed_state_bytes"], ov_config, context_tokens,
+        sequences=(
+            scheduler_config.get("max_num_seqs", _GENAI_DEFAULT_MAX_NUM_SEQS)
+            if scheduler_config else 1
+        ),
     )
 
-    scheduler_config = dict(profile["scheduler"])
     validate_fixed_cache_size(scheduler_config.get("cache_size"), kv_gb)
     if str(scheduler_config.get("cache_size")).lower() == "auto":
         auto = auto_cache_size_gb(kv_gb, static["weight_disk_gb"], settings["gpu_memory_budget_gb"])
@@ -977,6 +1168,11 @@ def _run_case(model_name, model_dir, profile, context_tokens, settings, static) 
                     flush=True,
                 )
 
+    # After the `auto` resolution, not before: dropping an underivable `cache_size` can empty
+    # a one-key scheduler, and that really does hand the case to the stateful pipeline. The
+    # reported mode has to be the one the child will run.
+    mode = pipeline_mode(scheduler_config)
+
     print(
         f"\n[{model_name} | {profile['name']} | {context_tokens:,} tok] "
         f"{settings['warmup']} warmup + {settings['iterations']} iterations, timeout "
@@ -984,12 +1180,21 @@ def _run_case(model_name, model_dir, profile, context_tokens, settings, static) 
         flush=True,
     )
     print(f"  ov: {format_config(ov_config)}", flush=True)
-    print(f"  scheduler: {format_config(scheduler_config) if scheduler_config else '(stateful)'}",
-          flush=True)
-    if "cache_size" not in scheduler_config:
+    print(f"  pipeline: {mode}", flush=True)
+    if mode == PIPELINE_PAGED:
+        print(f"  scheduler: {format_config(scheduler_config)}", flush=True)
+        if "cache_size" not in scheduler_config:
+            print(
+                "  note: cache_size is unset; OpenVINO runtime manages the KV pool. Peak GPU "
+                "memory can look flatter across contexts when the pool is pre-allocated, and a "
+                "160K run with an unset pool once went past 372s with no first token.",
+                flush=True,
+            )
+    else:
         print(
-            "  note: cache_size is unset; OpenVINO runtime manages the KV pool. "
-            "Peak GPU memory can look flatter across contexts when the pool is pre-allocated.",
+            "  note: no scheduler_config, so prefill is one SDPA pass over the whole context "
+            "and the KV cache is model state that grows with it. `cache_size` does not exist on "
+            "this path -- KV_CACHE_PRECISION is the only lever on cache bytes.",
             flush=True,
         )
 
@@ -1011,6 +1216,10 @@ def _run_case(model_name, model_dir, profile, context_tokens, settings, static) 
     peak_gpu = result.get("peak_gpu_gb")
     budget = settings["gpu_memory_budget_gb"]
     ram_pct = result.get("peak_ram_pct")
+    # Aggregated first because `mean_gpu_pct_of_budget` is derived from a median the
+    # aggregation produces, and the case row below is assembled in one expression.
+    aggregated = metrics.aggregate(result.get("iterations"))
+    mean_gpu = aggregated.get("mean_gpu_gb")
 
     case = {
         "model": model_name,
@@ -1018,13 +1227,17 @@ def _run_case(model_name, model_dir, profile, context_tokens, settings, static) 
         "context_tokens": context_tokens,
         "device": device,
         "weight_format": settings["weight_format"],
+        "pipeline_mode": mode,
         "status": _status(result),
         "error": result.get("error"),
         "stage_reached": result.get("stage_reached"),
         "kv_cache_precision": ov_config.get("KV_CACHE_PRECISION", "(plugin default)"),
         "cache_size_gb": scheduler_config.get("cache_size"),
         "ov_config": format_config(ov_config),
-        "scheduler_config": format_config(scheduler_config) if scheduler_config else "(stateful)",
+        # `format_config({})` already renders "(none)". Spelling it "(stateful)" here made the
+        # CSV disagree with --list-profiles about the same empty scheduler, and the
+        # `pipeline_mode` column now carries that meaning anyway.
+        "scheduler_config": format_config(scheduler_config),
         "load_ok": result.get("load_ok"),
         "load_time_s": result.get("load_time_s"),
         "prompt_tokens": result.get("prompt_tokens"),
@@ -1035,16 +1248,18 @@ def _run_case(model_name, model_dir, profile, context_tokens, settings, static) 
         "peak_gpu_pct_of_budget": (
             round(peak_gpu / budget * 100, 1) if peak_gpu is not None else None
         ),
+        "mean_gpu_pct_of_budget": (
+            round(mean_gpu / budget * 100, 1) if mean_gpu is not None else None
+        ),
         "memory_measurement_error": ram_pct is None or peak_gpu is None,
         "system_memory_limit_exceeded": bool(
             ram_pct is not None and ram_pct > settings["max_system_memory_pct"]
         ),
+        # The peak is what decides usability: a configuration whose transient prefill
+        # workspace exceeds the budget is unusable even if its mean sits comfortably below.
         "gpu_budget_exceeded": bool(peak_gpu is not None and peak_gpu > budget),
-        **{k: result.get(k) for k in (
-            "peak_ram_gb", "peak_ram_pct", "min_available_ram_gb",
-            "post_load_peak_ram_gb", "post_load_peak_gpu_gb", "peak_gpu_gb",
-        )},
-        **metrics.aggregate(result.get("iterations")),
+        **{k: result.get(k) for k in _CASE_MEMORY_FIELDS},
+        **aggregated,
     }
     case["_iterations"] = result.get("iterations") or []
 
@@ -1067,9 +1282,12 @@ def _format_case(case: dict) -> str:
         f"| TTFT {_ttft_seconds(case)}s "
         f"| decode {_fmt(case.get('decode_throughput'), '{:.2f}')} tok/s "
         f"| e2e {_fmt(case.get('e2e_throughput'))} tok/s "
-        f"| peak RAM {_fmt(case.get('peak_ram_gb'))} GB ({_fmt(case.get('peak_ram_pct'))}%) "
-        f"| peak GPU {_fmt(case.get('peak_gpu_gb'))} GB "
-        f"({_fmt(case.get('peak_gpu_pct_of_budget'))}% of budget)"
+        f"| RAM peak {_fmt(case.get('peak_ram_gb'))} GB ({_fmt(case.get('peak_ram_pct'))}%) "
+        f"/ mean {_fmt(case.get('mean_ram_gb'))} GB "
+        f"| GPU peak {_fmt(case.get('peak_gpu_gb'))} GB "
+        f"({_fmt(case.get('peak_gpu_pct_of_budget'))}% of budget) "
+        f"/ mean {_fmt(case.get('mean_gpu_gb'))} GB "
+        f"({_fmt(case.get('mean_gpu_pct_of_budget'))}%)"
     )
 
 
@@ -1108,6 +1326,24 @@ def _leaderboard(cases: list) -> list:
             if isinstance(c.get("first_token_latency"), (int, float))
             else float("inf"),
         ),
+    )
+
+
+def _ttft_leaderboard(cases: list) -> list:
+    """The same usable cases, ranked by TTFT alone.
+
+    Reported next to the TPOT ranking rather than replacing it. TPOT stays the primary
+    service metric, but at 160K TTFT is ~96% of the wall clock, and the stateful-vs-paged
+    question is decided almost entirely in prefill: a leaderboard that only ranks decode
+    would hide the difference the run exists to measure.
+    """
+    return sorted(
+        (
+            c for c in cases
+            if c["status"] == "ok"
+            and isinstance(c.get("first_token_latency"), (int, float))
+        ),
+        key=lambda c: c["first_token_latency"],
     )
 
 
@@ -1167,7 +1403,21 @@ def write_reports(output_dir: str, settings: dict, cases: list, platform_info: d
         "",
         "Latencies are milliseconds and throughputs tokens/second, in llm_bench's units. "
         "Every figure is the **median** of the measured iterations; the warm-up is excluded. "
-        "Profiles are ranked by TPOT (lower is better), with TTFT as the tie-breaker.",
+        "Profiles are ranked by TPOT (lower is better), with TTFT as the tie-breaker; because "
+        "TTFT dominates the wall clock at long context, the fastest TTFT is called out "
+        "separately under each table.",
+        "",
+        "The `Pipeline` column is the measured variable when a config ships both a `stateful` "
+        "and a `paged` profile: `stateful` prefills the whole context in one SDPA pass and has "
+        "no KV pool to size, `paged` runs continuous batching with the `cache_size` shown.",
+        "",
+        "Memory is reported as **peak / mean**, and the two are not interchangeable. Peak is "
+        "the high-water mark over the whole case, load included, and is what decides whether "
+        "the box can run the configuration at all -- it is set by the transient prefill "
+        "workspace. Mean is the time-weighted average over the measured iterations only, so it "
+        "excludes model load, and is what the configuration costs for the minutes it actually "
+        "runs -- the figure to use when the same budget has to hold the rest of the "
+        "application. A large peak/mean gap is a spiky workload, not a cheap one.",
         "",
     ]
 
@@ -1178,10 +1428,10 @@ def write_reports(output_dir: str, settings: dict, cases: list, platform_info: d
         lines += [
             f"## {context:,} tokens",
             "",
-            "| Model | Profile | Status | TPOT ms/token | TTFT s | Decode tok/s | "
-            f"E2E tok/s | Prefill tok/s | Peak RAM | Peak GPU "
+            "| Model | Profile | Pipeline | Status | TPOT ms/token | TTFT s | Decode tok/s | "
+            f"E2E tok/s | Prefill tok/s | RAM peak / mean | GPU peak / mean "
             f"(% of {settings['gpu_memory_budget_gb']:g} GB) | Expected KV | cache_size |",
-            "|---|---|---|---|---|---|---|---|---|---|---|---|",
+            "|---|---|---|---|---|---|---|---|---|---|---|---|---|",
         ]
         ranked = _leaderboard(at_context)
         # Identity, not equality: two profiles can produce byte-identical rows, and `in`
@@ -1201,15 +1451,30 @@ def write_reports(output_dir: str, settings: dict, cases: list, platform_info: d
             if case["status"] not in _USABLE_STATUSES:
                 timings = ["--"] * len(timings)
             lines.append(
-                f"| {case['model']} | {case['profile']} | {case['status']} | "
+                f"| {case['model']} | {case['profile']} "
+                f"| {case.get('pipeline_mode') or '--'} | {case['status']} | "
                 + " | ".join(timings)
-                + f" | {_fmt(case.get('peak_ram_gb'))} GB "
+                + f" | {_fmt(case.get('peak_ram_gb'))} / {_fmt(case.get('mean_ram_gb'))} GB "
                 f"| {_fmt(case.get('peak_gpu_gb'))} GB "
                 f"({_fmt(case.get('peak_gpu_pct_of_budget'))}%) "
+                f"/ {_fmt(case.get('mean_gpu_gb'))} GB "
+                f"({_fmt(case.get('mean_gpu_pct_of_budget'))}%) "
                 f"| {_fmt(case.get('expected_kv_gb'), '{:.2f}')} GB "
                 f"| {_fmt(case.get('cache_size_gb'), '{:g}')} |"
             )
         lines.append("")
+
+        by_ttft = _ttft_leaderboard(at_context)
+        if by_ttft:
+            fastest = by_ttft[0]
+            lines += [
+                f"**Fastest TTFT at {context:,} tokens: `{fastest['profile']}`** "
+                f"({fastest.get('pipeline_mode') or '--'} pipeline) on {fastest['model']} -- "
+                f"TTFT {_ttft_seconds(fastest)}s, prefill "
+                f"{_fmt(fastest.get('prefill_throughput'))} tok/s, peak GPU "
+                f"{_fmt(fastest.get('peak_gpu_gb'))} GB.",
+                "",
+            ]
 
         if ranked:
             best = ranked[0]
@@ -1219,6 +1484,7 @@ def write_reports(output_dir: str, settings: dict, cases: list, platform_info: d
                 f"{_fmt(best.get('peak_gpu_gb'))} GB "
                 f"({_fmt(best.get('peak_gpu_pct_of_budget'))}% of configured budget).",
                 "",
+                f"    pipeline:  {best.get('pipeline_mode') or '--'}",
                 f"    ov:        {best['ov_config']}",
                 f"    scheduler: {best['scheduler_config']}",
                 "",
@@ -1247,9 +1513,10 @@ def _append_iterations(output_dir: str, case: dict) -> None:
             "model": case["model"],
             "profile": case["profile"],
             "context_tokens": case["context_tokens"],
-            **{field: record.get(field) for field in metrics.ITERATION_FIELDS},
-            "peak_ram_gb": record.get("peak_ram_gb"),
-            "peak_gpu_gb": record.get("peak_gpu_gb"),
+            **{
+                field: record.get(field)
+                for field in (*metrics.ITERATION_FIELDS, *_ITERATION_MEMORY_FIELDS)
+            },
         }
         StorageManager.save_csv(path, row, headers=ITERATION_CSV_FIELDS, append=True)
 
@@ -1300,10 +1567,11 @@ def main() -> None:
         print(f"\n{len(settings['profiles'])} profile(s), {total} case(s):\n")
         for profile in settings["profiles"]:
             print(f"  {profile['name']}")
+            print(f"    pipeline:  {pipeline_mode(profile['scheduler'])}")
             print(f"    ov:        {format_config(profile['ov'])}")
             print(
                 "    scheduler: "
-                + (format_config(profile["scheduler"]) if profile["scheduler"] else "(stateful)")
+                + (format_config(profile["scheduler"]) if profile["scheduler"] else "(none)")
             )
         return
 
@@ -1352,6 +1620,7 @@ def main() -> None:
                 f"({settings['weight_format']})",
                 flush=True,
             )
+            _preflight_cache_sizes(settings, static, model_name)
 
             for context in settings["context_tokens"]:
                 for profile in settings["profiles"]:
@@ -1370,13 +1639,22 @@ def main() -> None:
             traceback.print_exc()
         else:
             for context in settings["context_tokens"]:
-                ranked = _leaderboard(
-                    [case for case in cases if case.get("context_tokens") == context]
-                )
+                at_context = [case for case in cases if case.get("context_tokens") == context]
+                ranked = _leaderboard(at_context)
                 if ranked:
                     print(
                         f"\nBest TPOT at {context:,} tokens: {ranked[0]['profile']} on "
                         f"{ranked[0]['model']} -- {_best_summary(ranked[0])}",
+                        flush=True,
+                    )
+                by_ttft = _ttft_leaderboard(at_context)
+                if by_ttft:
+                    fastest = by_ttft[0]
+                    print(
+                        f"Fastest TTFT at {context:,} tokens: {fastest['profile']} "
+                        f"({fastest.get('pipeline_mode') or '--'}) on {fastest['model']} -- "
+                        f"TTFT {_ttft_seconds(fastest)}s, prefill "
+                        f"{_fmt(fastest.get('prefill_throughput'))} tok/s",
                         flush=True,
                     )
             print(

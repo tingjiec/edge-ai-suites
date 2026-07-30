@@ -309,7 +309,8 @@ class TestParentRecoversResultRacingChildExit(_ParentHarness):
 
         spike = {"ram_gb": 60.0, "gpu_gb": 50.0, "ram_pct": 95.0, "available_ram_gb": 1.0}
         sampler._observe(spike)
-        self.assertEqual(sampler.window(), (60.0, 50.0))
+        window = sampler.window()
+        self.assertEqual((window["peak_ram_gb"], window["peak_gpu_gb"]), (60.0, 50.0))
 
         quiet = {"ram_gb": 20.0, "gpu_gb": 10.0, "ram_pct": 30.0, "available_ram_gb": 40.0}
         with mock.patch.object(benchmark, "_read_mem", return_value=quiet):
@@ -318,7 +319,11 @@ class TestParentRecoversResultRacingChildExit(_ParentHarness):
         # window reports this iteration's peak, not the previous one's.
         sampler._observe(quiet)
 
-        self.assertEqual(sampler.window(), (20.0, 10.0))
+        window = sampler.window()
+        self.assertEqual((window["peak_ram_gb"], window["peak_gpu_gb"]), (20.0, 10.0))
+        # The mean is windowed too: the spike stood only before the reset, so this
+        # iteration's mean must report the quiet level, not an average of the two.
+        self.assertEqual((window["mean_ram_gb"], window["mean_gpu_gb"]), (20.0, 10.0))
         # The case-wide peak is a separate accumulator and must still remember the spike.
         self.assertEqual(sampler.peak_ram, 60.0)
         self.assertEqual(sampler.peak_gpu, 50.0)

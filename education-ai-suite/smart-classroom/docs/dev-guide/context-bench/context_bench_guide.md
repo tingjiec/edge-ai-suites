@@ -13,9 +13,11 @@ questions for a candidate summarizer model at long context:
 
 It benchmarks a matrix of named configuration *profiles* — KV cache precision, prefill
 chunk size, scheduler cache size, continuous batching vs the stateful pipeline — and ranks
-them by measured TPOT, using TTFT as the tie-breaker. Each shipped config pins a single
-profile; add entries to `profiles` to A/B several in one run. Measurement follows the
-methodology of
+them by measured TPOT, using TTFT as the tie-breaker; the fastest TTFT is also called out on
+its own, because at long context TTFT is what the user waits for. Each shipped config pins two
+profiles that differ **only** in the pipeline — `stateful` and `paged_min` — so one run answers
+which pipeline reaches the first token sooner. Add entries to `profiles` to A/B more in one
+run. Measurement follows the methodology of
 [llm_bench](https://github.com/openvinotoolkit/openvino.genai/tree/master/tools/llm_bench):
 one warm-up iteration excluded from every statistic, N measured iterations, and the
 **median** reported with min/max so run-to-run spread stays visible.
@@ -28,8 +30,8 @@ own model-specific configs —
 
 ```
 components/llm/context_bench/
-  config_qwen3.5_9b.yaml       Qwen3.5-9B single 160K profile
-  config_qwen3.6_35b_a3b.yaml  Qwen3.6-35B-A3B single 160K profile
+  config_qwen3.5_9b.yaml       Qwen3.5-9B 160K: stateful vs paged_min
+  config_qwen3.6_35b_a3b.yaml  Qwen3.6-35B-A3B 160K: stateful vs paged_min
   context_builder.py     synthetic transcript sized to an exact token count
   metrics.py             llm_bench-unit iteration records and their aggregation
   trial_runner.py        runs ONE (model, profile, context) case, in a subprocess
@@ -52,28 +54,40 @@ components/llm/context_bench/
 .\components\llm\context_bench\run_benchmark.ps1 --list-profiles
 
 # One profile, one short context -- the fast way to confirm the plumbing works
-.\components\llm\context_bench\run_benchmark.ps1 --profiles optimized --contexts 8000 --iterations 1
+.\components\llm\context_bench\run_benchmark.ps1 --profiles stateful --contexts 8000 --iterations 1
 
 # Select the 35B model matrix
 .\components\llm\context_bench\run_benchmark.ps1 --config components/llm/context_bench/config_qwen3.6_35b_a3b.yaml
 ```
 
 Historical 160K runs took roughly 245–300 s per Qwen3.5-9B iteration and 400–500 s per
-Qwen3.6-35B-A3B iteration; use those only for rough scheduling because the current profiles
-differ from the fixed-cache configurations that produced them. Each model config contains one
-profile, named `optimized`, holding the **candidate** values to be measured:
+Qwen3.6-35B-A3B iteration, all of them on paged attention with a fixed pool; the `stateful`
+profile has never been measured on this box, so use those figures only for rough scheduling.
+Each model config ships the same two profiles:
 
-| Config | KV precision | `max_num_batched_tokens` | `cache_size` |
-|---|---|---:|---|
-| `config_qwen3.5_9b.yaml` | f16 | 16,000 | omitted — OpenVINO manages the pool |
-| `config_qwen3.6_35b_a3b.yaml` | f16 | 80,000 | omitted — OpenVINO manages the pool |
+| Profile | Pipeline | `cache_size` | `max_num_batched_tokens` | KV precision |
+|---|---|---:|---:|---|
+| `stateful` | stateful (SDPA) — no `scheduler` section at all | n/a | n/a | 9B f16, 35B u8 |
+| `paged_min` | continuous batching | 9B 8 GiB, 35B 4 GiB | 32,768 | same as `stateful` |
 
-The profile name is not a performance claim. Both prefill chunk sizes sit outside the range
-the historical sweep covered (16,000 is below the 32,768 that looked saturated for the 9B;
-80,000 is above the 64K attempt that the 35B abandoned without a first token), and the 35B's
-f16 KV replaces the u8 cache that its only capacity evidence used. Re-measuring them is the
-point. Use `--warmup 0 --iterations 1` for a quick capacity check, then the configured one
-warm-up and three measured iterations for the final median.
+Both profiles in a config carry an identical `ov` block, so the pipeline is the only variable
+and the two TTFTs are comparable — a test enforces this. Neither name is a performance claim:
+`stateful` is unmeasured here, and `paged_min` re-uses the values with the strongest historical
+support (8 GiB covers the 9B's ~4.93 GiB f16 cache; 32,768 is where the prefill-chunk sweep
+saturated) rather than the wider chunk sizes an earlier config guessed at. Use
+`--warmup 0 --iterations 1` (the shipped setting) for a first capacity and TTFT check, then
+raise `iterations` for a median once both profiles are known to complete.
+
+### `cache_size` and the stateful pipeline are alternatives, not a combination
+
+`cache_size` is a property of OpenVINO GenAI's `SchedulerConfig`, and **passing any
+`SchedulerConfig` selects continuous batching / paged attention** — there is no "stateful
+pipeline with a bounded KV pool". On the stateful path the KV cache is model state that grows
+with the context, and on genai 2026.4 none of the GPU plugin's 51 advertised properties bound
+it; `KV_CACHE_PRECISION` changes bytes per token, not the total. That is why the pool cap and
+the stateful pipeline are shipped as two profiles instead of one, and why a `cache_size`
+written directly under a profile (next to `ov` / `scheduler`) is rejected with a message saying
+where it belongs rather than silently ignored.
 
 Equivalent invocation if you already have the backend venv active — run from
 `smart-classroom/` so relative model paths resolve:
@@ -107,7 +121,9 @@ streamer callback.
 
 **Ranking policy.** TPOT is primary because steady decode latency is the requested service
 metric; lower is better. TTFT is the secondary key. Prefill and e2e throughput remain in the
-report because at 160K TTFT dominates wall time and explains the user-visible wait.
+report because at 160K TTFT dominates wall time and explains the user-visible wait — and since
+the stateful-vs-paged difference is decided almost entirely in prefill, the report also names
+the fastest TTFT separately from the TPOT winner rather than burying it in a tie-breaker.
 
 **Why the median.** Before iterations existed, the same 160K configuration was measured at
 247.0 s and 349.5 s on two separate single-shot runs. One sample cannot distinguish a
@@ -126,28 +142,34 @@ Each model-specific config has three sections.
 | `models`, `context_tokens` | the run matrix, together with `profiles` |
 | `output_tokens` | decode length per iteration; must be at least 2 to measure TPOT; 64 is the shipped value |
 | `warmup`, `iterations` | iteration 0 is the warm-up and never enters a statistic |
-| `timeout_sec` | maximum seconds **without a child progress event**, not a cap on the case; refreshed by every milestone. Both configs ship 600 s — see the note below |
+| `timeout_sec` | maximum seconds **without a child progress event**, not a cap on the case; refreshed by every milestone. 1200 s for the 9B, 1800 s for the 35B — see the note below |
 | `max_system_memory_pct` | set to 100 on this PTL run so successful 160K trials are not rejected on host-RAM percentage |
 | `gpu_memory_budget_gb` | finite positive GiB budget; **set this per machine** (see below) |
 | `cache_dir` | set to a path to cache compiled blobs; cuts repeated load time for the 33 GB 35B export |
 | `output_dir` | each run writes to a timestamped subdirectory |
 
-**`profiles`** — the configurations benchmarked in order. `ov` are OpenVINO plugin
-properties; `scheduler` are OpenVINO GenAI `SchedulerConfig` values.
+**`profiles`** — the configurations benchmarked in order. A profile is exactly
+`{name, ov, scheduler}`; any other key is rejected. `ov` are OpenVINO plugin properties;
+`scheduler` are OpenVINO GenAI `SchedulerConfig` values, and **omitting the `scheduler`
+section is what selects the stateful pipeline** (reported as `pipeline_mode: stateful`).
 
-The current profiles omit `cache_size`; this is distinct from `cache_size: auto`. An omitted
-value leaves pool sizing entirely to OpenVINO. Setting `cache_size: auto` asks this tool to
-derive a pool from the model architecture and configured GPU budget, while a numeric value
-uses a fixed GiB pool and is rejected before loading when it is below the estimated
-persistent KV requirement. A completed case above the configured GPU budget keeps its
-measurements but is marked `gpu_memory_limit` and excluded from ranking.
+Inside a `scheduler`, three `cache_size` states are distinct. Omitted leaves pool sizing
+entirely to OpenVINO — measurably a third configuration, not a neutral default: a 160K run
+with a runtime-managed pool once went past 372 s with no first token. `auto` asks this tool to
+derive a pool from the model architecture and configured GPU budget. A numeric value uses a
+fixed GiB pool and is rejected before loading when it is below the estimated persistent KV
+requirement. A completed case above the configured GPU budget keeps its measurements but is
+marked `gpu_memory_limit` and excluded from ranking.
 
 ### `timeout_sec` is a TTFT ceiling in practice
 
 Because the timer resets on every child event, the longest silent interval in a case is one
-prefill — so `timeout_sec` effectively bounds TTFT, not the whole case. Both configs ship
-600 s. Historical 160K TTFTs were 237–350 s for the 9B and 432 s for the 35B, and a **warm-up
-iteration is slower than that** because it also pays first-run kernel compilation. If a run
+prefill — so `timeout_sec` effectively bounds TTFT, not the whole case. Historical 160K TTFTs
+were 237–350 s for the 9B and 432 s for the 35B on paged attention, a **warm-up iteration is
+slower than that** because it also pays first-run kernel compilation, and the `stateful`
+profile's single-pass prefill has no measurement at all here. The configs therefore ship a
+deliberately loose ceiling — 1200 s for the 9B, 1800 s for the 35B — because a `timeout`
+verdict says nothing about TTFT except that it is above whatever ceiling was chosen. If a run
 reports `timeout` with `stage_reached: prompt_built`, the box was still prefilling: raise
 `timeout_sec` rather than concluding the context length failed.
 
@@ -158,9 +180,16 @@ overrides that enable it.
 
 Configuration is validated before model loading: contexts and iteration counts must be
 positive integers, warm-up must be non-negative, profile names must be unique, model names
-must be non-empty, timeout must be positive, and profile `ov` / `scheduler` values must be
-mappings. `enable_prefix_caching`, when present, must be the boolean `false`. Invalid values
-fail once with an actionable message instead of failing every case.
+must be non-empty, timeout must be positive, profiles must carry no key outside
+`{name, ov, scheduler}`, and profile `ov` / `scheduler` values must be mappings.
+`enable_prefix_caching`, when present, must be the boolean `false`. Invalid values fail once
+with an actionable message instead of failing every case.
+
+A fixed `cache_size` is checked against the estimated cache for **every** context in the
+matrix as soon as the model's `config.json` can be read, before the first case of that model
+loads. On a hybrid model that estimate includes one linear-attention reservation per
+`max_num_seqs`, so an 8 GiB pool at the genai default of 256 is rejected in the first second
+rather than after the earlier cases have already spent hours.
 
 ### `gpu_memory_budget_gb` is a per-machine value
 
@@ -178,7 +207,10 @@ context of 0.
 
 `--pipeline-config KEY=VALUE` and `--scheduler-config KEY=VALUE` add to or override every
 profile's properties; `KEY=` with an empty value removes one. This exists so a one-off
-measurement never requires an uncommitted config edit.
+measurement never requires an uncommitted config edit. Note that `--scheduler-config` applies
+to *every* profile, so it moves the `stateful` profile onto paged attention — a different
+pipeline, not a tweak of the same one. The tool prints a warning when that happens; to sweep a
+scheduler value, add `--profiles paged_min`.
 
 ```powershell
 # Try a property across the whole matrix without editing the config
@@ -194,10 +226,30 @@ Each run writes to `<output_dir>/<YYYYMMDD-HHMMSS>/`, so runs never mix:
 
 | File | Contents |
 |---|---|
-| `iterations.csv` | one row per iteration, warm-up included and flagged, with its own memory window |
-| `summary.csv` | one row per (model, profile, context) with aggregated metrics |
-| `summary.md` | ranked leaderboard per context, plus the exact config of the winner |
+| `iterations.csv` | one row per iteration, warm-up included and flagged, with its own peak and mean memory window |
+| `summary.csv` | one row per (model, profile, context) with aggregated metrics, including `pipeline_mode` and `cache_size_gb` |
+| `summary.md` | ranked leaderboard per context with a `Pipeline` column, the fastest-TTFT call-out, and the exact config of the TPOT winner |
 | `summary.json` | the same data structured, including hardware info |
+
+The TPOT ranking and the fastest-TTFT line can name different profiles — that is the point of
+printing both. At 160K, TTFT is ~96% of the wall clock, so a profile that wins on TPOT while
+losing 100 s on first token is not the one to ship.
+
+### Memory is reported as peak / mean
+
+Both are needed and they answer different questions:
+
+| Column | Covers | Answers |
+|---|---|---|
+| `peak_ram_gb` / `peak_gpu_gb` | the whole case, model load included | whether the box can run this configuration **at all**. Set by the transient prefill workspace, and it is what `gpu_budget_exceeded` is judged on |
+| `mean_ram_gb` / `mean_gpu_gb` | the measured iterations only — no load, no warm-up | what the configuration **costs while it runs**, which is the figure to use when the same budget also has to hold the rest of the application |
+
+The mean is time-weighted, not a flat average of samples, so it does not move when the
+sampling interval changes and is not skewed by the sampler's own jitter. Case-level means are
+the median across the measured iterations, like every other aggregate here.
+
+A large peak/mean gap means a spiky workload, not a cheap one: a case peaking at 26 GB but
+averaging 19 GB still needs 26 GB of headroom to start.
 
 The reports are rewritten after every case, not once at the end: this tool's job is to push
 the box until something breaks, and it can break hard enough to take the orchestrator with it.
@@ -265,8 +317,8 @@ python -m unittest discover -s components/tests -p "test_context_bench_*.py"
 | File | Covers |
 |---|---|
 | `test_context_bench_context_builder.py` | exact-token prompt construction |
-| `test_context_bench_kv_estimate.py` | architecture-derived KV size and `cache_size: auto` |
-| `test_context_bench_metrics.py` | llm_bench units, TPOT-first ranking, medians, `perf_metrics` fallback |
+| `test_context_bench_kv_estimate.py` | architecture-derived KV size, the per-sequence linear-attention reservation `max_num_seqs` controls, `cache_size: auto`, and the shipped stateful/paged pair (only the pipeline differs) |
+| `test_context_bench_metrics.py` | llm_bench units, TPOT-first ranking, the TTFT ranking, `pipeline_mode` recording, medians, the time-weighted mean occupancy, `perf_metrics` fallback |
 | `test_context_bench_trial_lifecycle.py` | child exit path, parent recovery, failure classification |
 
 All four run without a GPU, a model, or the OpenVINO stack.
