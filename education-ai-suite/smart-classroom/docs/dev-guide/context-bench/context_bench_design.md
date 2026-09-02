@@ -444,6 +444,16 @@ TPOT 排行第一名与 TTFT 最快项**可以是不同的 profile**，两者都
 5. **`gpu_memory_budget_gb` 是本机值**：换机器必须修改，工具不自动探测真实共享预算。
 6. **输出校验有意较弱**：只要求产生 token，不判断语义——把模型行为变成硬件结论是错的。
 7. **profile 之间不共享编译缓存**（除非配置 `cache_dir`），完整矩阵在 160K 上是数小时任务。
+8. **新架构可能在加载阶段原生崩溃，而非报出可分类的错误**：`config_qwen3.8_27b.yaml`
+   （Qwen3.8-27B，`qwen3_5` 混合注意力 VLM）在本机上无论 `stateful`/`paged_min`、
+   GPU/CPU、还是上下文长度，都在 `VLMPipeline` 构造阶段崩溃
+   （`crashed:exitcode=3221225477:0xC0000005 STATUS_ACCESS_VIOLATION`），发生在本工具能
+   控制的任何配置之前。根因是上游：`optimum-intel`（当前 1.27.0）尚无 `qwen3_5` 的原生导出
+   路径（见 https://github.com/huggingface/optimum-intel/issues/1628 ），该模型的 IR 很可能
+   是通过 `--trust-remote-code` 自定义建模代码导出的，产生了已安装的
+   `openvino_genai`（2026.4.0.0.dev20260723）VLMPipeline reader 未曾适配的图结构，因而不是
+   抛出干净的"不支持"异常，而是原生崩溃。这类问题不能通过 context_bench 的 Python 配置规避
+   ——只能等待 `optimum-intel`/`openvino_genai` 增加原生支持后重新导出、重新测试。
 
 ## 12. 关键源码索引
 

@@ -24,14 +24,20 @@ one warm-up iteration excluded from every statistic, N measured iterations, and 
 
 It is **not** part of the runtime pipeline. Nothing in the app imports it, and it reads its
 own model-specific configs —
-[`config_qwen3.5_9b.yaml`](../../../components/llm/context_bench/config_qwen3.5_9b.yaml) and
-[`config_qwen3.6_35b_a3b.yaml`](../../../components/llm/context_bench/config_qwen3.6_35b_a3b.yaml)
+[`config_qwen3.5_9b.yaml`](../../../components/llm/context_bench/config_qwen3.5_9b.yaml),
+[`config_qwen3.6_35b_a3b.yaml`](../../../components/llm/context_bench/config_qwen3.6_35b_a3b.yaml), and
+[`config_qwen3.8_27b.yaml`](../../../components/llm/context_bench/config_qwen3.8_27b.yaml)
 — never `smart-classroom/config.yaml`. Editing either has no effect on the application.
+
+> **`config_qwen3.8_27b.yaml` is currently blocked, not just untuned.** Every case in it
+> crashes during model load (`STATUS_ACCESS_VIOLATION`) on this build, independent of device
+> or pipeline -- see the comments in that file and design doc §11.
 
 ```
 components/llm/context_bench/
   config_qwen3.5_9b.yaml       Qwen3.5-9B 160K: stateful vs paged_min
   config_qwen3.6_35b_a3b.yaml  Qwen3.6-35B-A3B 160K: stateful vs paged_min
+  config_qwen3.8_27b.yaml      Qwen3.8-27B 160K: stateful vs paged_min -- BLOCKED, crashes at load
   context_builder.py     synthetic transcript sized to an exact token count
   metrics.py             llm_bench-unit iteration records and their aggregation
   trial_runner.py        runs ONE (model, profile, context) case, in a subprocess

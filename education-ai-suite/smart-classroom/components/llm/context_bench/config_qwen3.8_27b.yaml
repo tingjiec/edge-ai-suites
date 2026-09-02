@@ -1,0 +1,85 @@
+# Copyright (C) 2026 Intel Corporation
+# SPDX-License-Identifier: Apache-2.0
+#
+# PTL 64 GB / 59 GB shared-GPU configuration for Qwen3.8-27B int8 at 160K.
+# Two profiles that differ ONLY in the pipeline: stateful (SDPA) vs paged attention with a
+# capped KV pool. TTFT is the figure under test -- same shape as config_qwen3.5_9b.yaml and
+# config_qwen3.6_35b_a3b.yaml.
+#
+# STATUS: BLOCKED, not just untuned. Every case in this file has been confirmed to crash
+# during model load, before any prefill or decode:
+#   crashed:exitcode=3221225477:0xC0000005 STATUS_ACCESS_VIOLATION
+# Confirmed independent of every lever this tool controls: GPU and CPU (`--device CPU`),
+# `stateful` and `paged_min`, and context length (reproduces at 300 tokens, not just 160K).
+# So this is not a memory, scheduler, or context-size problem -- it is VLMPipeline failing to
+# read this specific model's IR, on any device, before any of that runs.
+#
+# Root cause (upstream, not fixable from this repo): Qwen3.8-27B is `Qwen3_5ForConditionalGeneration`
+# / model_type `qwen3_5` -- the same hybrid (full_attention + linear_attention) VLM family as
+# Qwen3.5. `optimum-intel` (1.27.0 installed here) has no native export path for `qwen3_5` yet
+# (tracked at https://github.com/huggingface/optimum-intel/issues/1628, "Qwen3.5 Family Support"),
+# so this IR was almost certainly produced via `--trust-remote-code` custom modeling code rather
+# than optimum-intel's normal VLM export -- consistent with component names in the exported
+# folder that don't match optimum-intel's usual VLM layout (`openvino_vision_embeddings_pos_model`).
+# `openvino_genai` 2026.4.0.0.dev20260723's VLMPipeline reader has a fixed set of architectures it
+# understands; handed a graph shape it was never built for, it corrupts memory instead of raising
+# a clean "unsupported architecture" error.
+#
+# There is no config-level workaround: the crash is independent of every property in `ov` and
+# `scheduler` below. Re-test this file once `optimum-intel`/`openvino_genai` add native `qwen3_5`
+# support and the model is re-exported through that path -- until then, running this config
+# reproduces the same crash. See docs/dev-guide/context-bench/context_bench_design.md §11.
+
+model:
+  provider: openvino
+  device: GPU
+  weight_format: int4
+  models_base_path: "models"
+
+benchmark:
+  models: [Qwen3.8-27B]
+  context_tokens: [32000]
+  output_tokens: 64
+  warmup: 0
+  iterations: 1
+  timeout_sec: 1800
+  max_system_memory_pct: 100
+  gpu_memory_budget_gb: 59
+  cache_dir: null
+  output_dir: monitoring/executionlogs/context_bench/qwen3.8_27b
+
+# Both profiles carry the SAME `ov` block, so the pipeline would be the only variable between
+# them if either could load. f16 KV is the untuned, historically-safer default (per
+# config_qwen3.5_9b.yaml) -- there is no measurement on this model to tune it against, since
+# load never completes.
+#
+# `cache_size` is a SchedulerConfig property, and passing any SchedulerConfig selects
+# continuous batching, so a capped KV pool and the stateful pipeline are alternatives, not
+# settings to combine. See docs/dev-guide/context-bench/.
+profiles:
+  # No scheduler section at all -> the stateful (SDPA) pipeline. Crashes at load exactly like
+  # paged_min below -- included for the same A/B shape as the other configs, not because it is
+  # expected to behave differently.
+  - name: stateful
+    ov:
+      GPU_ENABLE_LARGE_ALLOCATIONS: "YES"
+      KV_CACHE_PRECISION: f16
+
+  # Continuous batching with the KV pool capped. cache_size=8 GiB is a placeholder carried over
+  # from config_qwen3.5_9b.yaml, not a measured value -- the pipeline crashes before this pool is
+  # ever allocated. Revisit once load succeeds.
+  - name: paged_min
+    ov:
+      GPU_ENABLE_LARGE_ALLOCATIONS: "YES"
+      KV_CACHE_PRECISION: f16
+    scheduler:
+      max_num_batched_tokens: 65536
+      # NOT a concurrency setting on this model: Qwen3.8-27B is hybrid (16 full_attention + 48
+      # linear_attention layers, per config.json's layer_types), and the paged backend reserves
+      # one whole linear-attention state per schedulable sequence out of the same `cache_size`
+      # pool the KV blocks come from. Left at 1 for the same reason as the other two configs;
+      # unmeasured here like everything else in this profile.
+      max_num_seqs: 1
+      # Mandatory, not tuning: iterations reuse one prompt, so a warm prefix cache would
+      # report a TTFT no first request ever sees.
+      enable_prefix_caching: false
