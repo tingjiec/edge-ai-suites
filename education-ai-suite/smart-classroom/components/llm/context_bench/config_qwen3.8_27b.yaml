@@ -32,23 +32,25 @@
 #   mtp_k6         161.3     30.2%
 #
 # k=6 does not have a hidden acceptance knob: this GenAI MTP path requires a static candidate
-# count and a zero confidence threshold. Lower k to raise acceptance; on this workload k=3
-# also improves TPOT. MTP shortens decode and does not touch prefill.
+# count and a zero confidence threshold. Lower k raises acceptance, but it can lower decode
+# throughput because the main model verifies fewer candidates per pass. On the 1K/64-token
+# classroom workload, choose k=2 for the higher-acceptance profile and k=3 for minimum TPOT.
+# MTP shortens decode and does not touch prefill.
 
 model:
   provider: openvino
   device: GPU
   weight_format: int4
   models_base_path: "models"
-  # The published IR is named `Qwen3.8-27B-int4-ov`, which is not the
+  # The published IR is named `Qwen3.8-27B_int4`, which is not the
   # `<name>_<weight_format>` layout `models_base_path` derives. Named explicitly rather than
   # renamed on disk, so re-downloading the model does not silently break this config.
   model_dirs:
-    Qwen3.8-27B: models/openvino/Qwen3.8-27B-int4-ov
+    Qwen3.8-27B: models/openvino/Qwen3.8-27B_int4
 
 benchmark:
   models: [Qwen3.8-27B]
-  context_tokens: [1000]
+  context_tokens: [8000]
   output_tokens: 64
   # A k-sweep compares six profiles against each other, so a single sample per profile is not
   # enough: the run-to-run spread that motivated iterations in the first place is the same
@@ -96,7 +98,7 @@ profiles:
       # 4 GB is the measured minimum that admits the target + draft pipelines; using
       # `auto` here would resolve to 2 GB for baseline and 4 GB for MTP, changing two
       # variables in what should be a one-variable comparison.
-      cache_size: 4
+      #cache_size: 4
 
   # The sweep. k is the number of candidates the draft head offers per verification pass;
   # higher k means fewer main-model passes but a lower share of candidates accepted, and the
@@ -116,7 +118,7 @@ profiles:
       num_assistant_tokens: 2
 
   - name: mtp_k3
-    # Minimum-TPOT profile: slightly faster than k=2, but only ~51% acceptance.
+    # Minimum-TPOT profile. Use mtp_k2 when draft acceptance is the primary objective.
     ov: *ov_qwen38
     scheduler: *scheduler_qwen38
     mtp:

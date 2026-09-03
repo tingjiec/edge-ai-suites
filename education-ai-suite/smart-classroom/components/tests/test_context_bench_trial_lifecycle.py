@@ -510,6 +510,7 @@ class TestMtpIsRejectedBeforeTheModelLoads(unittest.TestCase):
         # because "assertion failed" would send the reader to tune the wrong thing.
         with tempfile.TemporaryDirectory() as model_dir:
             Path(model_dir, trial_runner.MTP_MODEL_FILE).touch()
+            Path(model_dir, "openvino_mtp_model.bin").touch()
 
             with self.assertRaises(ValueError) as caught:
                 trial_runner.validate_mtp(
@@ -520,13 +521,25 @@ class TestMtpIsRejectedBeforeTheModelLoads(unittest.TestCase):
             self.assertIn("scheduler", message)
             self.assertIn("PA", message)
 
-    def test_npu_is_exempt_because_it_has_its_own_stateful_path(self):
+    def test_npu_is_rejected_because_qwen38_mtp_does_not_support_it(self):
         with tempfile.TemporaryDirectory() as model_dir:
             Path(model_dir, trial_runner.MTP_MODEL_FILE).touch()
+            Path(model_dir, "openvino_mtp_model.bin").touch()
 
-            trial_runner.validate_mtp(
-                model_dir, "NPU", {"enabled": True, "num_assistant_tokens": 3}, {}
-            )
+            with self.assertRaisesRegex(ValueError, "NPU"):
+                trial_runner.validate_mtp(
+                    model_dir, "NPU", {"enabled": True, "num_assistant_tokens": 3}, {}
+                )
+
+    def test_cross_device_draft_model_is_rejected(self):
+        with tempfile.TemporaryDirectory() as model_dir:
+            Path(model_dir, trial_runner.MTP_MODEL_FILE).touch()
+            Path(model_dir, "openvino_mtp_model.bin").touch()
+
+            with self.assertRaisesRegex(ValueError, "same device"):
+                trial_runner.validate_mtp(
+                    model_dir, "GPU", {"enabled": True, "device": "CPU"}, {"cache_size": 4}
+                )
 
     def test_a_profile_with_mtp_off_is_never_held_to_any_of_this(self):
         with tempfile.TemporaryDirectory() as model_dir:

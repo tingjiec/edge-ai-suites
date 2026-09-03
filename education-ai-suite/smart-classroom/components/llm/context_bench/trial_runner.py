@@ -99,8 +99,10 @@ STAGE_PREFILLED = "prefilled"  # first token streamed: the whole context is thro
 STAGE_DECODED = "decoded"  # at least one generate() returned
 
 # The multi-token-prediction draft head, as `optimum-cli`/the published OpenVINO IR names
-# it. The same directory serves as both the target and the draft model.
-MTP_MODEL_FILE = "openvino_mtp_model.xml"
+# it. Both files are required: the XML is the graph and the BIN holds its weights.
+# The same directory serves as both the target and the draft model.
+MTP_MODEL_FILES = ("openvino_mtp_model.xml", "openvino_mtp_model.bin")
+MTP_MODEL_FILE = MTP_MODEL_FILES[0]
 
 # Properties openvino_genai consumes itself rather than forwarding to the plugin. The GPU
 # plugin does not advertise them, so without this list `_device_diagnostics` reports every
@@ -132,7 +134,7 @@ def has_mtp_head(model_dir: str) -> bool:
     failure for a missing one is a deep assertion inside the speculative-decoding
     strategy. Checking the file is what lets a profile be rejected up front.
     """
-    return os.path.isfile(os.path.join(model_dir, MTP_MODEL_FILE))
+    return all(os.path.isfile(os.path.join(model_dir, filename)) for filename in MTP_MODEL_FILES)
 
 
 def validate_mtp(model_dir: str, device: str, mtp: dict | None,
@@ -147,18 +149,32 @@ def validate_mtp(model_dir: str, device: str, mtp: dict | None,
     if not (mtp or {}).get("enabled"):
         return
     if not has_mtp_head(model_dir):
+        missing = [
+            filename for filename in MTP_MODEL_FILES
+            if not os.path.isfile(os.path.join(model_dir, filename))
+        ]
         raise ValueError(
-            f"mtp is enabled but {model_dir} has no {MTP_MODEL_FILE}; this export "
+            f"mtp is enabled but {model_dir} is missing {missing}; this export "
             "carries no draft head, so there is nothing to speculate with"
         )
+    if device.upper().startswith("NPU"):
+        raise ValueError(
+            "mtp is enabled on NPU, but the Qwen3.8 experimental MTP path supports "
+            "CPU and GPU only"
+        )
+    draft_device = mtp.get("device")
+    if draft_device and draft_device.upper() != device.upper():
+        raise ValueError(
+            "mtp draft_model must use the same device as the target pipeline; "
+            "the Qwen3.8 MTP workflow does not support cross-device speculation"
+        )
     # PA is not a tuning preference here: genai refuses speculative decoding on the SDPA
-    # backend for anything but a Gemma4 MTP pair, and a SchedulerConfig is what selects
-    # PA. NPU has its own stateful path and is exempt.
-    if not scheduler_config and not device.upper().startswith("NPU"):
+    # backend for anything but a Gemma4 MTP pair, and a SchedulerConfig is what selects PA.
+    if not scheduler_config:
         raise ValueError(
             "mtp is enabled without a `scheduler` section, which leaves the profile on "
-            "the stateful (SDPA) pipeline. On a non-NPU device openvino_genai only runs "
-            "speculative decoding on paged attention -- give the profile a `scheduler` "
+            "the stateful (SDPA) pipeline. OpenVINO GenAI only runs this speculative "
+            "decoding path on paged attention -- give the profile a `scheduler` "
             'section and set ATTENTION_BACKEND: PA under `ov`'
         )
 
@@ -279,7 +295,7 @@ def _load_pipeline(model_dir: str, device: str, ov_config: dict,
 
     if (mtp or {}).get("enabled"):
         pipeline_args["draft_model"] = ov_genai.draft_model(
-            model_dir, mtp.get("device") or device
+            model_dir, device
         )
 
     if os.path.exists(os.path.join(model_dir, "openvino_language_model.xml")):
