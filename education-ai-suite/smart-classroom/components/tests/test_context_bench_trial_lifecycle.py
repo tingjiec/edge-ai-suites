@@ -541,6 +541,28 @@ class TestMtpIsRejectedBeforeTheModelLoads(unittest.TestCase):
                     model_dir, "GPU", {"enabled": True, "device": "CPU"}, {"cache_size": 4}
                 )
 
+    def test_non_cpu_gpu_device_is_rejected(self):
+        with tempfile.TemporaryDirectory() as model_dir:
+            Path(model_dir, trial_runner.MTP_MODEL_FILE).touch()
+            Path(model_dir, "openvino_mtp_model.bin").touch()
+
+            for device in ("AUTO", "HETERO:GPU,CPU"):
+                with self.subTest(device=device), self.assertRaisesRegex(ValueError, device):
+                    trial_runner.validate_mtp(
+                        model_dir, device, {"enabled": True}, {"cache_size": 4},
+                        {"ATTENTION_BACKEND": "PA"},
+                    )
+
+    def test_mtp_requires_paged_attention_backend(self):
+        with tempfile.TemporaryDirectory() as model_dir:
+            Path(model_dir, trial_runner.MTP_MODEL_FILE).touch()
+            Path(model_dir, "openvino_mtp_model.bin").touch()
+
+            with self.assertRaisesRegex(ValueError, "ATTENTION_BACKEND=PA"):
+                trial_runner.validate_mtp(
+                    model_dir, "GPU", {"enabled": True}, {"cache_size": 4}, {}
+                )
+
     def test_a_profile_with_mtp_off_is_never_held_to_any_of_this(self):
         with tempfile.TemporaryDirectory() as model_dir:
             for mtp in (None, {}, {"enabled": False}):

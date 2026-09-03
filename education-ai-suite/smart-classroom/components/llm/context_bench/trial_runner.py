@@ -138,7 +138,7 @@ def has_mtp_head(model_dir: str) -> bool:
 
 
 def validate_mtp(model_dir: str, device: str, mtp: dict | None,
-                 scheduler_config: dict | None) -> None:
+                 scheduler_config: dict | None, ov_config: dict | None = None) -> None:
     """Reject an MTP profile this model/device/pipeline combination cannot run.
 
     Every rule here is enforced by openvino_genai as well -- the point is *where*. The
@@ -157,10 +157,11 @@ def validate_mtp(model_dir: str, device: str, mtp: dict | None,
             f"mtp is enabled but {model_dir} is missing {missing}; this export "
             "carries no draft head, so there is nothing to speculate with"
         )
-    if device.upper().startswith("NPU"):
+    normalized_device = device.upper()
+    if not normalized_device.startswith(("CPU", "GPU")):
         raise ValueError(
-            "mtp is enabled on NPU, but the Qwen3.8 experimental MTP path supports "
-            "CPU and GPU only"
+            f"mtp is enabled on {device}, but the Qwen3.8 experimental MTP path "
+            "supports CPU and GPU only"
         )
     draft_device = mtp.get("device")
     if draft_device and draft_device.upper() != device.upper():
@@ -168,7 +169,7 @@ def validate_mtp(model_dir: str, device: str, mtp: dict | None,
             "mtp draft_model must use the same device as the target pipeline; "
             "the Qwen3.8 MTP workflow does not support cross-device speculation"
         )
-    # PA is not a tuning preference here: genai refuses speculative decoding on the SDPA
+    # PA is not a tuning preference here: GenAI refuses speculative decoding on the SDPA
     # backend for anything but a Gemma4 MTP pair, and a SchedulerConfig is what selects PA.
     if not scheduler_config:
         raise ValueError(
@@ -176,6 +177,11 @@ def validate_mtp(model_dir: str, device: str, mtp: dict | None,
             "the stateful (SDPA) pipeline. OpenVINO GenAI only runs this speculative "
             "decoding path on paged attention -- give the profile a `scheduler` "
             'section and set ATTENTION_BACKEND: PA under `ov`'
+        )
+    if (ov_config or {}).get("ATTENTION_BACKEND") != "PA":
+        raise ValueError(
+            "mtp is enabled without ATTENTION_BACKEND=PA; the Qwen3.8 MTP workflow "
+            "requires paged attention"
         )
 
 
@@ -532,7 +538,7 @@ def run_case(
     try:
         # Before the clock starts: a profile this model cannot run is a configuration
         # error, not a load time worth reporting.
-        validate_mtp(model_dir, device, mtp, scheduler_config)
+        validate_mtp(model_dir, device, mtp, scheduler_config, ov_config)
         t0 = time.perf_counter()
         tokenizer = _load_tokenizer(model_dir)
         pipe, accepts_tokenized_input = _load_pipeline(
