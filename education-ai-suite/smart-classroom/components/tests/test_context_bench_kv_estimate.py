@@ -203,6 +203,16 @@ class TestAutoCacheSize(unittest.TestCase):
         # guessing a number for an architecture we cannot size is not.
         self.assertIsNone(auto_cache_size_gb(None, weight_disk_gb=8.8, budget_gb=59))
 
+    def test_mtp_factor_reserves_a_second_pipeline_pool(self):
+        baseline = auto_cache_size_gb(0.01, weight_disk_gb=14.8, budget_gb=59)
+        mtp = auto_cache_size_gb(
+            0.01, weight_disk_gb=14.8, budget_gb=59,
+            pool_factor=benchmark._MTP_CACHE_POOL_FACTOR,
+        )
+
+        self.assertEqual(baseline, 2)
+        self.assertEqual(mtp, 4)
+
 
 class TestFixedCacheSizeValidation(unittest.TestCase):
     def test_accepts_a_fixed_pool_above_the_estimate(self):
@@ -373,6 +383,132 @@ class TestFixedStateCacheBytes(unittest.TestCase):
     def test_missing_ir_is_not_an_error(self):
         with tempfile.TemporaryDirectory() as model_dir:
             self.assertEqual(fixed_state_cache_bytes(model_dir), 0)
+
+
+class TestShippedMtpConfig(unittest.TestCase):
+    """config_qwen3.8_27b.yaml sweeps a different variable from the other two configs.
+
+    Its A/B is not stateful-vs-paged but multi-token prediction and its candidate count, so
+    the invariant it needs is the mirror image: every profile on the *same* pipeline with
+    the same pool, and MTP the only thing that moves. It also has to keep exactly one row
+    with MTP off -- that row is the denominator of every speedup the report prints, and a
+    config that swept k without it would produce six numbers and no conclusion."""
+
+    def _profiles(self) -> list:
+        path = Path(__file__).parents[1] / "llm" / "context_bench" / "config_qwen3.8_27b.yaml"
+        return benchmark._resolve_profiles(load_config(str(path)).profiles, None, {}, {})
+
+    def test_exactly_one_profile_runs_without_mtp_as_the_baseline(self):
+        without = [p for p in self._profiles() if not p["mtp"]["enabled"]]
+
+        self.assertEqual(len(without), 1)
+        self.assertEqual(without[0]["name"], "paged_min")
+
+    def test_the_sweep_visits_each_candidate_count_once(self):
+        counts = [
+            p["mtp"]["num_assistant_tokens"] for p in self._profiles() if p["mtp"]["enabled"]
+        ]
+
+        self.assertGreater(len(counts), 1)
+        self.assertEqual(sorted(counts), sorted(set(counts)))
+
+    def test_mtp_is_the_only_variable_across_the_matrix(self):
+        # A stray KV-precision or cache_size edit to one row would turn the sweep into a
+        # two-variable experiment whose TPOT gap nothing in the report could attribute.
+        profiles = self._profiles()
+        first = profiles[0]
+
+        for profile in profiles[1:]:
+            with self.subTest(profile=profile["name"]):
+                self.assertEqual(profile["ov"], first["ov"])
+                self.assertEqual(profile["scheduler"], first["scheduler"])
+
+    def test_every_profile_is_paged_because_mtp_cannot_run_stateful(self):
+        # On a non-NPU device genai only runs speculative decoding on paged attention, so a
+        # stateful row here could not carry MTP and would not be comparable with one that
+        # does. The baseline is paged too, or it is not the same pipeline as what it is
+        # being compared against.
+        for profile in self._profiles():
+            with self.subTest(profile=profile["name"]):
+                self.assertEqual(pipeline_mode(profile["scheduler"]), PIPELINE_PAGED)
+                self.assertEqual(profile["ov"]["ATTENTION_BACKEND"], "PA")
+                self.assertFalse(profile["scheduler"]["enable_prefix_caching"])
+
+    def test_the_prefill_chunk_admits_a_whole_candidate_batch(self):
+        for profile in self._profiles():
+            if not profile["mtp"]["enabled"]:
+                continue
+            with self.subTest(profile=profile["name"]):
+                self.assertGreaterEqual(
+                    profile["scheduler"]["max_num_batched_tokens"],
+                    profile["mtp"]["num_assistant_tokens"] + 1,
+                )
+
+    def test_the_model_directory_is_named_explicitly(self):
+        # The published IR is `Qwen3.8-27B-int4-ov`, which is not the
+        # `<name>_<weight_format>` layout the derived path would produce.
+        path = Path(__file__).parents[1] / "llm" / "context_bench" / "config_qwen3.8_27b.yaml"
+        config = load_config(str(path))
+        model_dirs = benchmark._namespace_to_dict(config.model.model_dirs)
+
+        for model in config.benchmark.models:
+            self.assertIn(model, model_dirs)
+
+
+class TestMtpHeadKvSurcharge(unittest.TestCase):
+    """The MTP draft head runs alongside the target and keeps its own KV over the same
+    context, so it comes out of the same pool. Ignoring it would size `cache_size: auto`
+    for one model while two are allocating."""
+
+    MTP_XML = """<net><layers><layer><data
+        variable_id="past_key_values.0.keypresent_key_values.0.key"
+        variable_type="f32" variable_shape="?,4,?,256" /></layer><layer><data
+        variable_id="past_key_values.0.valuepresent_key_values.0.value"
+        variable_type="f32" variable_shape="?,4,?,256" /></layer></layers></net>"""
+
+    def test_counts_draft_layers_from_the_ir_rather_than_assuming_one(self):
+        with tempfile.TemporaryDirectory() as model_dir:
+            Path(model_dir, "openvino_mtp_model.xml").write_text(self.MTP_XML, encoding="utf-8")
+            self.assertEqual(benchmark.mtp_head_layers(model_dir), 1)
+
+    def test_a_model_without_a_draft_head_reports_no_extra_layers(self):
+        with tempfile.TemporaryDirectory() as model_dir:
+            self.assertEqual(benchmark.mtp_head_layers(model_dir), 0)
+
+    def test_one_draft_layer_costs_exactly_one_target_layers_worth_of_cache(self):
+        # Qwen3.5-9B's shape: 8 growing layers out of 32. Adding one draft layer must add
+        # 1/8 of the target's per-token cost -- not 1/32, which would charge the
+        # linear-attention layers that hold no growing cache.
+        without = expected_kv_gb(_QWEN35_9B, 0, {}, 160000)
+        with_mtp = expected_kv_gb(_QWEN35_9B, 0, {}, 160000, mtp_layers=1)
+
+        self.assertAlmostEqual(with_mtp, without * 9 / 8, places=2)
+
+    def test_the_surcharge_follows_the_kv_precision_of_the_profile(self):
+        # A u8 cache halves the draft head's cost too; a flat GB addition would report a
+        # phantom saving on the compressed profile.
+        f16 = expected_kv_gb(_QWEN35_9B, 0, {"KV_CACHE_PRECISION": "f16"}, 160000, mtp_layers=1)
+        u8 = expected_kv_gb(_QWEN35_9B, 0, {"KV_CACHE_PRECISION": "u8"}, 160000, mtp_layers=1)
+
+        self.assertLess(u8, f16)
+
+    def test_a_profile_with_mtp_off_is_sized_for_the_target_model_alone(self):
+        self.assertEqual(
+            expected_kv_gb(_QWEN35_9B, 0, {}, 160000, mtp_layers=0),
+            expected_kv_gb(_QWEN35_9B, 0, {}, 160000),
+        )
+
+
+class TestAutoCacheSizeIsAWholeNumber(unittest.TestCase):
+    def test_derived_pool_is_an_int_because_scheduler_config_rejects_a_float(self):
+        # genai 2026.5's SchedulerConfig.cache_size takes an integer and refuses a float
+        # with a pybind type error that names neither the property nor the pool. A derived
+        # 2.0 used to fail every `cache_size: auto` case at pipeline construction.
+        for kv_gb in (0.01, 1.5, 2.1, 9.91):
+            with self.subTest(kv_gb=kv_gb):
+                cache_size = auto_cache_size_gb(kv_gb, weight_disk_gb=14.8, budget_gb=59)
+                self.assertIsInstance(cache_size, int)
+                self.assertNotIsInstance(cache_size, bool)
 
 
 class TestIrReadiness(unittest.TestCase):

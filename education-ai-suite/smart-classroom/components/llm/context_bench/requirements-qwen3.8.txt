@@ -1,7 +1,8 @@
 # Copyright (C) 2026 Intel Corporation
 # SPDX-License-Identifier: Apache-2.0
 #
-# Dependency overlay for models.text_gen.vlm_name: Qwen/Qwen3.8-27B (int8).
+# Dependency overlay for Qwen3.8-27B (int4), including its multi-token-prediction
+# draft head.
 #
 # Apply ON TOP OF requirements.txt, into the same venv:
 #
@@ -11,7 +12,7 @@
 # Why this is a separate file
 # ---------------------------
 # Qwen3.8-27B is published as an EXPERIMENTAL OpenVINO IR. Its model card
-# (OpenVINO/Qwen3.8-27B-int8-ov) requires:
+# (OpenVINO/Qwen3.8-27B-int4-ov) requires:
 #
 #   - OpenVINO 2026.4.0 (nightly) or higher
 #   - OpenVINO GenAI nightly builds from 2026-08-14 or later
@@ -22,21 +23,39 @@
 # requirements.txt already pins 5.2.0 exactly, which is what this model wants
 # as well.
 #
+# Multi-token prediction needs more than the model card asks for
+# --------------------------------------------------------------
+# Loading the model and running MTP are two different version requirements.
+# `openvino_genai.draft_model(...)` and the paged-attention MTP
+# strategy behind it (src/cpp/src/speculative_decoding/continuous_batching/
+# mtp_strategy.cpp) are newer than the model card's floor. Verified working on:
+#
+#   openvino          2026.5.0-22987-f1a195380ab
+#   openvino-genai    2026.5.0.0-3416-e218acf4dd7
+#   transformers      5.2.0
+#
+# On a build without MTP support the model still loads and benchmarks; the
+# `mtp_*` profiles in config_qwen3.8_27b.yaml are what would fail. The floors
+# below are therefore raised to 2026.5.0.dev rather than left at the card's
+# 2026.4 -- context_bench's MTP sweep is the thing this overlay exists for.
+#
 # Tradeoff: this swaps the validated 2026.3.0 runtime for a nightly across the
 # WHOLE venv, so Qwen3.5-9B / Qwen3.6-35B-A3B / Qwen3-VL-8B-Instruct end up on
 # the nightly too. Keep a separate venv if you need the released stack back,
-# and drop this overlay once 2026.4.0 ships as a stable release.
+# and drop this overlay once these versions ship as a stable release.
 
 --extra-index-url https://storage.openvinotoolkit.org/simple/wheels/nightly
 --pre
 
-openvino>=2026.4.0.dev
-openvino-tokenizers>=2026.4.0.0.dev
-openvino-genai>=2026.4.0.0.dev20260814
+openvino>=2026.5.0.dev
+openvino-tokenizers>=2026.5.0.0.dev
+openvino-genai>=2026.5.0.0.dev
 
 # Only needed to re-export Qwen3.8-27B from the source weights; the default
-# path downloads the published OpenVINO/Qwen3.8-27B-int8-ov IR (or reuses a
-# local copy under models/openvino/Qwen3.8-27B/int8) and never runs an export.
-# Uncomment if you must convert it yourself -- note this also unpins the
-# optimum-intel 2.1.0 in requirements.txt.
+# path downloads the published OpenVINO/Qwen3.8-27B-int4-ov IR (which already
+# contains openvino_mtp_model.xml) into
+# models/openvino/Qwen3.8-27B-int4-ov, the directory config_qwen3.8_27b.yaml
+# names under `model.model_dirs`. Uncomment if you must convert it yourself --
+# note this also unpins the optimum-intel 2.1.0 in requirements.txt, and that a
+# hand-rolled export without the MTP head cannot run the `mtp_*` profiles.
 # optimum-intel @ git+https://github.com/huggingface/optimum-intel.git

@@ -12,11 +12,13 @@ questions for a candidate summarizer model at long context:
 2. **Which OpenVINO configuration does it fastest?**
 
 It benchmarks a matrix of named configuration *profiles* — KV cache precision, prefill
-chunk size, scheduler cache size, continuous batching vs the stateful pipeline — and ranks
+chunk size, scheduler cache size, continuous batching vs the stateful pipeline, multi-token
+prediction and its candidate count — and ranks
 them by measured TPOT, using TTFT as the tie-breaker; the fastest TTFT is also called out on
-its own, because at long context TTFT is what the user waits for. Each shipped config pins two
+its own, because at long context TTFT is what the user waits for. The 9B and 35B configs pin two
 profiles that differ **only** in the pipeline — `stateful` and `paged_min` — so one run answers
-which pipeline reaches the first token sooner. Add entries to `profiles` to A/B more in one
+which pipeline reaches the first token sooner; the Qwen3.8 config instead sweeps
+[multi-token prediction](#multi-token-prediction-mtp). Add entries to `profiles` to A/B more in one
 run. Measurement follows the methodology of
 [llm_bench](https://github.com/openvinotoolkit/openvino.genai/tree/master/tools/llm_bench):
 one warm-up iteration excluded from every statistic, N measured iterations, and the
@@ -29,15 +31,11 @@ own model-specific configs —
 [`config_qwen3.8_27b.yaml`](../../../components/llm/context_bench/config_qwen3.8_27b.yaml)
 — never `smart-classroom/config.yaml`. Editing either has no effect on the application.
 
-> **`config_qwen3.8_27b.yaml` is currently blocked, not just untuned.** Every case in it
-> crashes during model load (`STATUS_ACCESS_VIOLATION`) on this build, independent of device
-> or pipeline -- see the comments in that file and design doc §11.
-
 ```
 components/llm/context_bench/
   config_qwen3.5_9b.yaml       Qwen3.5-9B 160K: stateful vs paged_min
   config_qwen3.6_35b_a3b.yaml  Qwen3.6-35B-A3B 160K: stateful vs paged_min
-  config_qwen3.8_27b.yaml      Qwen3.8-27B 160K: stateful vs paged_min -- BLOCKED, crashes at load
+  config_qwen3.8_27b.yaml      Qwen3.8-27B 8K: no-MTP baseline vs a num_assistant_tokens sweep
   context_builder.py     synthetic transcript sized to an exact token count
   metrics.py             llm_bench-unit iteration records and their aggregation
   trial_runner.py        runs ONE (model, profile, context) case, in a subprocess
@@ -69,7 +67,7 @@ components/llm/context_bench/
 Historical 160K runs took roughly 245–300 s per Qwen3.5-9B iteration and 400–500 s per
 Qwen3.6-35B-A3B iteration, all of them on paged attention with a fixed pool; the `stateful`
 profile has never been measured on this box, so use those figures only for rough scheduling.
-Each model config ships the same two profiles:
+The 9B and 35B configs ship the same two profiles:
 
 | Profile | Pipeline | `cache_size` | `max_num_batched_tokens` | KV precision |
 |---|---|---:|---:|---|
@@ -94,6 +92,95 @@ it; `KV_CACHE_PRECISION` changes bytes per token, not the total. That is why the
 the stateful pipeline are shipped as two profiles instead of one, and why a `cache_size`
 written directly under a profile (next to `ov` / `scheduler`) is rejected with a message saying
 where it belongs rather than silently ignored.
+
+## Multi-Token Prediction (MTP)
+
+Some models ship a small **draft head** alongside the main network — for Qwen3.8-27B it is
+`openvino_mtp_model.xml` inside the same IR directory. OpenVINO GenAI can run it as
+*self-speculative decoding*: the head proposes `k` candidate tokens, the main model verifies
+all of them in one forward pass, and every candidate that matches is kept. Fewer main-model
+passes for the same output means lower TPOT at identical output.
+
+It is a **decode-side** lever only. Prefill still processes the whole context exactly once, so
+expect TPOT to move and TTFT not to.
+
+Turn it on with an `mtp` section on a profile:
+
+```yaml
+- name: mtp_k3
+  ov:
+    ATTENTION_BACKEND: PA
+    KV_CACHE_PRECISION: f16
+  scheduler:
+    max_num_batched_tokens: 32768
+    max_num_seqs: 1
+    enable_prefix_caching: false
+    cache_size: auto
+  mtp:
+    num_assistant_tokens: 3      # candidates offered per verification pass
+    # enabled: true              # implied by the section existing
+    # device: CPU                # defaults to the main model's device
+```
+
+Four constraints are OpenVINO GenAI's, not this tool's, and all four are checked **before**
+the model loads rather than after a minute of loading a 14 GB export:
+
+| Constraint | Why |
+|---|---|
+| the profile needs a `scheduler` section, and `ATTENTION_BACKEND: PA` | off NPU, genai only runs speculative decoding on paged attention. A profile with no `scheduler` is stateful/SDPA and cannot carry MTP |
+| `num_assistant_tokens` ≥ 1 | genai asserts `> 0` |
+| greedy decoding | set for every profile already (`do_sample = False`) — genai's MTP strategy rejects sampling |
+| `assistant_confidence_threshold == 0` | genai's MTP path accepts a *static* candidate count only; a non-zero threshold selects the dynamic variant it refuses. This tool always sets 0 |
+
+`max_num_batched_tokens` also has to be at least `num_assistant_tokens + 1`, the size of one
+verification step. That is checked too.
+
+Each request uses a fresh `openvino_genai.GenerationConfig`, matching the notebook rather than
+mutating the model's sampling-enabled defaults. Warmup keeps the same prompt and MTP settings
+but generates only four tokens; measured iterations use the configured output length. Since the
+benchmark pre-renders the native chat template to hit the exact context size, it disables only
+the pipeline's second template application.
+
+### Reading the result
+
+Two columns exist only for this, and TPOT alone cannot replace them:
+
+| Field | Meaning |
+|---|---|
+| `tokens_per_step` | output tokens produced per main-model verification pass. **Exactly 1.00 when MTP is off** — that is the self-check that a baseline row really is a baseline |
+| `mtp_acceptance_rate` | share of drafted candidates accepted, read only from GenAI's public `extended_perf_metrics`; unavailable on older runtimes rather than approximated |
+
+Acceptance is what says whether raising `k` still buys anything. Measured on Qwen3.8-27B (GPU,
+the shipped 8K prompt, 64 output tokens) while reusing one loaded pipeline:
+
+| Profile | TPOT ms | accepted |
+|---|---:|---:|
+| `mtp_k1` | 197.2 | 63.2% |
+| `mtp_k2` | 156.8 | 61.8% |
+| `mtp_k3` | **150.9** | **50.7%** |
+| `mtp_k4` | 152.0 | 41.3% |
+| `mtp_k6` | 161.3 | 30.2% |
+
+For this workload k=2 is the higher-acceptance balanced profile and k=3 is the minimum-TPOT
+profile. Past k=3, extra candidates are verified and thrown away, and both acceptance and TPOT
+get worse. The MTP path requires a zero confidence threshold, so lowering
+`num_assistant_tokens` is the supported way to improve acceptance. Below 60%, the console
+suggests the next smaller k. `summary.md` prints an **MTP speedup** line per
+context comparing the best MTP profile against the best non-MTP one, so the ranking does not
+have to be read as a subtraction.
+
+Like the official notebook, a complete baseline + MTP sweep checks that deterministic greedy
+outputs match exactly. The report warns when an MTP output hash differs from the baseline, since
+a speedup that changes output is not a valid like-for-like result.
+
+To sweep `k` without editing the config, `--mtp-tokens K` overrides it on every profile that
+already enables MTP — and deliberately leaves the no-MTP baseline alone, since that row is the
+denominator of the speedup.
+
+```powershell
+.\components\llm\context_bench\run_benchmark.ps1 `
+  --config components/llm/context_bench/config_qwen3.8_27b.yaml --mtp-tokens 8
+```
 
 Equivalent invocation if you already have the backend venv active — run from
 `smart-classroom/` so relative model paths resolve:
@@ -120,10 +207,15 @@ time, tokens/second for throughput):
 | `prefill_throughput` | `input_size / TTFT` |
 | `decode_throughput` | llm_bench's 2nd-token rate, `1000 / TPOT` |
 | `e2e_throughput` | `(input_size + output_size) / generation_time` |
+| `tokens_per_step` | output tokens per main-model verification pass — 1.00 unless MTP is on |
+| `mtp_acceptance_rate` | share of drafted candidates accepted; `None` unless MTP is on |
 
 Timings come from OpenVINO GenAI's own `perf_metrics` (the same source llm_bench reads)
 wherever the runtime provides them, falling back per field to wall-clock timing around the
-streamer callback.
+streamer callback. Acceptance comes from `extended_perf_metrics.get_draft_acceptance_rate()`.
+The verification-step count behind `tokens_per_step` has no public getter, so its compatibility
+path reads `perf_metrics.raw_metrics.m_new_token_times`, which holds one entry per main-model
+pass rather than per token.
 
 **Ranking policy.** TPOT is primary because steady decode latency is the requested service
 metric; lower is better. TTFT is the secondary key. Prefill and e2e throughput remain in the
@@ -141,6 +233,18 @@ Each model-specific config has three sections.
 
 **`model`** — provider, `device` (GPU/CPU), `weight_format`, and `models_base_path`.
 
+`model_dirs` is optional and maps a model name to an explicit IR directory. Without it the
+path is derived as `<models_base_path>/<provider>/<name>_<weight_format>`, which is what
+`utils/ensure_model.py` produces — but a downloaded IR carries the publisher's naming
+(`models/openvino/Qwen3.8-27B-int4-ov`), so `config_qwen3.8_27b.yaml` names it instead of
+guessing at a second convention:
+
+```yaml
+model:
+  model_dirs:
+    Qwen3.8-27B: models/openvino/Qwen3.8-27B-int4-ov
+```
+
 **`benchmark`** — what to run and the acceptance budgets:
 
 | Key | Notes |
@@ -155,9 +259,11 @@ Each model-specific config has three sections.
 | `output_dir` | each run writes to a timestamped subdirectory |
 
 **`profiles`** — the configurations benchmarked in order. A profile is exactly
-`{name, ov, scheduler}`; any other key is rejected. `ov` are OpenVINO plugin properties;
+`{name, ov, scheduler, mtp}`; any other key is rejected. `ov` are OpenVINO plugin properties;
 `scheduler` are OpenVINO GenAI `SchedulerConfig` values, and **omitting the `scheduler`
 section is what selects the stateful pipeline** (reported as `pipeline_mode: stateful`).
+`mtp` is `{enabled, num_assistant_tokens, device}` and is absent on a profile that does not
+run speculative decoding — see [Multi-Token Prediction](#multi-token-prediction-mtp).
 
 Inside a `scheduler`, three `cache_size` states are distinct. Omitted leaves pool sizing
 entirely to OpenVINO — measurably a third configuration, not a neutral default: a 160K run
@@ -187,9 +293,11 @@ overrides that enable it.
 Configuration is validated before model loading: contexts and iteration counts must be
 positive integers, warm-up must be non-negative, profile names must be unique, model names
 must be non-empty, timeout must be positive, profiles must carry no key outside
-`{name, ov, scheduler}`, and profile `ov` / `scheduler` values must be mappings.
-`enable_prefix_caching`, when present, must be the boolean `false`. Invalid values fail once
-with an actionable message instead of failing every case.
+`{name, ov, scheduler, mtp}`, and profile `ov` / `scheduler` values must be mappings.
+`enable_prefix_caching`, when present, must be the boolean `false`. An `mtp` section must use
+only `{enabled, num_assistant_tokens, device}`, `num_assistant_tokens` must be an integer ≥ 1,
+and `max_num_batched_tokens` must leave room for one whole verification step. Invalid values
+fail once with an actionable message instead of failing every case.
 
 A fixed `cache_size` is checked against the estimated cache for **every** context in the
 matrix as soon as the model's `config.json` can be read, before the first case of that model
@@ -210,6 +318,7 @@ context of 0.
 
 `--models` `--contexts` `--profiles` `--iterations` `--warmup` `--output-tokens` `--device`
 `--weight-format` `--output-dir` `--config` override config values for one run.
+`--mtp-tokens K` sweeps the candidate count on the profiles that already enable MTP.
 
 `--pipeline-config KEY=VALUE` and `--scheduler-config KEY=VALUE` add to or override every
 profile's properties; `KEY=` with an empty value removes one. This exists so a one-off
@@ -233,8 +342,8 @@ Each run writes to `<output_dir>/<YYYYMMDD-HHMMSS>/`, so runs never mix:
 | File | Contents |
 |---|---|
 | `iterations.csv` | one row per iteration, warm-up included and flagged, with its own peak and mean memory window |
-| `summary.csv` | one row per (model, profile, context) with aggregated metrics, including `pipeline_mode` and `cache_size_gb` |
-| `summary.md` | ranked leaderboard per context with a `Pipeline` column, the fastest-TTFT call-out, and the exact config of the TPOT winner |
+| `summary.csv` | one row per (model, profile, context) with aggregated metrics, including `pipeline_mode`, `cache_size_gb`, `mtp` and `num_assistant_tokens` |
+| `summary.md` | ranked leaderboard per context with `Pipeline` and `MTP` columns, the fastest-TTFT call-out, the MTP speedup line, and the exact config of the TPOT winner |
 | `summary.json` | the same data structured, including hardware info |
 
 The TPOT ranking and the fastest-TTFT line can name different profiles — that is the point of
@@ -323,9 +432,9 @@ python -m unittest discover -s components/tests -p "test_context_bench_*.py"
 | File | Covers |
 |---|---|
 | `test_context_bench_context_builder.py` | exact-token prompt construction |
-| `test_context_bench_kv_estimate.py` | architecture-derived KV size, the per-sequence linear-attention reservation `max_num_seqs` controls, `cache_size: auto`, and the shipped stateful/paged pair (only the pipeline differs) |
-| `test_context_bench_metrics.py` | llm_bench units, TPOT-first ranking, the TTFT ranking, `pipeline_mode` recording, medians, the time-weighted mean occupancy, `perf_metrics` fallback |
-| `test_context_bench_trial_lifecycle.py` | child exit path, parent recovery, failure classification |
+| `test_context_bench_kv_estimate.py` | architecture-derived KV size, the per-sequence linear-attention reservation `max_num_seqs` controls, `cache_size: auto`, the MTP draft head's own KV surcharge, and the shipped configs' invariants (the 9B/35B pair differ only in the pipeline; the Qwen3.8 matrix differs only in MTP) |
+| `test_context_bench_metrics.py` | llm_bench units, TPOT-first ranking, the TTFT ranking, `pipeline_mode` recording, `mtp` profile resolution, the MTP yield/acceptance arithmetic, medians, the time-weighted mean occupancy, `perf_metrics` fallback |
+| `test_context_bench_trial_lifecycle.py` | child exit path, parent recovery, failure classification, MTP rejected before the model loads |
 
 All four run without a GPU, a model, or the OpenVINO stack.
 

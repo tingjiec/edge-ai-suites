@@ -31,6 +31,7 @@ def _settings_args(**overrides):
         "output_dir": None,
         "pipeline_config": None,
         "scheduler_config": None,
+        "mtp_tokens": None,
     }
     values.update(overrides)
     return SimpleNamespace(**values)
@@ -149,7 +150,9 @@ class TestSettingsValidation(unittest.TestCase):
                 self._load(_settings_config(gpu_memory_budget_gb=value))
 
 
-def _record(iteration, generation_time, ttft_ms, warmup=False, output_size=64, input_size=160000):
+def _record(iteration, generation_time, ttft_ms, warmup=False, output_size=64,
+            input_size=160000, num_assistant_tokens=None, verification_steps=None):
+    mtp_enabled = num_assistant_tokens is not None
     return metrics.iteration_record(
         iteration=iteration,
         input_size=input_size,
@@ -157,6 +160,11 @@ def _record(iteration, generation_time, ttft_ms, warmup=False, output_size=64, i
         generation_time=generation_time,
         first_token_latency=ttft_ms,
         warmup=warmup,
+        num_assistant_tokens=num_assistant_tokens,
+        verification_steps=verification_steps,
+        mtp_acceptance_rate=0.59 if mtp_enabled else None,
+        mtp_draft_tokens=100 if mtp_enabled else None,
+        mtp_accepted_tokens=59 if mtp_enabled else None,
     )
 
 
@@ -284,7 +292,13 @@ class TestAggregation(unittest.TestCase):
         self.assertLess(aggregate["e2e_throughput_min"], aggregate["e2e_throughput_max"])
 
     def test_aggregates_every_advertised_metric(self):
-        aggregate = metrics.aggregate([_record(1, 247.0, 237_000.0), _record(2, 250.0, 240_000.0)])
+        # An MTP profile, so the speculative-decoding metrics are exercised too: they are
+        # advertised in AGGREGATED_METRICS and would otherwise only be checked on records
+        # where they are legitimately absent.
+        aggregate = metrics.aggregate([
+            _record(1, 247.0, 237_000.0, num_assistant_tokens=3, verification_steps=23),
+            _record(2, 250.0, 240_000.0, num_assistant_tokens=3, verification_steps=25),
+        ])
 
         for metric in metrics.AGGREGATED_METRICS:
             self.assertIn(metric, aggregate, f"{metric} is advertised but never aggregated")
@@ -733,25 +747,84 @@ class TestPerfMetricsAreTheStandardSource(unittest.TestCase):
 
 
 class TestGenerationConfigMatchesLlmBench(unittest.TestCase):
-    class _Config:
-        max_new_tokens = 0
-        max_length = 0
-        ignore_eos = False
-        do_sample = True
-        apply_chat_template = True
-
-    class _Pipeline:
-        def get_generation_config(self):
-            return TestGenerationConfigMatchesLlmBench._Config()
-
-    def test_forces_deterministic_fixed_length_generation(self):
-        config = trial_runner.generation_config(self._Pipeline(), 64)
+    def test_builds_the_notebooks_fresh_deterministic_config(self):
+        config = trial_runner.generation_config(64)
 
         self.assertEqual(config.max_new_tokens, 64)
         self.assertEqual(config.max_length, 2**64 - 1)
-        self.assertTrue(config.ignore_eos)
+        self.assertFalse(config.ignore_eos)
         self.assertFalse(config.do_sample)
+        self.assertEqual(config.num_return_sequences, 1)
+        self.assertEqual(config.assistant_confidence_threshold, 0.0)
+        self.assertEqual(config.num_assistant_tokens, 0)
         self.assertFalse(config.apply_chat_template)
+
+
+class TestMtpTuningHint(unittest.TestCase):
+    def test_low_acceptance_recommends_a_smaller_candidate_count(self):
+        case = {
+            "status": "ok", "mtp": True, "num_assistant_tokens": 6,
+            "mtp_acceptance_rate": 0.302,
+        }
+
+        hint = benchmark._mtp_tuning_hint(case)
+
+        self.assertIn("k=3", hint)
+        self.assertIn("30%", hint)
+
+    def test_k3_acceptance_recommends_the_balanced_k2_profile(self):
+        case = {
+            "status": "ok", "mtp": True, "num_assistant_tokens": 3,
+            "mtp_acceptance_rate": 0.507,
+        }
+
+        self.assertIn("k=2", benchmark._mtp_tuning_hint(case))
+
+    def test_healthy_acceptance_needs_no_tuning_hint(self):
+        case = {
+            "status": "ok", "mtp": True, "num_assistant_tokens": 2,
+            "mtp_acceptance_rate": 0.618,
+        }
+
+        self.assertIsNone(benchmark._mtp_tuning_hint(case))
+
+
+class TestMtpOutputCheck(unittest.TestCase):
+    def test_matching_greedy_outputs_pass(self):
+        cases = [
+            {"profile": "paged_min", "status": "ok", "mtp": False,
+             "output_sha256": "same"},
+            {"profile": "mtp_k2", "status": "ok", "mtp": True,
+             "output_sha256": "same"},
+        ]
+
+        self.assertIn("match", benchmark._mtp_output_check(cases))
+
+    def test_divergent_mtp_output_is_named(self):
+        cases = [
+            {"profile": "paged_min", "status": "ok", "mtp": False,
+             "output_sha256": "baseline"},
+            {"profile": "mtp_k2", "status": "ok", "mtp": True,
+             "output_sha256": "different"},
+        ]
+
+        warning = benchmark._mtp_output_check(cases)
+
+        self.assertIn("WARNING", warning)
+        self.assertIn("mtp_k2", warning)
+
+    def test_nondeterministic_profile_is_rejected_before_cross_profile_comparison(self):
+        cases = [
+            {"profile": "paged_min", "status": "ok", "mtp": False,
+             "output_sha256": None, "output_consistent": False},
+            {"profile": "mtp_k2", "status": "ok", "mtp": True,
+             "output_sha256": "stable", "output_consistent": True},
+        ]
+
+        warning = benchmark._mtp_output_check(cases)
+
+        self.assertIn("nondeterministic", warning)
+        self.assertIn("paged_min", warning)
 
 
 class TestGeneratedTokenCount(unittest.TestCase):
@@ -775,6 +848,201 @@ class TestGeneratedTokenCount(unittest.TestCase):
 
         self.assertEqual(trial_runner.generated_token_count(result, tokenizer), 7)
         self.assertEqual(tokenizer.encoded, "generated answer")
+
+
+class TestMtpProfileResolution(unittest.TestCase):
+    """`mtp` is a profile section, not a plugin property, because switching it on changes
+    what is being measured rather than how the plugin is configured. These pin the shape
+    the config author writes and the mistakes that are caught before a 14 GB load."""
+
+    def _resolve(self, profiles, mtp_tokens=None):
+        return benchmark._resolve_profiles(profiles, None, {}, {}, mtp_tokens)
+
+    def _profile(self, **extra):
+        return {"name": "p", "ov": {}, "scheduler": {"cache_size": 4}, **extra}
+
+    def test_a_profile_with_no_mtp_section_resolves_to_mtp_off(self):
+        resolved = self._resolve([self._profile()])[0]
+
+        self.assertFalse(resolved["mtp"]["enabled"])
+        self.assertIsNone(resolved["mtp"]["num_assistant_tokens"])
+
+    def test_a_candidate_count_alone_is_enough_to_turn_mtp_on(self):
+        # A section written out with a count and no `enabled: true` is a profile whose
+        # author meant to run MTP; ignoring it would report a baseline under an `mtp_k3` name.
+        resolved = self._resolve([self._profile(mtp={"num_assistant_tokens": 3})])[0]
+
+        self.assertTrue(resolved["mtp"]["enabled"])
+        self.assertEqual(resolved["mtp"]["num_assistant_tokens"], 3)
+
+    def test_enabled_false_wins_over_a_leftover_candidate_count(self):
+        resolved = self._resolve(
+            [self._profile(mtp={"enabled": False, "num_assistant_tokens": 3})]
+        )[0]
+
+        self.assertFalse(resolved["mtp"]["enabled"])
+
+    def test_zero_candidates_is_rejected_by_name(self):
+        with self.assertRaisesRegex(SystemExit, "num_assistant_tokens must be an integer"):
+            self._resolve([self._profile(mtp={"num_assistant_tokens": 0})])
+
+    def test_a_boolean_candidate_count_is_not_accepted_as_one(self):
+        with self.assertRaisesRegex(SystemExit, "num_assistant_tokens must be an integer"):
+            self._resolve([self._profile(mtp={"num_assistant_tokens": True})])
+
+    def test_mtp_on_a_stateful_profile_survives_resolution_and_dies_at_the_case(self):
+        # A profile with no `scheduler` is stateful, which cannot carry MTP off NPU. It is
+        # not rejected here, because `--device NPU` on the command line would make it legal;
+        # the check that knows the device runs in the child, before the model loads.
+        resolved = benchmark._resolve_profiles(
+            [{"name": "p", "ov": {}, "mtp": {"num_assistant_tokens": 3}}], None, {}, {}
+        )[0]
+
+        self.assertTrue(resolved["mtp"]["enabled"])
+        self.assertEqual(benchmark.pipeline_mode(resolved["scheduler"]),
+                         benchmark.PIPELINE_STATEFUL)
+        with self.assertRaises(ValueError):
+            trial_runner.validate_mtp(".", "GPU", resolved["mtp"], resolved["scheduler"])
+
+    def test_a_prefill_chunk_too_small_for_one_step_names_both_numbers(self):
+        with self.assertRaises(SystemExit) as caught:
+            self._resolve([{
+                "name": "p", "ov": {},
+                "scheduler": {"max_num_batched_tokens": 3},
+                "mtp": {"num_assistant_tokens": 6},
+            }])
+
+        message = str(caught.exception)
+        self.assertIn("max_num_batched_tokens=3", message)
+        self.assertIn("num_assistant_tokens=6", message)
+
+    def test_an_unknown_mtp_key_says_what_the_section_accepts(self):
+        with self.assertRaisesRegex(SystemExit, "mtp has unknown key"):
+            self._resolve([self._profile(mtp={"num_assistant_tokens": 3, "k": 3})])
+
+    def test_the_cli_override_sweeps_k_without_converting_the_baseline(self):
+        # The no-MTP row is the denominator of every speedup the report prints; a sweep flag
+        # that switched it on would leave the run with six numbers and nothing to compare to.
+        baseline, swept = self._resolve(
+            [
+                {"name": "paged_min", "ov": {}, "scheduler": {"cache_size": 4}},
+                {"name": "mtp_k3", "ov": {}, "scheduler": {"cache_size": 4},
+                 "mtp": {"num_assistant_tokens": 3}},
+            ],
+            mtp_tokens=5,
+        )
+
+        self.assertFalse(baseline["mtp"]["enabled"])
+        self.assertEqual(swept["mtp"]["num_assistant_tokens"], 5)
+
+    def test_the_configured_matrix_reaches_summary_csv(self):
+        for field in ("mtp", "num_assistant_tokens", "tokens_per_step",
+                      "mtp_acceptance_rate"):
+            self.assertIn(field, benchmark.CASE_FIELDS)
+
+
+class TestMultiTokenPredictionYield(unittest.TestCase):
+    """What an MTP profile produced, not just what it was asked for.
+
+    TPOT alone cannot rank a candidate-count sweep: k=3 and k=6 reached 103.4 and
+    100.2 ms/token on this box, a difference smaller than run-to-run spread, while
+    their acceptance rates -- 59% and 39% -- say plainly that the sixth candidate is
+    not earning its verification. These two derived numbers are what make that
+    visible, so their arithmetic is pinned here.
+    """
+
+    def test_mtp_off_yields_exactly_one_token_per_pass(self):
+        # The self-check the reports lean on: with no draft head, the main model runs
+        # once per output token. A baseline row reading anything else means MTP is
+        # leaking into it and every speedup measured against it is wrong.
+        tokens_per_step, acceptance = metrics.mtp_yield(64, 64, None)
+
+        self.assertEqual(tokens_per_step, 1.0)
+        self.assertIsNone(acceptance)
+
+    def test_acceptance_excludes_the_bonus_token_the_main_model_produces(self):
+        # Measured on Qwen3.8-27B: 64 tokens in 23 verification passes at k=3.
+        # 64/23 = 2.783 tokens per pass, of which one is the main model's own bonus
+        # token -- so 1.783 of the 3 drafted candidates were accepted, not 2.783/3.
+        tokens_per_step, acceptance = metrics.mtp_yield(64, 23, 3)
+
+        self.assertAlmostEqual(tokens_per_step, 2.783, places=3)
+        self.assertAlmostEqual(acceptance, 0.5942, places=4)
+
+    def test_raising_k_past_the_knee_shows_up_as_falling_acceptance(self):
+        # k=1 -> 34 passes, k=6 -> 19 passes, both for 64 tokens. Yield rises while
+        # acceptance collapses; that divergence is the whole point of the column.
+        _, at_k1 = metrics.mtp_yield(64, 34, 1)
+        _, at_k6 = metrics.mtp_yield(64, 19, 6)
+
+        self.assertAlmostEqual(at_k1, 0.8824, places=4)
+        self.assertAlmostEqual(at_k6, 0.3947, places=4)
+        self.assertGreater(at_k1, at_k6)
+
+    def test_a_runtime_that_reports_no_steps_yields_nothing_rather_than_zero(self):
+        # "Not measured" and "nothing accepted" are different findings, and a 0 here
+        # would enter the median as a real sample and drag a working profile down.
+        self.assertEqual(metrics.mtp_yield(64, None, 3), (None, None))
+        self.assertEqual(metrics.mtp_yield(64, 0, 3), (None, None))
+
+    def test_acceptance_stays_within_zero_and_one_when_step_counting_is_off_by_one(self):
+        # A runtime that counts the prefill pass as a step (or omits one) must not
+        # produce a rate outside [0, 1] and make the column unreadable.
+        self.assertEqual(metrics.mtp_yield(64, 64, 3)[1], 0.0)
+        self.assertEqual(metrics.mtp_yield(64, 4, 3)[1], 1.0)
+
+    def test_record_carries_the_mtp_fields_even_when_the_profile_runs_without_it(self):
+        # One shape for iterations.csv: a None column is readable, a missing one shifts
+        # every field after it on that row.
+        record = metrics.iteration_record(
+            iteration=1, input_size=8000, output_size=64, generation_time=12.0,
+            first_token_latency=6000.0,
+        )
+
+        for field in ("num_assistant_tokens", "verification_steps", "tokens_per_step",
+                      "mtp_acceptance_rate"):
+            self.assertIn(field, record)
+            self.assertIsNone(record[field])
+
+    def test_aggregate_reports_a_median_yield_with_its_spread(self):
+        rows = [
+            metrics.iteration_record(
+                iteration=index, input_size=8000, output_size=64, generation_time=12.0,
+                first_token_latency=6000.0, num_assistant_tokens=3,
+                verification_steps=steps, mtp_acceptance_rate=acceptance,
+            )
+            for index, (steps, acceptance) in enumerate(((23, 0.59), (25, 0.55), (21, 0.63)))
+        ]
+
+        aggregated = metrics.aggregate(rows)
+
+        self.assertAlmostEqual(aggregated["tokens_per_step"], 2.783, places=3)
+        self.assertAlmostEqual(aggregated["tokens_per_step_min"], 2.56, places=2)
+        self.assertAlmostEqual(aggregated["tokens_per_step_max"], 3.048, places=3)
+        self.assertIn("mtp_acceptance_rate", aggregated)
+
+    def test_iteration_line_names_the_candidate_count_it_was_measured_at(self):
+        record = metrics.iteration_record(
+            iteration=1, input_size=8000, output_size=64, generation_time=12.0,
+            first_token_latency=6000.0, other_tokens_avg_latency=103.4,
+            num_assistant_tokens=3, verification_steps=23, mtp_acceptance_rate=0.59,
+            mtp_draft_tokens=100, mtp_accepted_tokens=59,
+        )
+
+        line = metrics.format_iteration(record)
+
+        self.assertIn("MTP k=3", line)
+        self.assertIn("2.78 tok/step", line)
+        self.assertIn("59% accepted", line)
+        self.assertIn("59/100 candidates", line)
+
+    def test_iteration_line_of_a_non_mtp_profile_gains_no_mtp_tail(self):
+        record = metrics.iteration_record(
+            iteration=1, input_size=8000, output_size=64, generation_time=12.0,
+            first_token_latency=6000.0, other_tokens_avg_latency=192.5,
+        )
+
+        self.assertNotIn("MTP", metrics.format_iteration(record))
 
 
 if __name__ == "__main__":

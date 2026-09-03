@@ -1,85 +1,135 @@
 # Copyright (C) 2026 Intel Corporation
 # SPDX-License-Identifier: Apache-2.0
 #
-# PTL 64 GB / 59 GB shared-GPU configuration for Qwen3.8-27B int8 at 160K.
-# Two profiles that differ ONLY in the pipeline: stateful (SDPA) vs paged attention with a
-# capped KV pool. TTFT is the figure under test -- same shape as config_qwen3.5_9b.yaml and
-# config_qwen3.6_35b_a3b.yaml.
+# PTL 64 GB / 59 GB shared-GPU configuration for Qwen3.8-27B int4 at 8K.
 #
-# STATUS: BLOCKED, not just untuned. Every case in this file has been confirmed to crash
-# during model load, before any prefill or decode:
-#   crashed:exitcode=3221225477:0xC0000005 STATUS_ACCESS_VIOLATION
-# Confirmed independent of every lever this tool controls: GPU and CPU (`--device CPU`),
-# `stateful` and `paged_min`, and context length (reproduces at 300 tokens, not just 160K).
-# So this is not a memory, scheduler, or context-size problem -- it is VLMPipeline failing to
-# read this specific model's IR, on any device, before any of that runs.
+# Unlike config_qwen3.5_9b.yaml and config_qwen3.6_35b_a3b.yaml, the measured variable here
+# is NOT stateful-vs-paged. It is multi-token prediction: this model ships its own MTP draft
+# head (openvino_mtp_model.xml), openvino_genai can run it as self-speculative decoding, and
+# it is by far the largest decode-side lever available on this model. The matrix is therefore
+# one no-MTP paged baseline plus a sweep of `num_assistant_tokens`.
 #
-# Root cause (upstream, not fixable from this repo): Qwen3.8-27B is `Qwen3_5ForConditionalGeneration`
-# / model_type `qwen3_5` -- the same hybrid (full_attention + linear_attention) VLM family as
-# Qwen3.5. `optimum-intel` (1.27.0 installed here) has no native export path for `qwen3_5` yet
-# (tracked at https://github.com/huggingface/optimum-intel/issues/1628, "Qwen3.5 Family Support"),
-# so this IR was almost certainly produced via `--trust-remote-code` custom modeling code rather
-# than optimum-intel's normal VLM export -- consistent with component names in the exported
-# folder that don't match optimum-intel's usual VLM layout (`openvino_vision_embeddings_pos_model`).
-# `openvino_genai` 2026.4.0.0.dev20260723's VLMPipeline reader has a fixed set of architectures it
-# understands; handed a graph shape it was never built for, it corrupts memory instead of raising
-# a clean "unsupported architecture" error.
+# There is no `stateful` profile in this file, and that is a constraint rather than an
+# omission: on a non-NPU device openvino_genai only runs speculative decoding on the paged
+# attention backend, so a stateful profile could not carry MTP and would not be comparable
+# with the rows that do.
 #
-# There is no config-level workaround: the crash is independent of every property in `ov` and
-# `scheduler` below. Re-test this file once `optimum-intel`/`openvino_genai` add native `qwen3_5`
-# support and the model is re-exported through that path -- until then, running this config
-# reproduces the same crash. See docs/dev-guide/context-bench/context_bench_design.md §11.
+# HISTORY: this file previously declared every case BLOCKED, crashing during model load with
+# `crashed:exitcode=3221225477:0xC0000005 STATUS_ACCESS_VIOLATION` on any device and at any
+# context length, attributed to VLMPipeline having no reader for the `qwen3_5` architecture.
+# That is no longer true. On openvino 2026.5.0 / openvino-genai 2026.5.0.0-3416 with the
+# published OpenVINO/Qwen3.8-27B-int4-ov IR, the model loads in ~50 s and generates normally,
+# with and without MTP.
+#
+# Measured on this box with the shipped 8K classroom prompt and 64 output tokens, reusing
+# one loaded pipeline so load/compile noise cannot move the knee:
+#
+#   profile        TPOT ms   accepted
+#   mtp_k1         197.2     63.2%
+#   mtp_k2         156.8     61.8%   <- recommended balanced profile
+#   mtp_k3         150.9     50.7%   <- minimum-TPOT profile
+#   mtp_k4         152.0     41.3%
+#   mtp_k6         161.3     30.2%
+#
+# k=6 does not have a hidden acceptance knob: this GenAI MTP path requires a static candidate
+# count and a zero confidence threshold. Lower k to raise acceptance; on this workload k=3
+# also improves TPOT. MTP shortens decode and does not touch prefill.
 
 model:
   provider: openvino
   device: GPU
   weight_format: int4
   models_base_path: "models"
+  # The published IR is named `Qwen3.8-27B-int4-ov`, which is not the
+  # `<name>_<weight_format>` layout `models_base_path` derives. Named explicitly rather than
+  # renamed on disk, so re-downloading the model does not silently break this config.
+  model_dirs:
+    Qwen3.8-27B: models/openvino/Qwen3.8-27B-int4-ov
 
 benchmark:
   models: [Qwen3.8-27B]
-  context_tokens: [32000]
+  context_tokens: [1000]
   output_tokens: 64
-  warmup: 0
-  iterations: 1
+  # A k-sweep compares six profiles against each other, so a single sample per profile is not
+  # enough: the run-to-run spread that motivated iterations in the first place is the same
+  # size as the differences between adjacent k values. One warm-up absorbs kernel compilation,
+  # three measured iterations give a median with visible min/max.
+  warmup: 1
+  iterations: 3
   timeout_sec: 1800
   max_system_memory_pct: 100
   gpu_memory_budget_gb: 59
   cache_dir: null
   output_dir: monitoring/executionlogs/context_bench/qwen3.8_27b
 
-# Both profiles carry the SAME `ov` block, so the pipeline would be the only variable between
-# them if either could load. f16 KV is the untuned, historically-safer default (per
-# config_qwen3.5_9b.yaml) -- there is no measurement on this model to tune it against, since
-# load never completes.
+# All six profiles carry an IDENTICAL `ov` and `scheduler` block. The only variable in this
+# file is the `mtp` section, so every TPOT difference between rows is attributable to
+# multi-token prediction and nothing else.
 #
-# `cache_size` is a SchedulerConfig property, and passing any SchedulerConfig selects
-# continuous batching, so a capped KV pool and the stateful pipeline are alternatives, not
-# settings to combine. See docs/dev-guide/context-bench/.
+# `ATTENTION_BACKEND: PA` is mandatory for the MTP rows, not tuning: genai refuses
+# speculative decoding on the SDPA backend for anything but a Gemma4 MTP pair. It is set on
+# the baseline too so the baseline is the same pipeline as what it is being compared against.
+#
+# `max_num_batched_tokens: 32768` also bounds one MTP step, which submits
+# `num_assistant_tokens + 1` tokens -- far below this, but the tool checks it, so lowering
+# this value below k+1 is rejected before loading rather than confusing the scheduler.
 profiles:
-  # No scheduler section at all -> the stateful (SDPA) pipeline. Crashes at load exactly like
-  # paged_min below -- included for the same A/B shape as the other configs, not because it is
-  # expected to behave differently.
-  - name: stateful
-    ov:
-      GPU_ENABLE_LARGE_ALLOCATIONS: "YES"
-      KV_CACHE_PRECISION: f16
-
-  # Continuous batching with the KV pool capped. cache_size=8 GiB is a placeholder carried over
-  # from config_qwen3.5_9b.yaml, not a measured value -- the pipeline crashes before this pool is
-  # ever allocated. Revisit once load succeeds.
+  # The row every speedup below is measured against: same pipeline, same pool, draft head
+  # not loaded. Its `tok/step` should read exactly 1.00 -- if it does not, MTP is leaking
+  # into the baseline and none of the comparisons mean anything.
   - name: paged_min
-    ov:
+    ov: &ov_qwen38
+      ATTENTION_BACKEND: PA
       GPU_ENABLE_LARGE_ALLOCATIONS: "YES"
       KV_CACHE_PRECISION: f16
-    scheduler:
-      max_num_batched_tokens: 65536
-      # NOT a concurrency setting on this model: Qwen3.8-27B is hybrid (16 full_attention + 48
-      # linear_attention layers, per config.json's layer_types), and the paged backend reserves
-      # one whole linear-attention state per schedulable sequence out of the same `cache_size`
-      # pool the KV blocks come from. Left at 1 for the same reason as the other two configs;
-      # unmeasured here like everything else in this profile.
+    scheduler: &scheduler_qwen38
+      max_num_batched_tokens: 32768
+      # NOT a concurrency setting on this model: Qwen3.8-27B is hybrid (16 full_attention +
+      # 48 linear_attention layers, per config.json's layer_types), and the paged backend
+      # reserves one whole linear-attention state per schedulable sequence out of the same
+      # `cache_size` pool the KV blocks come from.
       max_num_seqs: 1
       # Mandatory, not tuning: iterations reuse one prompt, so a warm prefix cache would
       # report a TTFT no first request ever sees.
       enable_prefix_caching: false
+      # Fixed for this 8K A/B matrix so baseline and MTP use the same scheduler pool.
+      # 4 GB is the measured minimum that admits the target + draft pipelines; using
+      # `auto` here would resolve to 2 GB for baseline and 4 GB for MTP, changing two
+      # variables in what should be a one-variable comparison.
+      cache_size: 4
+
+  # The sweep. k is the number of candidates the draft head offers per verification pass;
+  # higher k means fewer main-model passes but a lower share of candidates accepted, and the
+  # product of those two is what this sweep exists to locate. 1, 2, 3, 4, 6 brackets the knee
+  # measured at short context (k=3) with a point on either side of it.
+  - name: mtp_k1
+    ov: *ov_qwen38
+    scheduler: *scheduler_qwen38
+    mtp:
+      num_assistant_tokens: 1
+
+  - name: mtp_k2
+    # Recommended balanced profile: ~62% acceptance with TPOT close to k=3.
+    ov: *ov_qwen38
+    scheduler: *scheduler_qwen38
+    mtp:
+      num_assistant_tokens: 2
+
+  - name: mtp_k3
+    # Minimum-TPOT profile: slightly faster than k=2, but only ~51% acceptance.
+    ov: *ov_qwen38
+    scheduler: *scheduler_qwen38
+    mtp:
+      num_assistant_tokens: 3
+
+  - name: mtp_k4
+    ov: *ov_qwen38
+    scheduler: *scheduler_qwen38
+    mtp:
+      num_assistant_tokens: 4
+
+  - name: mtp_k6
+    ov: *ov_qwen38
+    scheduler: *scheduler_qwen38
+    mtp:
+      num_assistant_tokens: 6

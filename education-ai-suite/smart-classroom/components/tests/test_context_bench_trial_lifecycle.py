@@ -23,8 +23,11 @@ the child's exit instead of calling it a crash.
 """
 
 import inspect
+import tempfile
 import unittest
+from pathlib import Path
 from queue import Empty
+from types import SimpleNamespace
 from unittest import mock
 
 from components.llm.context_bench import benchmark, trial_runner
@@ -483,6 +486,134 @@ class TestGeneratedOutputIsNotQualityJudged(unittest.TestCase):
         # The token count comes from the runtime or the tokenizer -- never from
         # inspecting whether the text looks like a good answer.
         self.assertNotIn("strip()", code)
+
+
+class TestMtpIsRejectedBeforeTheModelLoads(unittest.TestCase):
+    """openvino_genai enforces all of these too -- inside `mtp_strategy.cpp`, after the
+    pipeline has loaded. On a 14 GB int4 export that is a minute per case spent to learn
+    the profile was never runnable, and the same minute again for every context in the
+    matrix. These checks are filesystem and dict reads, so they cost nothing."""
+
+    def test_a_model_without_a_draft_head_names_the_missing_file(self):
+        with tempfile.TemporaryDirectory() as model_dir:
+            with self.assertRaises(ValueError) as caught:
+                trial_runner.validate_mtp(
+                    model_dir, "GPU", {"enabled": True, "num_assistant_tokens": 3},
+                    {"cache_size": 4},
+                )
+
+            self.assertIn(trial_runner.MTP_MODEL_FILE, str(caught.exception))
+
+    def test_mtp_without_a_scheduler_says_where_the_pipeline_went_wrong(self):
+        # A profile with no `scheduler` section is stateful/SDPA, and genai only runs
+        # speculative decoding on paged attention off NPU. The error has to say that,
+        # because "assertion failed" would send the reader to tune the wrong thing.
+        with tempfile.TemporaryDirectory() as model_dir:
+            Path(model_dir, trial_runner.MTP_MODEL_FILE).touch()
+
+            with self.assertRaises(ValueError) as caught:
+                trial_runner.validate_mtp(
+                    model_dir, "GPU", {"enabled": True, "num_assistant_tokens": 3}, {}
+                )
+
+            message = str(caught.exception)
+            self.assertIn("scheduler", message)
+            self.assertIn("PA", message)
+
+    def test_npu_is_exempt_because_it_has_its_own_stateful_path(self):
+        with tempfile.TemporaryDirectory() as model_dir:
+            Path(model_dir, trial_runner.MTP_MODEL_FILE).touch()
+
+            trial_runner.validate_mtp(
+                model_dir, "NPU", {"enabled": True, "num_assistant_tokens": 3}, {}
+            )
+
+    def test_a_profile_with_mtp_off_is_never_held_to_any_of_this(self):
+        with tempfile.TemporaryDirectory() as model_dir:
+            for mtp in (None, {}, {"enabled": False}):
+                with self.subTest(mtp=mtp):
+                    trial_runner.validate_mtp(model_dir, "GPU", mtp, {})
+
+    def test_validation_runs_before_the_load_clock_starts(self):
+        code = _executable_source(trial_runner.run_case)
+        validate_at = code.index("validate_mtp(")
+
+        self.assertLess(validate_at, code.index("_load_pipeline("))
+        self.assertLess(validate_at, code.index("time.perf_counter()"))
+
+
+class TestMtpDraftModelConstruction(unittest.TestCase):
+    def test_uses_the_public_notebook_call_without_internal_mode_flags(self):
+        fake_genai = SimpleNamespace(
+            SchedulerConfig=type("SchedulerConfig", (), {"max_num_seqs": None}),
+            draft_model=mock.Mock(return_value="draft"),
+            LLMPipeline=mock.Mock(return_value="pipeline"),
+        )
+        with tempfile.TemporaryDirectory() as model_dir:
+            Path(model_dir, "openvino_model.xml").touch()
+            with mock.patch.dict("sys.modules", {"openvino_genai": fake_genai}):
+                trial_runner._load_pipeline(
+                    model_dir, "GPU", {}, {"max_num_seqs": 1},
+                    {"enabled": True, "device": None},
+                )
+
+        fake_genai.draft_model.assert_called_once_with(model_dir, "GPU")
+
+
+class TestMtpGenerationConfig(unittest.TestCase):
+    """The notebook's fresh config and the settings GenAI requires for MTP."""
+
+    def test_candidate_count_and_a_zero_threshold_are_both_set(self):
+        # genai's MTP strategy accepts a *static* candidate count only: a non-zero
+        # confidence threshold selects the dynamic variant and is rejected outright.
+        config = trial_runner.generation_config(
+            64, {"enabled": True, "num_assistant_tokens": 3}
+        )
+
+        self.assertEqual(config.num_assistant_tokens, 3)
+        self.assertEqual(config.assistant_confidence_threshold, 0.0)
+        self.assertFalse(config.do_sample)
+        self.assertEqual(config.num_return_sequences, 1)
+
+    def test_a_non_mtp_case_uses_the_notebooks_zero_candidate_baseline(self):
+        config = trial_runner.generation_config(64)
+
+        self.assertEqual(config.num_assistant_tokens, 0)
+        self.assertEqual(config.assistant_confidence_threshold, 0.0)
+
+
+class TestMtpYieldIsReadFromTheRuntime(unittest.TestCase):
+    def test_acceptance_rate_uses_the_public_extended_metric(self):
+        result = SimpleNamespace(
+            perf_metrics=SimpleNamespace(),
+            extended_perf_metrics=SimpleNamespace(
+                get_draft_acceptance_rate=lambda: 0.625,
+                get_num_draft_tokens=lambda: 80,
+                get_num_accepted_tokens=lambda: 50,
+            ),
+        )
+
+        metrics = trial_runner.read_perf_metrics(result)
+
+        self.assertEqual(metrics["mtp_acceptance_rate"], 0.625)
+        self.assertEqual(metrics["mtp_draft_tokens"], 80)
+        self.assertEqual(metrics["mtp_accepted_tokens"], 50)
+
+    def test_verification_steps_come_from_the_new_token_time_series(self):
+        # There is no public verification-step getter, so the count of main-model passes
+        # comes from `raw_metrics.m_new_token_times`: 23 passes for 64 tokens at k=3.
+        result = SimpleNamespace(
+            perf_metrics=SimpleNamespace(
+                raw_metrics=SimpleNamespace(m_new_token_times=[0.0] * 23),
+            )
+        )
+
+        self.assertEqual(trial_runner.read_perf_metrics(result)["verification_steps"], 23)
+
+    def test_a_runtime_without_that_series_reports_no_steps_rather_than_failing(self):
+        result = SimpleNamespace(perf_metrics=SimpleNamespace())
+
+        self.assertNotIn("verification_steps", trial_runner.read_perf_metrics(result))
 
 
 if __name__ == "__main__":

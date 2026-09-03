@@ -24,12 +24,20 @@ Timing comes from OpenVINO GenAI's own ``perf_metrics`` where the runtime
 provides it (the same source llm_bench uses), falling back to wall-clock timing
 around the streamer callback.
 
+A profile may also enable multi-token prediction, which is self-speculative
+decoding: the model's own ``openvino_mtp_model.xml`` draft head proposes ``k``
+candidates and the main model verifies them in one pass. It is a decode-side
+lever only -- measured on Qwen3.8-27B it cuts TPOT by 1.6-1.9x and leaves TTFT
+untouched -- and it only runs on the paged backend. See ``validate_mtp``.
+
 OpenVINO / transformers are imported lazily inside run_case() so this module can
 be imported on a machine without the OpenVINO stack.
 """
 
 from __future__ import annotations
 
+import hashlib
+import math
 import os
 import sys
 import time
@@ -90,6 +98,16 @@ STAGE_PROMPT_BUILT = "prompt_built"  # context tokenized, nothing sent to the de
 STAGE_PREFILLED = "prefilled"  # first token streamed: the whole context is through the model
 STAGE_DECODED = "decoded"  # at least one generate() returned
 
+# The multi-token-prediction draft head, as `optimum-cli`/the published OpenVINO IR names
+# it. The same directory serves as both the target and the draft model.
+MTP_MODEL_FILE = "openvino_mtp_model.xml"
+
+# Properties openvino_genai consumes itself rather than forwarding to the plugin. The GPU
+# plugin does not advertise them, so without this list `_device_diagnostics` reports every
+# MTP profile as passing an unsupported property -- advice that would break the profile if
+# followed.
+_GENAI_LEVEL_PROPERTIES = frozenset({"ATTENTION_BACKEND", "scheduler_config", "draft_model"})
+
 # The stage a failure belongs to, given the last milestone reached. Off-by-one on purpose:
 # an exception is thrown by the step *after* the last completed milestone, so a crash with
 # the prompt built but no token streamed is a prefill failure.
@@ -105,6 +123,44 @@ _FAILING_STAGE = {
 def failing_stage(stage_reached: str) -> str:
     """Name the stage that was running when a case at `stage_reached` failed."""
     return _FAILING_STAGE.get(stage_reached, "generate")
+
+
+def has_mtp_head(model_dir: str) -> bool:
+    """Whether this export ships the multi-token-prediction draft head.
+
+    Not every OpenVINO export of an MTP-capable model includes it, and genai's own
+    failure for a missing one is a deep assertion inside the speculative-decoding
+    strategy. Checking the file is what lets a profile be rejected up front.
+    """
+    return os.path.isfile(os.path.join(model_dir, MTP_MODEL_FILE))
+
+
+def validate_mtp(model_dir: str, device: str, mtp: dict | None,
+                 scheduler_config: dict | None) -> None:
+    """Reject an MTP profile this model/device/pipeline combination cannot run.
+
+    Every rule here is enforced by openvino_genai as well -- the point is *where*. The
+    runtime's checks fire inside `mtp_strategy.cpp` after the pipeline has loaded, which
+    on a 14 GB int4 export costs a minute per case to learn that the profile was never
+    runnable. These are pure filesystem and dict checks, so they cost nothing.
+    """
+    if not (mtp or {}).get("enabled"):
+        return
+    if not has_mtp_head(model_dir):
+        raise ValueError(
+            f"mtp is enabled but {model_dir} has no {MTP_MODEL_FILE}; this export "
+            "carries no draft head, so there is nothing to speculate with"
+        )
+    # PA is not a tuning preference here: genai refuses speculative decoding on the SDPA
+    # backend for anything but a Gemma4 MTP pair, and a SchedulerConfig is what selects
+    # PA. NPU has its own stateful path and is exempt.
+    if not scheduler_config and not device.upper().startswith("NPU"):
+        raise ValueError(
+            "mtp is enabled without a `scheduler` section, which leaves the profile on "
+            "the stateful (SDPA) pipeline. On a non-NPU device openvino_genai only runs "
+            "speculative decoding on paged attention -- give the profile a `scheduler` "
+            'section and set ATTENTION_BACKEND: PA under `ov`'
+        )
 
 
 def classify_error(exc: Exception) -> str:
@@ -136,7 +192,10 @@ def _device_diagnostics(device: str, ov_config: dict) -> dict:
         core = ov.Core()
         if ov_config:
             supported = set(core.get_property(device, "SUPPORTED_PROPERTIES"))
-            info["unsupported_properties"] = [k for k in ov_config if k not in supported]
+            info["unsupported_properties"] = [
+                k for k in ov_config
+                if k not in supported and k not in _GENAI_LEVEL_PROPERTIES
+            ]
         if device.upper().startswith("GPU"):
             total_bytes = core.get_property(device, "GPU_DEVICE_TOTAL_MEM_SIZE")
             info["gpu_budget_gb"] = round(float(total_bytes) / (1024 ** 3), 2)
@@ -178,7 +237,8 @@ def _load_tokenizer(model_dir: str, trust_remote_code: bool = True):
     raise last_exc
 
 
-def _load_pipeline(model_dir: str, device: str, ov_config: dict, scheduler_config: dict | None):
+def _load_pipeline(model_dir: str, device: str, ov_config: dict,
+                   scheduler_config: dict | None, mtp: dict | None = None):
     """Pick LLMPipeline or VLMPipeline from the IR layout on disk.
 
     optimum-cli decides whether a candidate exports as a plain causal LM
@@ -193,6 +253,11 @@ def _load_pipeline(model_dir: str, device: str, ov_config: dict, scheduler_confi
     still the paged backend -- which is why a bounded KV pool (`cache_size`, a
     SchedulerConfig-only property) and the stateful pipeline are separate profiles rather
     than one configuration. See benchmark.pipeline_mode.
+
+    With `mtp` enabled the *same* directory is handed back as the draft model. That is not
+    a shortcut: multi-token prediction is self-speculative decoding, and GenAI recognizes
+    `openvino_mtp_model.xml` in that export. Keep this call aligned with the official
+    Qwen3.8 MTP notebook; passing the internal `mtp_mode=True` kwarg crashes this runtime.
     """
     import openvino_genai as ov_genai
 
@@ -202,8 +267,20 @@ def _load_pipeline(model_dir: str, device: str, ov_config: dict, scheduler_confi
         for key, value in scheduler_config.items():
             if not hasattr(scheduler, key):
                 raise ValueError(f"Unsupported SchedulerConfig property: {key}")
-            setattr(scheduler, key, value)
+            try:
+                setattr(scheduler, key, value)
+            except TypeError as exc:
+                # pybind's own message names neither the property nor the config that set
+                # it, which turns a one-character config mistake into a stack trace.
+                raise ValueError(
+                    f"SchedulerConfig.{key} rejected {value!r} ({type(value).__name__}): {exc}"
+                ) from exc
         pipeline_args["scheduler_config"] = scheduler
+
+    if (mtp or {}).get("enabled"):
+        pipeline_args["draft_model"] = ov_genai.draft_model(
+            model_dir, mtp.get("device") or device
+        )
 
     if os.path.exists(os.path.join(model_dir, "openvino_language_model.xml")):
         return ov_genai.VLMPipeline(model_dir, device=device, **pipeline_args), False
@@ -227,13 +304,25 @@ def prepare_pipeline_input(pipe, prompt: str, accepts_tokenized_input: bool):
     return (tokenized if accepts_tokenized_input else prompt), prompt_tokens
 
 
-def generation_config(pipe, output_tokens: int):
-    """Use the same deterministic, fixed-length settings as llm_bench."""
-    config = pipe.get_generation_config()
+def generation_config(output_tokens: int, mtp: dict | None = None):
+    """Build the deterministic request config used by the Qwen3.8 MTP notebook.
+
+    A fresh config is intentional: the model's generation_config.json enables sampling,
+    while MTP requires greedy decoding. Reusing the pipeline-owned config risks retaining
+    model defaults or fields changed by an earlier request. `apply_chat_template` is the
+    one benchmark-specific difference from the notebook because our prompt is already
+    rendered to an exact token count before it reaches VLMPipeline.
+    """
+    import openvino_genai as ov_genai
+
+    config = ov_genai.GenerationConfig()
     config.max_new_tokens = output_tokens
-    config.max_length = 2**64 - 1
-    config.ignore_eos = True
     config.do_sample = False
+    config.num_return_sequences = 1
+    config.assistant_confidence_threshold = 0.0
+    config.num_assistant_tokens = (
+        mtp["num_assistant_tokens"] if (mtp or {}).get("enabled") else 0
+    )
     if hasattr(config, "apply_chat_template"):
         config.apply_chat_template = False
     return config
@@ -247,9 +336,14 @@ def generated_token_count(result, tokenizer) -> int:
             return len(tokens[0])
         except (IndexError, TypeError):
             pass
-    texts = getattr(result, "texts", None)
-    output_text = texts[0] if texts else str(result)
+    output_text = generated_text(result)
     return int(tokenizer.encode(output_text).input_ids.shape[-1])
+
+
+def generated_text(result) -> str:
+    """Return the first generated text, matching the notebook's comparison target."""
+    texts = getattr(result, "texts", None)
+    return texts[0] if texts else str(result)
 
 
 def _mean_ms(pair) -> float | None:
@@ -271,6 +365,10 @@ def read_perf_metrics(result) -> dict:
     pipeline tokenizes the string itself (see prepare_pipeline_input), so the count taken
     here is what was requested, not necessarily what ran -- and prefill/e2e throughput
     divide by it.
+
+    Newer GenAI builds expose MTP's draft acceptance directly on
+    `result.extended_perf_metrics`. The verification-step count has no public getter, so it
+    remains a best-effort compatibility metric read from `raw_metrics.m_new_token_times`.
     """
     out = {}
     perf = getattr(result, "perf_metrics", None)
@@ -304,6 +402,25 @@ def read_perf_metrics(result) -> dict:
         duration = _mean_ms(perf.get_generate_duration())
         if duration is not None:
             out["generation_time"] = duration / 1000.0
+    except Exception:  # noqa: BLE001
+        pass
+    try:
+        extended = result.extended_perf_metrics
+        acceptance = extended.get_draft_acceptance_rate()
+        if isinstance(acceptance, (int, float)) and math.isfinite(acceptance):
+            out["mtp_acceptance_rate"] = float(acceptance)
+        draft_tokens = extended.get_num_draft_tokens()
+        accepted_tokens = extended.get_num_accepted_tokens()
+        if isinstance(draft_tokens, int) and draft_tokens >= 0:
+            out["mtp_draft_tokens"] = draft_tokens
+        if isinstance(accepted_tokens, int) and accepted_tokens >= 0:
+            out["mtp_accepted_tokens"] = accepted_tokens
+    except Exception:  # noqa: BLE001
+        pass
+    try:
+        steps = len(perf.raw_metrics.m_new_token_times)
+        if steps > 0:
+            out["verification_steps"] = steps
     except Exception:  # noqa: BLE001
         pass
     return out
@@ -356,6 +473,7 @@ def run_case(
     result_queue,
     ov_config: dict | None = None,
     scheduler_config: dict | None = None,
+    mtp: dict | None = None,
 ) -> None:
     """Load once, generate ``warmup + iterations`` times, report each one.
 
@@ -396,10 +514,13 @@ def run_case(
     done["gpu_budget_gb"] = diagnostics["gpu_budget_gb"]
 
     try:
+        # Before the clock starts: a profile this model cannot run is a configuration
+        # error, not a load time worth reporting.
+        validate_mtp(model_dir, device, mtp, scheduler_config)
         t0 = time.perf_counter()
         tokenizer = _load_tokenizer(model_dir)
         pipe, accepts_tokenized_input = _load_pipeline(
-            model_dir, device, ov_config, scheduler_config
+            model_dir, device, ov_config, scheduler_config, mtp
         )
         done["load_ok"] = True
         done["load_time_s"] = round(time.perf_counter() - t0, 3)
@@ -431,7 +552,11 @@ def run_case(
         # Plain greedy decoding. Proving and timing prefill + decode is the whole goal, and
         # grammar-constrained decoding was observed to collapse into "!!!!" on some models,
         # which would score a false failure for a context the box handled.
-        gen_config = generation_config(pipe, output_tokens)
+        gen_config = generation_config(output_tokens, mtp)
+        warmup_config = generation_config(min(4, output_tokens), mtp)
+        assistant_tokens = (
+            mtp["num_assistant_tokens"] if (mtp or {}).get("enabled") else None
+        )
 
         # Warned about once per case, not once per iteration: every iteration reuses the
         # one prompt, so a divergence is a property of the case.
@@ -458,7 +583,9 @@ def run_case(
                 return ov_genai.StreamingStatus.RUNNING
 
             result = pipe.generate(
-                pipeline_input, generation_config=gen_config, streamer=_on_token
+                pipeline_input,
+                generation_config=warmup_config if is_warmup else gen_config,
+                streamer=_on_token,
             )
             wall_seconds = time.perf_counter() - t1
             done["stage_reached"] = STAGE_DECODED
@@ -496,6 +623,14 @@ def run_case(
                 tokenization_time=perf.get("tokenization_time", 0.0),
                 detokenization_time=perf.get("detokenization_time", 0.0),
                 warmup=is_warmup,
+                num_assistant_tokens=assistant_tokens,
+                verification_steps=perf.get("verification_steps"),
+                mtp_acceptance_rate=perf.get("mtp_acceptance_rate"),
+                mtp_draft_tokens=perf.get("mtp_draft_tokens"),
+                mtp_accepted_tokens=perf.get("mtp_accepted_tokens"),
+                output_sha256=hashlib.sha256(
+                    generated_text(result).encode("utf-8")
+                ).hexdigest(),
             )
             done["iterations"].append(record)
             result_queue.put({"event": "iteration", **record})

@@ -9,7 +9,8 @@ Answers two questions per (model, context length):
 
 The second question is why this exists in its current form. It benchmarks a
 matrix of named `profiles` -- KV precision, prefill chunk size, continuous
-batching vs the stateful pipeline -- and ranks them by TPOT, then TTFT,
+batching vs the stateful pipeline, multi-token prediction and its candidate
+count -- and ranks them by TPOT, then TTFT,
 following llm_bench's methodology: one warm-up iteration that is
 excluded from every statistic, N measured iterations, and the median reported
 with min/max so run-to-run spread is visible. The same 160K configuration was
@@ -106,6 +107,31 @@ _AUTO_CACHE_SAFETY = 1.3
 _AUTO_CACHE_RESERVE_GB = 8.0
 _AUTO_CACHE_MIN_GB = 2.0
 
+# Extra pool an MTP profile needs beyond the cache its two models actually hold.
+#
+# Not the same thing as `mtp_head_layers`: that accounts for the draft head's own KV, which
+# on Qwen3.8-27B is one full-attention layer against the target's 16, about +6%. The pool
+# requirement grows far more than that. Measured at 32K on this box, where the target's
+# persistent cache estimates at 2.1 GB: `cache_size=3` ran the no-MTP baseline comfortably
+# and had every MTP profile *dropped before prefill* --
+#
+#   Request 0 was dropped by the scheduler because it did not fit in the available
+#   cache budget (out of memory).
+#
+# -- while `cache_size=4` ran the same profile. Speculative decoding builds a second
+# continuous-batching pipeline for the draft model and genai sizes both from the single
+# `cache_size` this profile sets, so the pool has to cover the pair. The exact split genai
+# applies is not documented and this factor is not derived from it: 2.0 is a margin over the
+# smallest value measured to work, chosen because the failure mode is a case that loads a
+# 14 GB model and then produces nothing.
+_MTP_CACHE_POOL_FACTOR = 2.0
+
+# Below this point most drafted candidates are discarded. This is diagnostic rather than a
+# validity threshold: a low-acceptance profile can still win on TPOT, but a single-profile
+# run needs to say that lowering k is the next measurement rather than implying that an
+# OpenVINO property can make the same six candidates agree more often.
+_LOW_MTP_ACCEPTANCE_RATE = 0.6
+
 # `SchedulerConfig.max_num_seqs` when a profile leaves it out. On a hybrid model this is not
 # just a batch-size default: the paged backend reserves one full linear-attention state per
 # schedulable sequence out of the same `cache_size` pool the KV blocks come from -- see
@@ -132,7 +158,13 @@ CASE_FIELDS = [
     "model", "profile", "context_tokens", "device", "weight_format", "pipeline_mode",
     "status", "error", "stage_reached",
     "kv_cache_precision", "cache_size_gb", "ov_config", "scheduler_config",
+    "mtp", "num_assistant_tokens", "mtp_device",
+    "mtp_draft_tokens", "mtp_draft_tokens_min", "mtp_draft_tokens_max",
+    "mtp_accepted_tokens", "mtp_accepted_tokens_min", "mtp_accepted_tokens_max",
+    "tokens_per_step", "tokens_per_step_min", "tokens_per_step_max",
+    "mtp_acceptance_rate", "mtp_acceptance_rate_min", "mtp_acceptance_rate_max",
     "load_ok", "load_time_s", "prompt_tokens", "iterations_measured",
+    "output_sha256", "output_consistent",
     "generation_time", "generation_time_min", "generation_time_max",
     "latency", "first_token_latency", "first_token_latency_min", "first_token_latency_max",
     "other_tokens_avg_latency",
@@ -441,6 +473,32 @@ def theoretical_kv_bytes_per_token(
     return 2 * growing_layers * num_kv_heads * bytes_per_row
 
 
+def mtp_head_layers(model_dir: str) -> int:
+    """Full-attention layers in the MTP draft head, read from its exported IR.
+
+    The draft head runs alongside the target model and keeps its own KV cache over the same
+    context, so it is not free at long context: on Qwen3.8-27B it is one full-attention
+    layer against the target's 16, a 6% surcharge that `cache_size: auto` has to cover or
+    the pool it derives is short of what the pair actually allocates.
+
+    Counted from the IR rather than assumed to be 1: `mtp_num_hidden_layers` is a config
+    value that other MTP models set higher. Returns 0 when the head is absent or
+    unreadable, which leaves the estimate at the target model's own requirement.
+    """
+    model_xml = os.path.join(model_dir, trial_runner.MTP_MODEL_FILE)
+    if not os.path.isfile(model_xml):
+        return 0
+    keys = set()
+    try:
+        for _, elem in ET.iterparse(model_xml, events=("start",)):
+            match = re.search(r"past_key_values\.(\d+)\.key", elem.attrib.get("variable_id", ""))
+            if match:
+                keys.add(match.group(1))
+    except (ET.ParseError, OSError):
+        return 0
+    return len(keys)
+
+
 def fixed_state_cache_bytes(model_dir: str) -> int:
     """Fixed linear-attention cache state size, read from the exported IR."""
     model_xml = next(
@@ -488,7 +546,8 @@ def kv_quantization_param_bytes(ov_config: dict) -> int:
 
 
 def expected_kv_gb(model_config: dict | None, fixed_bytes: int, ov_config: dict,
-                   context_tokens: int, sequences: int = 1) -> float | None:
+                   context_tokens: int, sequences: int = 1,
+                   mtp_layers: int = 0) -> float | None:
     """Cache this model needs at `context_tokens` under `ov_config`'s precision.
 
     Recomputed per profile rather than once per model: KV_CACHE_PRECISION changes
@@ -504,6 +563,13 @@ def expected_kv_gb(model_config: dict | None, fixed_bytes: int, ov_config: dict,
     dropped as `GenerationStatus::IGNORED` after the model has already loaded. Counting the
     reservation here is what lets `auto_cache_size_gb` and `validate_fixed_cache_size` reject
     that arrangement up front instead of after a full load.
+
+    `mtp_layers` adds the multi-token-prediction draft head's own full-attention cache,
+    which is allocated over the same context and out of the same pool. It is 0 on a profile
+    that does not run MTP, so the two configurations are sized against what each of them
+    actually allocates rather than against one shared guess. The head reuses the target's
+    attention shape -- same `num_key_value_heads` and `head_dim` -- so its per-token cost is
+    the target's divided by the target's growing-layer count, times `mtp_layers`.
     """
     if not model_config:
         return None
@@ -512,13 +578,21 @@ def expected_kv_gb(model_config: dict | None, fixed_bytes: int, ov_config: dict,
     )
     if bytes_per_token is None:
         return None
+    if mtp_layers:
+        per_layer = theoretical_kv_bytes_per_token(
+            {**model_config.get("text_config", model_config), "num_hidden_layers": 1,
+             "layer_types": None},
+            kv_cache_dtype_bytes(ov_config), kv_quantization_param_bytes(ov_config),
+        )
+        bytes_per_token += (per_layer or 0) * mtp_layers
     reserved = fixed_bytes * max(1, sequences)
     return round((bytes_per_token * context_tokens + reserved) / (1024 ** 3), 2)
 
 
 def auto_cache_size_gb(
-    kv_gb: float | None, weight_disk_gb: float, budget_gb: float
-) -> float | None:
+    kv_gb: float | None, weight_disk_gb: float, budget_gb: float,
+    pool_factor: float = 1.0,
+) -> int | None:
     """Size the scheduler's KV pool from the model's architecture instead of a magic number.
 
     The pool has to cover the persistent cache with room for block-allocation slack, but
@@ -530,12 +604,16 @@ def auto_cache_size_gb(
 
     Returns None when the architecture is unknown, so the caller leaves cache_size unset
     and lets OpenVINO manage the pool rather than guessing.
+
+    Whole GiB, as an int: `SchedulerConfig.cache_size` takes an integer on genai 2026.5 and
+    rejects a float outright, so a derived 2.0 would fail the case at pipeline construction
+    with a pybind type error that says nothing about pool sizing.
     """
     if not kv_gb:
         return None
-    needed = kv_gb * _AUTO_CACHE_SAFETY
+    needed = max(_AUTO_CACHE_MIN_GB, kv_gb * _AUTO_CACHE_SAFETY) * pool_factor
     ceiling = max(_AUTO_CACHE_MIN_GB, budget_gb - weight_disk_gb - _AUTO_CACHE_RESERVE_GB)
-    return round(max(_AUTO_CACHE_MIN_GB, min(math.ceil(needed), ceiling)), 2)
+    return int(max(_AUTO_CACHE_MIN_GB, min(math.ceil(needed), math.floor(ceiling))))
 
 
 def validate_fixed_cache_size(cache_size, kv_gb: float | None) -> None:
@@ -618,6 +696,15 @@ def format_config(config: dict) -> str:
     return " ".join(f"{key}={value}" for key, value in sorted(config.items()))
 
 
+def format_mtp(mtp: dict, device: str | None = None) -> str:
+    """One-line rendering of a profile's multi-token-prediction setting."""
+    if not (mtp or {}).get("enabled"):
+        return "off"
+    draft_device = mtp.get("device") or device
+    where = f" on {draft_device}" if draft_device else ""
+    return f"num_assistant_tokens={mtp['num_assistant_tokens']}{where}"
+
+
 # The two pipelines OpenVINO GenAI can run a case on, and the reason they are two profiles
 # rather than one. Passing a SchedulerConfig at all selects continuous batching / paged
 # attention -- there is no "stateful pipeline with a SchedulerConfig". And `cache_size` exists
@@ -628,7 +715,12 @@ def format_config(config: dict) -> str:
 PIPELINE_STATEFUL = "stateful"
 PIPELINE_PAGED = "paged"
 
-_PROFILE_KEYS = ("name", "ov", "scheduler")
+_PROFILE_KEYS = ("name", "ov", "scheduler", "mtp")
+_MTP_KEYS = ("enabled", "num_assistant_tokens", "device")
+
+# What a profile's `mtp` section resolves to when it is absent. Normalized rather than left
+# as None so every consumer -- the child, the CSV row, the report -- reads one shape.
+_MTP_OFF = {"enabled": False, "num_assistant_tokens": None, "device": None}
 
 
 def pipeline_mode(scheduler_config: dict | None) -> str:
@@ -640,7 +732,72 @@ def pipeline_mode(scheduler_config: dict | None) -> str:
     return PIPELINE_PAGED if scheduler_config else PIPELINE_STATEFUL
 
 
-def _resolve_profiles(raw_profiles, names_filter, ov_overrides, sched_overrides) -> list:
+def _resolve_mtp(name: str, section, scheduler: dict, override) -> dict:
+    """Normalize and validate one profile's `mtp` section.
+
+    Multi-token prediction is self-speculative decoding: the model's own draft head
+    proposes `num_assistant_tokens` candidates per step and the main model verifies them
+    in a single pass. Turning it on is a change of *what is being measured*, not a plugin
+    property, which is why it is a profile section of its own rather than a key under `ov`.
+
+    The rules rejected here are openvino_genai's, enforced early. `num_assistant_tokens`
+    must be a positive integer -- genai asserts `> 0` -- and `max_num_batched_tokens` has
+    to leave room for the whole candidate batch plus the token being verified, or the
+    scheduler cannot admit a step. Both are cheap to check and expensive to discover after
+    a 14 GB load.
+    """
+    if section is None:
+        section = {}
+    if isinstance(section, bool):  # `mtp: true` -- accepted, k comes from the override
+        section = {"enabled": section}
+    if not isinstance(section, dict):
+        raise SystemExit(
+            f"profile {name!r} mtp must be a mapping of {{{', '.join(_MTP_KEYS)}}} or a boolean"
+        )
+    unknown = [key for key in section if key not in _MTP_KEYS]
+    if unknown:
+        raise SystemExit(
+            f"profile {name!r} mtp has unknown key(s): {', '.join(sorted(unknown))}. "
+            f"An mtp section is {{{', '.join(_MTP_KEYS)}}}."
+        )
+
+    # `enabled` defaults to "yes, if this profile says anything about MTP at all": a
+    # section written out with a candidate count and no `enabled: true` is a profile whose
+    # author meant to run MTP, and silently ignoring it would report a baseline under an
+    # `mtp_k3` name.
+    if not bool(section.get("enabled", bool(section))):
+        return dict(_MTP_OFF)
+
+    # The CLI override sweeps `k` across the profiles that already run MTP and deliberately
+    # does NOT switch it on elsewhere: a config's no-MTP baseline is the row every speedup
+    # is measured against, and converting it would leave the run with nothing to compare to.
+    tokens = override if override is not None else section.get("num_assistant_tokens")
+
+    if not isinstance(tokens, int) or isinstance(tokens, bool) or tokens < 1:
+        raise SystemExit(
+            f"profile {name!r} mtp.num_assistant_tokens must be an integer >= 1 "
+            f"(got {tokens!r}); it is how many candidates the draft head offers per "
+            "verification pass, and openvino_genai rejects 0"
+        )
+    chunk = scheduler.get("max_num_batched_tokens")
+    if isinstance(chunk, int) and not isinstance(chunk, bool) and chunk < tokens + 1:
+        raise SystemExit(
+            f"profile {name!r} has max_num_batched_tokens={chunk}, below the "
+            f"{tokens + 1} tokens one MTP step submits (num_assistant_tokens={tokens} "
+            "candidates plus the token being verified)"
+        )
+    device = section.get("device")
+    if device is not None and (not isinstance(device, str) or not device.strip()):
+        raise SystemExit(f"profile {name!r} mtp.device must be a non-empty string")
+    return {
+        "enabled": True,
+        "num_assistant_tokens": tokens,
+        "device": device.strip() if device else None,
+    }
+
+
+def _resolve_profiles(raw_profiles, names_filter, ov_overrides, sched_overrides,
+                      mtp_tokens=None) -> list:
     profiles = _namespace_to_dict(raw_profiles) or []
     if not isinstance(profiles, list) or not profiles:
         raise SystemExit("`profiles` must be a non-empty list of {name, ov, scheduler} entries")
@@ -698,6 +855,7 @@ def _resolve_profiles(raw_profiles, names_filter, ov_overrides, sched_overrides)
             # `scheduler: {}` is meaningful -- it selects the stateful pipeline -- so an
             # empty mapping is preserved rather than treated as "unset".
             "scheduler": resolved_scheduler,
+            "mtp": _resolve_mtp(name, entry.get("mtp"), resolved_scheduler, mtp_tokens),
         })
 
     names = [profile["name"] for profile in resolved]
@@ -743,6 +901,11 @@ def _parse_args():
     parser.add_argument(
         "--scheduler-config", nargs="+", metavar="KEY=VALUE",
         help="add to or override every profile's SchedulerConfig values; KEY= removes one",
+    )
+    parser.add_argument(
+        "--mtp-tokens", type=int, metavar="K",
+        help="override num_assistant_tokens on every profile that already enables MTP; "
+             "profiles without an `mtp` section stay the no-MTP baseline",
     )
     parser.add_argument(
         "--list-profiles", action="store_true",
@@ -819,6 +982,10 @@ def _load_settings(args) -> dict:
     return {
         "provider": model.provider,
         "models_base_path": model.models_base_path,
+        # Explicit per-model IR directories, for exports whose folder name does not follow
+        # `<name>_<weight_format>` -- the published OpenVINO IRs are named e.g.
+        # `Qwen3.8-27B-int4-ov`. Naming the path beats guessing at a second convention.
+        "model_dirs": _namespace_to_dict(getattr(model, "model_dirs", None)) or {},
         "device": args.device or model.device,
         "weight_format": args.weight_format or model.weight_format,
         "models": models,
@@ -836,12 +1003,24 @@ def _load_settings(args) -> dict:
             args.profiles,
             _parse_overrides(args.pipeline_config),
             _parse_overrides(args.scheduler_config),
+            args.mtp_tokens,
         ),
     }
 
 
-def _model_ir_dir(base: str, provider: str, model_name: str, weight_format: str) -> str:
-    # Mirrors utils/ensure_model.py::get_model_path, parameterized per candidate.
+def _model_ir_dir(base: str, provider: str, model_name: str, weight_format: str,
+                  model_dirs: dict | None = None) -> str:
+    """Where this candidate's IR lives.
+
+    Derived from the model name and weight format, mirroring
+    utils/ensure_model.py::get_model_path -- unless the config names the directory
+    explicitly under `model.model_dirs`, which is what a downloaded IR with its own naming
+    needs. An explicit path is taken relative to the working directory (smart-classroom/),
+    like `models_base_path` itself.
+    """
+    override = (model_dirs or {}).get(model_name)
+    if override:
+        return os.path.normpath(str(override))
     return os.path.join(base, provider, f"{model_name.replace('/', '_')}_{weight_format}")
 
 
@@ -913,6 +1092,7 @@ def _run_case_subprocess(
     timeout_sec: float,
     ov_config: dict,
     scheduler_config: dict,
+    mtp: dict | None = None,
     on_iteration=None,
     sample_interval: float = 0.5,
     poll_interval: float = 0.25,
@@ -939,7 +1119,7 @@ def _run_case_subprocess(
         target=trial_runner.run_case,
         args=(
             model_dir, device, context_tokens, output_tokens, warmup, iterations,
-            result_queue, ov_config, scheduler_config,
+            result_queue, ov_config, scheduler_config, mtp,
         ),
     )
     process.start()
@@ -1113,6 +1293,10 @@ def _preflight_cache_sizes(settings: dict, static: dict, model_name: str) -> Non
                 static["model_config"], static["fixed_state_bytes"], profile["ov"],
                 context_tokens,
                 sequences=scheduler.get("max_num_seqs", _GENAI_DEFAULT_MAX_NUM_SEQS),
+                mtp_layers=(
+                    static.get("mtp_layers", 0)
+                    if profile.get("mtp", _MTP_OFF)["enabled"] else 0
+                ),
             )
             try:
                 validate_fixed_cache_size(cache_size, kv_gb)
@@ -1146,17 +1330,24 @@ def _run_case(model_name, model_dir, profile, context_tokens, settings, static) 
     # Scheduler first, because the estimate depends on it: on the paged path `max_num_seqs`
     # decides how many linear-attention reservations come out of the pool being sized.
     scheduler_config = dict(profile["scheduler"])
+    mtp = dict(profile.get("mtp") or _MTP_OFF)
     kv_gb = expected_kv_gb(
         static["model_config"], static["fixed_state_bytes"], ov_config, context_tokens,
         sequences=(
             scheduler_config.get("max_num_seqs", _GENAI_DEFAULT_MAX_NUM_SEQS)
             if scheduler_config else 1
         ),
+        mtp_layers=static.get("mtp_layers", 0) if mtp["enabled"] else 0,
     )
 
     validate_fixed_cache_size(scheduler_config.get("cache_size"), kv_gb)
     if str(scheduler_config.get("cache_size")).lower() == "auto":
-        auto = auto_cache_size_gb(kv_gb, static["weight_disk_gb"], settings["gpu_memory_budget_gb"])
+        auto = auto_cache_size_gb(
+            kv_gb,
+            static["weight_disk_gb"],
+            settings["gpu_memory_budget_gb"],
+            pool_factor=_MTP_CACHE_POOL_FACTOR if mtp["enabled"] else 1.0,
+        )
         if auto is None:
             scheduler_config.pop("cache_size")
         else:
@@ -1181,6 +1372,7 @@ def _run_case(model_name, model_dir, profile, context_tokens, settings, static) 
     )
     print(f"  ov: {format_config(ov_config)}", flush=True)
     print(f"  pipeline: {mode}", flush=True)
+    print(f"  mtp: {format_mtp(mtp, settings['device'])}", flush=True)
     if mode == PIPELINE_PAGED:
         print(f"  scheduler: {format_config(scheduler_config)}", flush=True)
         if "cache_size" not in scheduler_config:
@@ -1205,7 +1397,7 @@ def _run_case(model_name, model_dir, profile, context_tokens, settings, static) 
         result = _run_case_subprocess(
             model_dir, device, context_tokens, settings["output_tokens"],
             settings["warmup"], settings["iterations"], settings["timeout_sec"],
-            ov_config, scheduler_config, on_iteration=_echo,
+            ov_config, scheduler_config, mtp, on_iteration=_echo,
         )
     except Exception as exc:  # noqa: BLE001 - a case the orchestrator could not carry out
         # Spawning a fresh interpreter that re-imports the OpenVINO stack is itself work the
@@ -1233,6 +1425,11 @@ def _run_case(model_name, model_dir, profile, context_tokens, settings, static) 
         "stage_reached": result.get("stage_reached"),
         "kv_cache_precision": ov_config.get("KV_CACHE_PRECISION", "(plugin default)"),
         "cache_size_gb": scheduler_config.get("cache_size"),
+        # From the profile, not from a measurement: a case that failed before generating
+        # still has to say which configuration failed.
+        "mtp": mtp["enabled"],
+        "num_assistant_tokens": mtp["num_assistant_tokens"],
+        "mtp_device": (mtp["device"] or device) if mtp["enabled"] else None,
         "ov_config": format_config(ov_config),
         # `format_config({})` already renders "(none)". Spelling it "(stateful)" here made the
         # CSV disagree with --list-profiles about the same empty scheduler, and the
@@ -1277,8 +1474,9 @@ def _format_case(case: dict) -> str:
             if stage and stage != trial_runner.STAGE_DECODED else ""
         )
         return f"  => {case['status'].upper()}{where}{detail}"
-    return (
+    line = (
         f"  => {case['status'].upper()} | TPOT {_fmt(case.get('other_tokens_avg_latency'))} ms/token "
+        f"{_mtp_cell(case, prefix='| MTP ')}"
         f"| TTFT {_ttft_seconds(case)}s "
         f"| decode {_fmt(case.get('decode_throughput'), '{:.2f}')} tok/s "
         f"| e2e {_fmt(case.get('e2e_throughput'))} tok/s "
@@ -1289,6 +1487,8 @@ def _format_case(case: dict) -> str:
         f"/ mean {_fmt(case.get('mean_gpu_gb'))} GB "
         f"({_fmt(case.get('mean_gpu_pct_of_budget'))}%)"
     )
+    hint = _mtp_tuning_hint(case)
+    return line + (f"\n{hint}" if hint else "")
 
 
 # ---------------------------------------------------------------------------
@@ -1302,6 +1502,46 @@ def _ttft_seconds(case: dict) -> str:
     """TTFT is recorded in milliseconds (llm_bench's unit) but read in seconds."""
     ttft = case.get("first_token_latency")
     return _fmt(ttft / 1000) if isinstance(ttft, (int, float)) else "--"
+
+
+def _mtp_cell(case: dict, prefix: str = "", empty: str = "") -> str:
+    """The MTP column: what was configured and what it actually yielded.
+
+    `k` alone would not say whether it worked -- a candidate count is a request, and the
+    finding is how many of those candidates survived verification. A case with MTP off
+    still reports its measured yield when there is one, because reading exactly 1.00
+    tok/step there is what confirms the draft head is not quietly running.
+    """
+    if not case.get("mtp"):
+        return empty
+    parts = [f"k={case.get('num_assistant_tokens')}"]
+    tokens_per_step = case.get("tokens_per_step")
+    if isinstance(tokens_per_step, (int, float)):
+        parts.append(f"{tokens_per_step:.2f} tok/step")
+    acceptance = case.get("mtp_acceptance_rate")
+    if isinstance(acceptance, (int, float)):
+        parts.append(f"{acceptance * 100:.0f}% accepted")
+    return prefix + ", ".join(parts) + " "
+
+
+def _mtp_tuning_hint(case: dict) -> str | None:
+    """Suggest the next k to measure when a profile drafts mostly rejected tokens."""
+    acceptance = case.get("mtp_acceptance_rate")
+    tokens = case.get("num_assistant_tokens")
+    if (
+        not case.get("mtp")
+        or not isinstance(acceptance, (int, float))
+        or acceptance >= _LOW_MTP_ACCEPTANCE_RATE
+        or not isinstance(tokens, int)
+        or tokens <= 1
+    ):
+        return None
+    next_tokens = max(1, math.ceil(tokens / 2))
+    return (
+        f"  hint: only {acceptance * 100:.0f}% of MTP candidates were accepted; compare "
+        f"k={next_tokens} (for Qwen3.8-27B at 8K, k=2 is the higher-acceptance "
+        "balanced profile and k=3 is the minimum-TPOT profile)."
+    )
 
 
 def _best_summary(case: dict) -> str:
@@ -1345,6 +1585,77 @@ def _ttft_leaderboard(cases: list) -> list:
         ),
         key=lambda c: c["first_token_latency"],
     )
+
+
+def _mtp_speedup(cases: list) -> str | None:
+    """The one sentence an MTP sweep exists to produce, or None when it cannot be formed.
+
+    Ranking by TPOT already puts the winner first, but a leaderboard does not say how much
+    of the win is MTP: the reader has to find the no-MTP row themselves and divide. Both
+    sides are the best *usable* case on their side of the split, so the claim is "the best
+    this box did with MTP against the best it did without", not a cherry-picked pair.
+
+    Returns None when the context has only one side -- there is nothing to compare, and a
+    speedup figure computed against a missing baseline would be an invention.
+    """
+    ranked = _leaderboard(cases)
+    with_mtp = next((c for c in ranked if c.get("mtp")), None)
+    without = next((c for c in ranked if not c.get("mtp")), None)
+    if with_mtp is None or without is None:
+        return None
+    baseline_tpot = without["other_tokens_avg_latency"]
+    mtp_tpot = with_mtp["other_tokens_avg_latency"]
+    if not mtp_tpot or not baseline_tpot:
+        return None
+    return (
+        f"**MTP speedup: {baseline_tpot / mtp_tpot:.2f}x on decode** -- "
+        f"`{with_mtp['profile']}` (k={with_mtp.get('num_assistant_tokens')}) at "
+        f"{_fmt(mtp_tpot)} ms/token against `{without['profile']}` at "
+        f"{_fmt(baseline_tpot)} ms/token"
+        + (
+            f", accepting {with_mtp['mtp_acceptance_rate'] * 100:.0f}% of drafted candidates "
+            f"for {_fmt(with_mtp.get('tokens_per_step'), '{:.2f}')} tokens per verification pass"
+            if isinstance(with_mtp.get("mtp_acceptance_rate"), (int, float)) else ""
+        )
+        + ". TTFT is unaffected -- MTP shortens decode, not prefill: "
+        f"{_ttft_seconds(with_mtp)}s vs {_ttft_seconds(without)}s."
+    )
+
+
+def _mtp_output_check(cases: list) -> str | None:
+    """Compare deterministic MTP outputs with the no-MTP baseline, as the notebook does."""
+    internally_inconsistent = [
+        case["profile"] for case in cases
+        if case.get("status") == "ok" and case.get("output_consistent") is False
+    ]
+    if internally_inconsistent:
+        return (
+            "**WARNING: repeated greedy outputs differ within profile(s)** "
+            + ", ".join(f"`{name}`" for name in internally_inconsistent)
+            + ". The run is nondeterministic, so its MTP comparison is invalid."
+        )
+    baseline = next(
+        (case for case in cases if case.get("status") == "ok" and not case.get("mtp")
+         and case.get("output_sha256")),
+        None,
+    )
+    mtp_cases = [
+        case for case in cases
+        if case.get("status") == "ok" and case.get("mtp") and case.get("output_sha256")
+    ]
+    if baseline is None or not mtp_cases:
+        return None
+    mismatches = [
+        case["profile"] for case in mtp_cases
+        if case["output_sha256"] != baseline["output_sha256"]
+    ]
+    if mismatches:
+        return (
+            "**WARNING: greedy MTP output differs from the baseline** for "
+            + ", ".join(f"`{name}`" for name in mismatches)
+            + ". Do not treat their speedup as valid until the divergence is explained."
+        )
+    return "**Greedy output check: all measured MTP profiles match the baseline exactly.**"
 
 
 def write_reports(output_dir: str, settings: dict, cases: list, platform_info: dict,
@@ -1411,6 +1722,13 @@ def write_reports(output_dir: str, settings: dict, cases: list, platform_info: d
         "and a `paged` profile: `stateful` prefills the whole context in one SDPA pass and has "
         "no KV pool to size, `paged` runs continuous batching with the `cache_size` shown.",
         "",
+        "The `MTP` column is the measured variable when a config sweeps multi-token "
+        "prediction: `k` is how many candidates the model's own draft head offered per step, "
+        "`tok/step` is how many output tokens each main-model verification pass actually "
+        "produced, and `% accepted` is the share of those candidates that survived. A profile "
+        "with MTP off yields exactly 1.00 tok/step by definition. MTP only runs on the paged "
+        "pipeline and only shortens decode -- expect TPOT to move and TTFT not to.",
+        "",
         "Memory is reported as **peak / mean**, and the two are not interchangeable. Peak is "
         "the high-water mark over the whole case, load included, and is what decides whether "
         "the box can run the configuration at all -- it is set by the transient prefill "
@@ -1428,10 +1746,10 @@ def write_reports(output_dir: str, settings: dict, cases: list, platform_info: d
         lines += [
             f"## {context:,} tokens",
             "",
-            "| Model | Profile | Pipeline | Status | TPOT ms/token | TTFT s | Decode tok/s | "
-            f"E2E tok/s | Prefill tok/s | RAM peak / mean | GPU peak / mean "
+            "| Model | Profile | Pipeline | MTP | Status | TPOT ms/token | TTFT s | "
+            f"Decode tok/s | E2E tok/s | Prefill tok/s | RAM peak / mean | GPU peak / mean "
             f"(% of {settings['gpu_memory_budget_gb']:g} GB) | Expected KV | cache_size |",
-            "|---|---|---|---|---|---|---|---|---|---|---|---|---|",
+            "|---|---|---|---|---|---|---|---|---|---|---|---|---|---|",
         ]
         ranked = _leaderboard(at_context)
         # Identity, not equality: two profiles can produce byte-identical rows, and `in`
@@ -1452,7 +1770,8 @@ def write_reports(output_dir: str, settings: dict, cases: list, platform_info: d
                 timings = ["--"] * len(timings)
             lines.append(
                 f"| {case['model']} | {case['profile']} "
-                f"| {case.get('pipeline_mode') or '--'} | {case['status']} | "
+                f"| {case.get('pipeline_mode') or '--'} "
+                f"| {_mtp_cell(case, empty='off').strip() or 'off'} | {case['status']} | "
                 + " | ".join(timings)
                 + f" | {_fmt(case.get('peak_ram_gb'))} / {_fmt(case.get('mean_ram_gb'))} GB "
                 f"| {_fmt(case.get('peak_gpu_gb'))} GB "
@@ -1487,8 +1806,16 @@ def write_reports(output_dir: str, settings: dict, cases: list, platform_info: d
                 f"    pipeline:  {best.get('pipeline_mode') or '--'}",
                 f"    ov:        {best['ov_config']}",
                 f"    scheduler: {best['scheduler_config']}",
+                f"    mtp:       {_mtp_cell(best, empty='off').strip() or 'off'}",
                 "",
             ]
+
+        speedup = _mtp_speedup(at_context)
+        if speedup:
+            lines += [speedup, ""]
+        output_check = _mtp_output_check(at_context)
+        if output_check:
+            lines += [output_check, ""]
 
     failures = [c for c in cases if c["status"] not in _USABLE_STATUSES]
     if failures:
@@ -1573,6 +1900,7 @@ def main() -> None:
                 "    scheduler: "
                 + (format_config(profile["scheduler"]) if profile["scheduler"] else "(none)")
             )
+            print(f"    mtp:       {format_mtp(profile['mtp'], settings['device'])}")
         return
 
     _preflight_environment_check()
@@ -1595,7 +1923,7 @@ def main() -> None:
         for model_name in settings["models"]:
             model_dir = _model_ir_dir(
                 settings["models_base_path"], settings["provider"], model_name,
-                settings["weight_format"],
+                settings["weight_format"], settings["model_dirs"],
             )
             if not _ir_ready(model_dir):
                 export = _prep_command(model_name, model_dir, settings["weight_format"])
@@ -1614,6 +1942,7 @@ def main() -> None:
                 "weight_disk_gb": _weight_disk_gb(model_dir),
                 "model_config": _load_model_config(model_dir),
                 "fixed_state_bytes": fixed_state_cache_bytes(model_dir),
+                "mtp_layers": mtp_head_layers(model_dir),
             }
             print(
                 f"\n=== {model_name} === weights on disk: {static['weight_disk_gb']:.1f} GB "
@@ -1657,6 +1986,12 @@ def main() -> None:
                         f"{_fmt(fastest.get('prefill_throughput'))} tok/s",
                         flush=True,
                     )
+                speedup = _mtp_speedup(at_context)
+                if speedup:
+                    print(speedup.replace("**", ""), flush=True)
+                output_check = _mtp_output_check(at_context)
+                if output_check:
+                    print(output_check.replace("**", "").replace("`", ""), flush=True)
             print(
                 f"Reports written to {output_dir} (iterations.csv, summary.csv, summary.md, "
                 "summary.json)" + ("" if completed else " -- run ended early, marked incomplete"),

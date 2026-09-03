@@ -58,6 +58,7 @@ continuous batching 与 stateful pipeline）做基准测试，按 TPOT 优先、
 components/llm/context_bench/
 ├── config_qwen3.5_9b.yaml       9B @160K：stateful 与 paged_min 两个 profile
 ├── config_qwen3.6_35b_a3b.yaml  35B @160K：stateful 与 paged_min 两个 profile
+├── config_qwen3.8_27b.yaml      27B @8K：无 MTP 基线 + num_assistant_tokens 扫描
 ├── context_builder.py   按目标 token 数精确构造合成课堂转录
 ├── metrics.py           llm_bench 口径的单次迭代记录与聚合
 ├── trial_runner.py      单个 (model, profile, context) case 的子进程执行器
@@ -328,6 +329,91 @@ prompt 的实测差值迭代校正（最多 5 次）命中精确值，无法收�
 `build_text_of_token_length()` 因此不再自行回测切片后的文本——decode 后的重新合并只能由整段
 prompt 的实测差值发现，多跑一次 160K 量级的 encode 换不来精度。
 
+### 6.6 MTP（multi-token prediction）作为被测变量
+
+部分模型在主网络之外附带一个 **draft head**（Qwen3.8-27B 是同目录下的
+`openvino_mtp_model.xml`）。openvino_genai 可以把它当作**自推测解码**运行：draft head 一次
+提出 `k` 个候选 token，主模型用一次前向把这 `k` 个一起验证，命中的前缀全部保留。同样的输出
+长度下主模型跑的次数变少，TPOT 随之下降。
+
+接入点只有三处，都在 `trial_runner` 里：
+
+```python
+# _load_pipeline：同一个目录既是 target 也是 draft——MTP 是自推测，
+# genai 自动识别该目录下的 openvino_mtp_model.xml
+pipeline_args["draft_model"] = ov_genai.draft_model(model_dir, device)
+
+# generation_config：静态候选数，且必须是 greedy
+config = ov_genai.GenerationConfig()  # 每次新建，不继承模型文件中的 sampling 默认值
+config.do_sample = False
+config.num_return_sequences = 1
+config.num_assistant_tokens = k
+config.assistant_confidence_threshold = 0.0
+```
+
+和 notebook 一样，warmup 使用同一个 prompt 和 MTP 参数，但只生成 4 token；正式迭代才生成
+`benchmark.output_tokens`。这样仍能触发首次编译，又不会让每个 profile 的 warmup 多做一整轮 decode。
+benchmark 已经提前渲染 chat template 来保证精确 context 长度，因此唯一额外设置是
+`apply_chat_template=False`，防止 VLMPipeline 二次套模板。
+
+`validate_mtp()` 是第三处，也是唯一一处纯粹为了**报错时机**而存在的代码。genai 自己同样
+会校验这些条件，但校验发生在 `speculative_decoding/continuous_batching/mtp_strategy.cpp`
+里，也就是 pipeline 已经加载完之后——对一个 14 GB 的 int4 导出，这意味着每个 case 花掉一分钟
+才知道这个 profile 根本跑不起来，而矩阵里的每个 context 还要再花一次。`validate_mtp()` 只做
+文件存在性和 dict 检查，代价为零：
+
+| 条件 | 原因 |
+|---|---|
+| 目录里有 `openvino_mtp_model.xml` | 没有 draft head 就没有东西可推测 |
+| profile 必须有 `scheduler` 段（NPU 除外） | 非 NPU 设备上 genai 只在 paged attention 后端跑推测解码；无 `scheduler` 即 stateful/SDPA |
+| `num_assistant_tokens >= 1` | genai 断言 `> 0` |
+| `assistant_confidence_threshold == 0` | genai 的 MTP 路径只接受**静态**候选数，非零阈值会选中它拒绝的动态变体 |
+
+#### 接受率是怎么来的
+
+当前 genai 在 `result.extended_perf_metrics.get_draft_acceptance_rate()` 直接暴露 draft
+接受率，报告优先使用这个公开指标。验证步数仍没有公开 getter；为了同时报告每次主模型前向
+实际产出的 token 数，兼容路径读取 `perf_metrics.raw_metrics.m_new_token_times`（每次主模型
+前向一条，而非每 token 一条）：
+
+$$\text{tokens per step}=\frac{\text{output\_size}}{\text{len}(m\_new\_token\_times)}$$
+
+不能用 $(\text{tokens per step}-1)/k$ 代替官方接受率：verification step 的边界和 draft
+批次并非严格一一对应。本机 k=3 的步数公式约为 46%，而公开计数给出 51%。旧 runtime 没有
+`ExtendedPerfMetrics` 时，接受率报告为空，而不是展示一个看似精确的估算值。
+
+关闭 MTP 时该式恒等于 1.00 tok/step——这正好成为**基线行的自检**：基线读数不是 1.00 就说明
+MTP 漏进了对照组，那一轮所有的加速比都不成立。
+
+本机实测（GPU，8K prompt，64 output tokens，复用同一个 pipeline）：
+
+| profile | TPOT ms | 接受率 |
+|---|---:|---:|
+| `mtp_k1` | 197.2 | 63.2% |
+| `mtp_k2` | 156.8 | 61.8% |
+| `mtp_k3` | **150.9** | **50.7%** |
+| `mtp_k4` | 152.0 | 41.3% |
+| `mtp_k6` | 161.3 | 30.2% |
+
+k=2 是高接受率平衡档，k=3 是最低 TPOT 档；继续提高 k 会让更多候选被验证后丢弃，接受率和
+TPOT 都变差。MTP 路径要求 `assistant_confidence_threshold=0`，所以不能靠动态阈值改善同一个
+k；有效操作是降低 `num_assistant_tokens` 并重新比较 TPOT。低于 60% 时控制台会建议下一个
+较小的 k。
+
+和官方 notebook 一样，完整 baseline + MTP sweep 还比较 greedy 输出的 SHA-256。任何 MTP
+输出与 baseline 不一致时，报告会明确警告，避免把改变输出得到的速度误认为有效加速。
+
+MTP 只影响 decode：prefill 仍然把整段 context 走一遍，因此不要用 TTFT 判断 k 的优劣。
+
+#### KV 估算
+
+draft head 与主模型并行运行，在**同一段 context 上维护自己的 KV**，且出自同一个
+`cache_size` 池。`mtp_head_layers()` 从 IR 里数 `past_key_values.N.key` 变量（不假设是 1，
+`mtp_num_hidden_layers` 在别的 MTP 模型上会更大），`expected_kv_gb()` 在 MTP 打开时按主模型
+同样的 `num_key_value_heads × head_dim` 加上这几层。Qwen3.8-27B 上是 16 个 full_attention
+层之外多 1 层，约 +6%——不大，但 `cache_size: auto` 必须按两个模型实际分配的量来推导，否则
+基线和 MTP 行会用同一个偏小的池。
+
 ## 7. 内存采样
 
 ### 7.1 在父进程采样
@@ -444,16 +530,19 @@ TPOT 排行第一名与 TTFT 最快项**可以是不同的 profile**，两者都
 5. **`gpu_memory_budget_gb` 是本机值**：换机器必须修改，工具不自动探测真实共享预算。
 6. **输出校验有意较弱**：只要求产生 token，不判断语义——把模型行为变成硬件结论是错的。
 7. **profile 之间不共享编译缓存**（除非配置 `cache_dir`），完整矩阵在 160K 上是数小时任务。
-8. **新架构可能在加载阶段原生崩溃，而非报出可分类的错误**：`config_qwen3.8_27b.yaml`
-   （Qwen3.8-27B，`qwen3_5` 混合注意力 VLM）在本机上无论 `stateful`/`paged_min`、
-   GPU/CPU、还是上下文长度，都在 `VLMPipeline` 构造阶段崩溃
+8. **新架构可能在加载阶段原生崩溃，而非报出可分类的错误**：这曾经是
+   `config_qwen3.8_27b.yaml` 的状态——在 `openvino_genai 2026.4.0.0.dev20260723` 上，
+   Qwen3.8-27B（`qwen3_5` 混合注意力 VLM）无论 `stateful`/`paged_min`、GPU/CPU、还是上下文
+   长度，都在 `VLMPipeline` 构造阶段崩溃
    （`crashed:exitcode=3221225477:0xC0000005 STATUS_ACCESS_VIOLATION`），发生在本工具能
-   控制的任何配置之前。根因是上游：`optimum-intel`（当前 1.27.0）尚无 `qwen3_5` 的原生导出
-   路径（见 https://github.com/huggingface/optimum-intel/issues/1628 ），该模型的 IR 很可能
-   是通过 `--trust-remote-code` 自定义建模代码导出的，产生了已安装的
-   `openvino_genai`（2026.4.0.0.dev20260723）VLMPipeline reader 未曾适配的图结构，因而不是
-   抛出干净的"不支持"异常，而是原生崩溃。这类问题不能通过 context_bench 的 Python 配置规避
-   ——只能等待 `optimum-intel`/`openvino_genai` 增加原生支持后重新导出、重新测试。
+   控制的任何配置之前，因而无法用 Python 侧配置规避。
+   **该结论已不再成立**：在 `openvino 2026.5.0` / `openvino-genai 2026.5.0.0-3416` 上，用
+   官方发布的 `OpenVINO/Qwen3.8-27B-int4-ov` IR，模型约 50 s 加载完成并正常生成，开不开 MTP
+   都可以。保留这一条是因为**失败模式**本身仍然存在：一个 runtime reader 没适配过的图结构
+   会以原生崩溃而不是干净异常的形式出现，`crashed` 状态和 `stage_reached` 是唯一的线索。
+9. **MTP 只能跑在 paged 后端上**：非 NPU 设备上 genai 只在 paged attention 上支持推测解码，
+   所以 stateful profile 无法携带 MTP，"stateful vs paged" 与 "MTP vs 无 MTP" 这两个对比
+   无法在同一个矩阵里正交展开。`config_qwen3.8_27b.yaml` 因此六个 profile 全是 paged。
 
 ## 12. 关键源码索引
 
@@ -461,13 +550,16 @@ TPOT 排行第一名与 TTFT 最快项**可以是不同的 profile**，两者都
 |---|---|
 | CLI 与配置 | `benchmark.main`, `_parse_args`, `_load_settings`, `_resolve_profiles` |
 | 管线选择 | `pipeline_mode`, `PIPELINE_STATEFUL`, `PIPELINE_PAGED`, `trial_runner._load_pipeline` |
+| MTP 接入与校验 | `benchmark._resolve_mtp`, `trial_runner.validate_mtp`, `has_mtp_head`, `MTP_MODEL_FILE`, `_load_pipeline` 的 `draft_model`, `generation_config` |
+| MTP 产出指标 | `metrics.mtp_yield`, `read_perf_metrics` 的 `verification_steps`, `benchmark._mtp_cell`, `_mtp_speedup` |
+| 模型目录覆盖 | `benchmark._model_ir_dir`, config 的 `model.model_dirs` |
 | 运行矩阵 | `benchmark.main` 三层循环, `_run_case` |
 | 子进程控制 | `_run_case_subprocess`, `_crash_reason` |
 | 子进程执行 | `trial_runner.run_case`, `_load_pipeline`, `_load_tokenizer` |
 | 子进程退出 | `trial_runner._post_and_exit` |
 | 指标口径 | `metrics.iteration_record`, `metrics.aggregate`, `trial_runner.read_perf_metrics` |
 | 内存采样 | `_read_mem`, `_MemorySampler`, `_wait_for_memory_settle` |
-| KV 估算与 cache_size | `theoretical_kv_bytes_per_token`, `fixed_state_cache_bytes`, `auto_cache_size_gb` |
+| KV 估算与 cache_size | `theoretical_kv_bytes_per_token`, `fixed_state_cache_bytes`, `mtp_head_layers`, `auto_cache_size_gb` |
 | 状态判定 | `benchmark._status`, `trial_runner.classify_error`, `trial_runner.failing_stage` |
 | Prompt 定长 | `context_builder.build_benchmark_prompt`, `render_prompt` |
 | 报告输出 | `write_reports`, `_append_iterations`, `_leaderboard`, `_ttft_leaderboard` |
