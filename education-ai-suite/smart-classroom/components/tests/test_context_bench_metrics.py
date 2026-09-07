@@ -165,6 +165,8 @@ def _record(iteration, generation_time, ttft_ms, warmup=False, output_size=64,
         mtp_acceptance_rate=0.59 if mtp_enabled else None,
         mtp_draft_tokens=100 if mtp_enabled else None,
         mtp_accepted_tokens=59 if mtp_enabled else None,
+        mtp_rejected_tokens=41 if mtp_enabled else None,
+        mtp_draft_to_main_ratio=0.42 if mtp_enabled else None,
     )
 
 
@@ -788,6 +790,30 @@ class TestMtpTuningHint(unittest.TestCase):
 
         self.assertIsNone(benchmark._mtp_tuning_hint(case))
 
+    def test_high_acceptance_recommends_a_larger_candidate_count(self):
+        # Acceptance is not the objective -- tokens/step is. A profile whose candidates almost
+        # all land is leaving yield unclaimed, so the hint points UP, not down: this is what
+        # would move a 74% k=2 run toward the faster k=4 measured on this box.
+        case = {
+            "status": "ok", "mtp": True, "num_assistant_tokens": 2,
+            "mtp_acceptance_rate": 0.74, "tokens_per_step": 2.44,
+        }
+
+        hint = benchmark._mtp_tuning_hint(case)
+
+        self.assertIn("k=3", hint)
+        self.assertIn("74%", hint)
+        self.assertIn("yield", hint)
+
+    def test_high_acceptance_at_the_ceiling_stops_suggesting_larger_k(self):
+        case = {
+            "status": "ok", "mtp": True,
+            "num_assistant_tokens": benchmark._MTP_TOKEN_SUGGESTION_CEILING,
+            "mtp_acceptance_rate": 0.95,
+        }
+
+        self.assertIsNone(benchmark._mtp_tuning_hint(case))
+
 
 class TestMtpOutputCheck(unittest.TestCase):
     def test_matching_greedy_outputs_pass(self):
@@ -1035,6 +1061,38 @@ class TestMultiTokenPredictionYield(unittest.TestCase):
         self.assertIn("2.78 tok/step", line)
         self.assertIn("59% accepted", line)
         self.assertIn("59/100 candidates", line)
+
+    def test_draft_cost_ratio_and_rejected_count_reach_the_record_and_line(self):
+        # The draft head's share of each verification pass, next to acceptance: a profile can
+        # keep accepting candidates while the head grows too expensive to be a net win, and
+        # only the duration ratio makes that visible.
+        record = metrics.iteration_record(
+            iteration=1, input_size=8000, output_size=64, generation_time=12.0,
+            first_token_latency=6000.0, other_tokens_avg_latency=103.4,
+            num_assistant_tokens=3, verification_steps=23, mtp_acceptance_rate=0.59,
+            mtp_draft_tokens=100, mtp_accepted_tokens=59, mtp_rejected_tokens=41,
+            mtp_draft_to_main_ratio=0.42,
+        )
+
+        self.assertEqual(record["mtp_rejected_tokens"], 41)
+        self.assertEqual(record["mtp_draft_to_main_ratio"], 0.42)
+        self.assertIn("draft/main 0.42x", metrics.format_iteration(record))
+
+    def test_draft_cost_ratio_aggregates_with_its_spread(self):
+        rows = [
+            metrics.iteration_record(
+                iteration=index, input_size=8000, output_size=64, generation_time=12.0,
+                first_token_latency=6000.0, num_assistant_tokens=3, verification_steps=23,
+                mtp_draft_to_main_ratio=ratio,
+            )
+            for index, ratio in enumerate((0.40, 0.42, 0.44))
+        ]
+
+        aggregated = metrics.aggregate(rows)
+
+        self.assertAlmostEqual(aggregated["mtp_draft_to_main_ratio"], 0.42, places=3)
+        self.assertAlmostEqual(aggregated["mtp_draft_to_main_ratio_min"], 0.40, places=3)
+        self.assertAlmostEqual(aggregated["mtp_draft_to_main_ratio_max"], 0.44, places=3)
 
     def test_iteration_line_of_a_non_mtp_profile_gains_no_mtp_tail(self):
         record = metrics.iteration_record(

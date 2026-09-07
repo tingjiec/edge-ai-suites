@@ -439,6 +439,24 @@ def read_perf_metrics(result) -> dict:
             out["mtp_accepted_tokens"] = accepted_tokens
     except Exception:  # noqa: BLE001
         pass
+    # Guarded on their own, not folded into the block above: these getters are newer than
+    # get_draft_acceptance_rate(), so a runtime that lacks them must not also lose the
+    # acceptance figures. `get_num_rejected_tokens` completes the accepted/draft picture, and
+    # `get_draft_to_main_inference_duration_ratio` is what says whether raising k still pays --
+    # a draft head costing an ever larger share of each pass can erase the decode win that
+    # rising tok/step suggests.
+    try:
+        rejected_tokens = result.extended_perf_metrics.get_num_rejected_tokens()
+        if isinstance(rejected_tokens, int) and rejected_tokens >= 0:
+            out["mtp_rejected_tokens"] = rejected_tokens
+    except Exception:  # noqa: BLE001
+        pass
+    try:
+        ratio = result.extended_perf_metrics.get_draft_to_main_inference_duration_ratio()
+        if isinstance(ratio, (int, float)) and math.isfinite(ratio) and ratio >= 0:
+            out["mtp_draft_to_main_ratio"] = float(ratio)
+    except Exception:  # noqa: BLE001
+        pass
     try:
         steps = len(perf.raw_metrics.m_new_token_times)
         if steps > 0:
@@ -650,6 +668,8 @@ def run_case(
                 mtp_acceptance_rate=perf.get("mtp_acceptance_rate"),
                 mtp_draft_tokens=perf.get("mtp_draft_tokens"),
                 mtp_accepted_tokens=perf.get("mtp_accepted_tokens"),
+                mtp_rejected_tokens=perf.get("mtp_rejected_tokens"),
+                mtp_draft_to_main_ratio=perf.get("mtp_draft_to_main_ratio"),
                 output_sha256=hashlib.sha256(
                     generated_text(result).encode("utf-8")
                 ).hexdigest(),

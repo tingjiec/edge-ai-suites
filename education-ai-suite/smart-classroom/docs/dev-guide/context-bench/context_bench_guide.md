@@ -149,6 +149,8 @@ Two columns exist only for this, and TPOT alone cannot replace them:
 |---|---|
 | `tokens_per_step` | output tokens produced per main-model verification pass. **Exactly 1.00 when MTP is off** — that is the self-check that a baseline row really is a baseline |
 | `mtp_acceptance_rate` | share of drafted candidates accepted, read only from GenAI's public `extended_perf_metrics`; unavailable on older runtimes rather than approximated |
+| `mtp_draft_to_main_ratio` | draft-model inference time as a fraction of the main model's, from `SDPerModelsPerfMetrics.get_draft_to_main_inference_duration_ratio()`. This is the cost side that acceptance cannot show: a head accepting 60% of candidates is only a decode win while proposing them stays cheap relative to the pass that verifies them, and a ratio drifting toward 1 is where raising `k` stops paying even though `tok/step` still rises |
+| `mtp_rejected_tokens` | drafted candidates the main model rejected, completing the accepted/draft/rejected picture; `None` unless MTP is on and the runtime reports it |
 
 Acceptance is what says whether raising `k` still buys anything. Measured on Qwen3.8-27B (GPU,
 the shipped 8K prompt, 64 output tokens) while reusing one loaded pipeline:
@@ -161,11 +163,24 @@ the shipped 8K prompt, 64 output tokens) while reusing one loaded pipeline:
 | `mtp_k4` | 152.0 | 41.3% |
 | `mtp_k6` | 161.3 | 30.2% |
 
-For this workload k=2 is the higher-acceptance balanced profile and k=3 is the minimum-TPOT
-profile. Past k=3, extra candidates are verified and thrown away, and both acceptance and TPOT
-get worse. The MTP path requires a zero confidence threshold, so lowering
-`num_assistant_tokens` is the supported way to improve acceptance. Below 60%, the console
-suggests the next smaller k. `summary.md` prints an **MTP speedup** line per
+**Acceptance is not the number to maximize — yield is.** What decode speed actually tracks is
+`tokens_per_step`, the tokens committed per verification pass, which is `1 + k · acceptance(k)`.
+Because acceptance falls as k rises, the two pull against each other, and the fastest profile is
+often *not* the highest-acceptance one. Measured on this box at 8K: k=2 accepted **74%** for
+2.44 tok/step at 85.5 ms TPOT, while k=4 accepted only **50%** but reached **2.90 tok/step** and
+a **faster 81.4 ms** TPOT. Raising acceptance by lowering k would have made it slower.
+
+So the console hint is **bidirectional**. Below 60% acceptance it suggests the *next smaller* k
+(candidates are mostly wasted). At 70% or above it suggests the *next larger* k (the draft head
+is agreeing often enough that a bigger candidate batch would likely commit more per pass) — this
+is what points a healthy k=2 run toward the faster k=4. The flat middle needs no next
+measurement. The MTP path requires a zero confidence threshold, so **k is the only lever on
+acceptance** — dynamic thresholds are rejected — but the target of tuning it is yield, not
+acceptance. Acceptance alone can mislead, though: read it next to
+`mtp_draft_to_main_ratio`, the draft head's share of each verification pass. A profile can
+hold acceptance steady while that ratio climbs, and once proposing the candidates costs a
+large fraction of the pass that verifies them, a higher `k` stops paying even while
+`tok/step` still rises. `summary.md` prints an **MTP speedup** line per
 context comparing the best MTP profile against the best non-MTP one, so the ranking does not
 have to be read as a subtraction.
 
@@ -209,6 +224,8 @@ time, tokens/second for throughput):
 | `e2e_throughput` | `(input_size + output_size) / generation_time` |
 | `tokens_per_step` | output tokens per main-model verification pass — 1.00 unless MTP is on |
 | `mtp_acceptance_rate` | share of drafted candidates accepted; `None` unless MTP is on |
+| `mtp_draft_to_main_ratio` | draft-model inference time / main-model inference time; the cost signal for whether a higher `k` still pays |
+| `mtp_rejected_tokens` | drafted candidates rejected by the main model; `None` unless MTP is on |
 
 Timings come from OpenVINO GenAI's own `perf_metrics` (the same source llm_bench reads)
 wherever the runtime provides them, falling back per field to wall-clock timing around the

@@ -49,9 +49,15 @@ ITERATION_FIELDS = [
     "num_assistant_tokens",
     "mtp_draft_tokens",
     "mtp_accepted_tokens",
+    "mtp_rejected_tokens",
     "verification_steps",
     "tokens_per_step",
     "mtp_acceptance_rate",
+    # Draft-model inference time as a fraction of the main model's, from
+    # SDPerModelsPerfMetrics. The signal a k-sweep actually turns on: acceptance says how
+    # many candidates stuck, this says what proposing them cost -- a draft head whose ratio
+    # climbs toward 1 is eating the decode saving even while acceptance still looks healthy.
+    "mtp_draft_to_main_ratio",
     "output_sha256",
 ]
 
@@ -66,8 +72,10 @@ AGGREGATED_METRICS = [
     "e2e_throughput",
     "mtp_draft_tokens",
     "mtp_accepted_tokens",
+    "mtp_rejected_tokens",
     "tokens_per_step",
     "mtp_acceptance_rate",
+    "mtp_draft_to_main_ratio",
 ]
 
 # Median only, no _min/_max. These are the orchestrator's per-iteration memory windows,
@@ -132,6 +140,8 @@ def iteration_record(
     mtp_acceptance_rate: float | None = None,
     mtp_draft_tokens: int | None = None,
     mtp_accepted_tokens: int | None = None,
+    mtp_rejected_tokens: int | None = None,
+    mtp_draft_to_main_ratio: float | None = None,
     output_sha256: str | None = None,
 ) -> dict:
     """One measured generation, in llm_bench units (ms for latency, s for time).
@@ -174,9 +184,11 @@ def iteration_record(
         "num_assistant_tokens": num_assistant_tokens,
         "mtp_draft_tokens": mtp_draft_tokens,
         "mtp_accepted_tokens": mtp_accepted_tokens,
+        "mtp_rejected_tokens": mtp_rejected_tokens,
         "verification_steps": verification_steps,
         "tokens_per_step": tokens_per_step,
         "mtp_acceptance_rate": acceptance,
+        "mtp_draft_to_main_ratio": mtp_draft_to_main_ratio,
         "output_sha256": output_sha256,
     }
 
@@ -248,12 +260,17 @@ def format_mtp(record: dict) -> str:
         f" | {tokens_per_step:.2f} tok/step"
     )
     acceptance = record.get("mtp_acceptance_rate")
-    if acceptance is None:
-        return text
-    accepted = record.get("mtp_accepted_tokens")
-    drafted = record.get("mtp_draft_tokens")
-    counts = (
-        f", {accepted}/{drafted} candidates"
-        if isinstance(accepted, int) and isinstance(drafted, int) else ""
-    )
-    return text + f" ({acceptance * 100:.0f}% accepted{counts})"
+    if acceptance is not None:
+        accepted = record.get("mtp_accepted_tokens")
+        drafted = record.get("mtp_draft_tokens")
+        counts = (
+            f", {accepted}/{drafted} candidates"
+            if isinstance(accepted, int) and isinstance(drafted, int) else ""
+        )
+        text += f" ({acceptance * 100:.0f}% accepted{counts})"
+    # The draft head's cost, next to what it bought: a high acceptance is only a win while
+    # proposing the candidates stays cheap relative to the main-model pass verifying them.
+    ratio = record.get("mtp_draft_to_main_ratio")
+    if isinstance(ratio, (int, float)):
+        text += f", draft/main {ratio:.2f}x"
+    return text

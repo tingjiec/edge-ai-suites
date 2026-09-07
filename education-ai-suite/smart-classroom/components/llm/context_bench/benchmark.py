@@ -132,6 +132,18 @@ _MTP_CACHE_POOL_FACTOR = 2.0
 # OpenVINO property can make the same six candidates agree more often.
 _LOW_MTP_ACCEPTANCE_RATE = 0.6
 
+# Above this the draft head is agreeing so often that the profile is probably leaving yield on
+# the table: acceptance this high means a *larger* candidate batch would likely commit more
+# tokens per verification pass. The objective is tokens/step (= 1 + k * acceptance), not
+# acceptance itself -- measured on this box k=4 (50% accepted, 2.90 tok/step) beat k=2 (74%,
+# 2.44) on TPOT, so a high-acceptance k=2 run should be told to try k=3/k=4, not celebrated.
+_HIGH_MTP_ACCEPTANCE_RATE = 0.7
+
+# Stop suggesting ever-larger k past here. Acceptance falls with k, so in practice the
+# high-acceptance branch stops firing on its own well before this; the ceiling is a backstop so
+# a pathologically agreeable draft head cannot produce an unbounded "try k+1" chain.
+_MTP_TOKEN_SUGGESTION_CEILING = 8
+
 # `SchedulerConfig.max_num_seqs` when a profile leaves it out. On a hybrid model this is not
 # just a batch-size default: the paged backend reserves one full linear-attention state per
 # schedulable sequence out of the same `cache_size` pool the KV blocks come from -- see
@@ -161,8 +173,10 @@ CASE_FIELDS = [
     "mtp", "num_assistant_tokens", "mtp_device",
     "mtp_draft_tokens", "mtp_draft_tokens_min", "mtp_draft_tokens_max",
     "mtp_accepted_tokens", "mtp_accepted_tokens_min", "mtp_accepted_tokens_max",
+    "mtp_rejected_tokens", "mtp_rejected_tokens_min", "mtp_rejected_tokens_max",
     "tokens_per_step", "tokens_per_step_min", "tokens_per_step_max",
     "mtp_acceptance_rate", "mtp_acceptance_rate_min", "mtp_acceptance_rate_max",
+    "mtp_draft_to_main_ratio", "mtp_draft_to_main_ratio_min", "mtp_draft_to_main_ratio_max",
     "load_ok", "load_time_s", "prompt_tokens", "iterations_measured",
     "output_sha256", "output_consistent",
     "generation_time", "generation_time_min", "generation_time_max",
@@ -1521,27 +1535,54 @@ def _mtp_cell(case: dict, prefix: str = "", empty: str = "") -> str:
     acceptance = case.get("mtp_acceptance_rate")
     if isinstance(acceptance, (int, float)):
         parts.append(f"{acceptance * 100:.0f}% accepted")
+    # What proposing those candidates cost, so the cell that says "62% accepted" also says
+    # whether the draft head is cheap enough for that acceptance to be a net decode win.
+    ratio = case.get("mtp_draft_to_main_ratio")
+    if isinstance(ratio, (int, float)):
+        parts.append(f"draft/main {ratio:.2f}x")
     return prefix + ", ".join(parts) + " "
 
 
 def _mtp_tuning_hint(case: dict) -> str | None:
-    """Suggest the next k to measure when a profile drafts mostly rejected tokens."""
+    """Point at the next k to measure -- in *either* direction.
+
+    The mistake this guards against is treating acceptance as the thing to maximize. It is
+    not: the objective is tokens committed per verification pass, ``1 + k * acceptance(k)``,
+    and acceptance(k) falls as k rises, so the two pull against each other. A profile whose
+    candidates are mostly rejected should lower k; a profile whose candidates almost all land
+    is leaving yield unclaimed and should raise k. Only the flat middle -- accepting well but
+    not lavishly -- needs no next measurement.
+    """
     acceptance = case.get("mtp_acceptance_rate")
     tokens = case.get("num_assistant_tokens")
     if (
         not case.get("mtp")
         or not isinstance(acceptance, (int, float))
-        or acceptance >= _LOW_MTP_ACCEPTANCE_RATE
         or not isinstance(tokens, int)
-        or tokens <= 1
     ):
         return None
-    next_tokens = max(1, math.ceil(tokens / 2))
-    return (
-        f"  hint: only {acceptance * 100:.0f}% of MTP candidates were accepted; compare "
-        f"k={next_tokens} (for Qwen3.8-27B at 8K, k=2 is the higher-acceptance "
-        "balanced profile and k=3 is the minimum-TPOT profile)."
-    )
+    if acceptance < _LOW_MTP_ACCEPTANCE_RATE and tokens > 1:
+        next_tokens = max(1, math.ceil(tokens / 2))
+        return (
+            f"  hint: only {acceptance * 100:.0f}% of MTP candidates were accepted; compare "
+            f"k={next_tokens} -- fewer candidates per pass usually raises acceptance (for "
+            "Qwen3.8-27B at 8K, k=2 is the higher-acceptance balanced profile and k=3 is the "
+            "minimum-TPOT profile)."
+        )
+    if acceptance >= _HIGH_MTP_ACCEPTANCE_RATE and tokens < _MTP_TOKEN_SUGGESTION_CEILING:
+        tokens_per_step = case.get("tokens_per_step")
+        yield_now = (
+            f" for {tokens_per_step:.2f} tok/step"
+            if isinstance(tokens_per_step, (int, float)) else ""
+        )
+        return (
+            f"  hint: {acceptance * 100:.0f}% of MTP candidates were accepted{yield_now}; the "
+            f"draft head is agreeing often, so compare k={tokens + 1} -- a larger candidate "
+            "batch can commit more tokens per pass even as acceptance eases. Rank by tokens/"
+            "step (yield), not acceptance: on this box k=4 (50% accepted, 2.90 tok/step) beat "
+            "k=2 (74%, 2.44) on TPOT."
+        )
+    return None
 
 
 def _best_summary(case: dict) -> str:

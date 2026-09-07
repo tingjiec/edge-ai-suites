@@ -40,13 +40,13 @@
 model:
   provider: openvino
   device: GPU
-  weight_format: int4
+  weight_format: int8
   models_base_path: "models"
   # The published IR is named `Qwen3.8-27B_int4`, which is not the
   # `<name>_<weight_format>` layout `models_base_path` derives. Named explicitly rather than
   # renamed on disk, so re-downloading the model does not silently break this config.
   model_dirs:
-    Qwen3.8-27B: models/openvino/Qwen3.8-27B_int4
+    Qwen3.8-27B: models/openvino/Qwen3.8-27B-int8-ov
 
 benchmark:
   models: [Qwen3.8-27B]
@@ -94,11 +94,19 @@ profiles:
       # Mandatory, not tuning: iterations reuse one prompt, so a warm prefix cache would
       # report a TTFT no first request ever sees.
       enable_prefix_caching: false
-      # Fixed for this 8K A/B matrix so baseline and MTP use the same scheduler pool.
-      # 4 GB is the measured minimum that admits the target + draft pipelines; using
-      # `auto` here would resolve to 2 GB for baseline and 4 GB for MTP, changing two
-      # variables in what should be a one-variable comparison.
-      #cache_size: 4
+      # Fixed, for a deterministic one-variable A/B: baseline and every MTP row draw from the
+      # same pre-allocated pool, where `auto` would resolve to different sizes for the no-MTP
+      # and MTP rows and move two things at once. 4 GB is the author's measured floor that admits
+      # the target + draft pipelines together; the 8K f16 KV is only ~0.6 GB, so this is generous
+      # headroom, and a fixed cache_size below the estimated persistent KV is rejected before the
+      # 14 GB load rather than crashing mid-run.
+      #
+      # NOTE: a fixed pool does NOT cure the TTFT drift seen across reused-prompt iterations on
+      # this box (iter1 ~10 s -> iter2/3 ~13 s while TPOT holds flat ~85 ms). That drift persisted
+      # with cache_size=4, so it is not KV-pool re-growth: it tracks prefill, a sustained compute
+      # burst that throttles on a shared-memory iGPU, while decode -- short bursts -- does not.
+      # It is a hardware characteristic, read the median with the min/max spread the report keeps.
+      cache_size: 4
 
   # The sweep. k is the number of candidates the draft head offers per verification pass;
   # higher k means fewer main-model passes but a lower share of candidates accepted, and the
