@@ -25,8 +25,11 @@ continuous batching 与 stateful pipeline）做基准测试，按 TPOT 优先、
 组件是独立诊断工具，不在生产推理链路中运行：使用两个模型专属 config，不读写主应用配置，
 每个 case 在独立子进程中加载模型，结果写入按运行时间戳隔离的目录。
 
-**明确排除**：不是质量评测。一次通过只证明本机能装载模型、处理指定 token 数并产生输出，
-不证明模型能准确召回长上下文前部信息。
+**默认路径明确排除质量评测**：吞吐路径下一次通过只证明本机能装载模型、处理指定 token 数并产生
+输出，不证明模型能准确召回长上下文前部信息。正确性由**可选的 `--accuracy` 模式**单独度量
+（§6.7）：`retrieval` suite 跑 RULER 的合成探测（检索/多跳追踪/聚合），`generation` suite 按
+who_what_benchmark 的方式把真实任务的输出与基线 profile 的输出比对。两条路径互不影响——不加
+`--accuracy` 时，其余一切与本文其他章节所述完全一致。
 
 ## 2. 为什么从"容量验证器"重构为"基准工具"
 
@@ -414,6 +417,86 @@ draft head 与主模型并行运行，在**同一段 context 上维护自己的 
 层之外多 1 层，约 +6%——不大，但 `cache_size: auto` 必须按两个模型实际分配的量来推导，否则
 基线和 MTP 行会用同一个偏小的池。
 
+### 6.7 准确率模式（RULER 检索 + WWB 保真度）作为可选路径
+
+`--accuracy` 把每个 `(model, profile, context)` case 的内层循环从"复用一个 prompt 计时
+`warmup + iterations` 次"换成"每个探测一个 prompt"，其余脚手架（子进程、内存采样、按 case
+重写报告）完全复用。
+
+分两个 suite，因为"这个配置是否仍然正确"是两个会**独立失效**的问题：
+
+- **`retrieval`（RULER）**：合成探测，有已知真值。方法学参照
+  [RULER](https://github.com/NVIDIA/RULER)（Hsieh et al., COLM 2024），它把
+  [Needle-in-a-Haystack](https://github.com/gkamradt/LLMTest_NeedleInAHaystack) 推广成三类会
+  分别失效的行为——**检索**（`niah_single` / `niah_multikey` / `niah_multivalue` /
+  `niah_multiquery`）、**多跳追踪**（`vt`，变量赋值链）、**聚合**（`cwe` / `fwe`，必须把整个
+  上下文**数**一遍而不是找一个片段），外加 `qa`（对植入段落的自然语言提问）。一个 profile
+  完全可能 `niah_single` 满分而在 `vt` 或 `cwe` 上崩掉——这正是单 needle 指标掩盖过的回归。
+- **`generation`（who_what_benchmark）**：模型在真实答案长度下做**真实任务**（`summary`：
+  总结/解释/列要点/出题；`fact_sheet`：对植入事实写报告），答案与**基线 profile** 对同一
+  prompt 的答案比较。这是 WWB 评估压缩模型的框架，也是检索测不到的那一半：一个 profile 可以
+  把每个植入码都取回，同时把文字写坏。
+
+设计约束与落点：
+
+- **打分在父进程，不在子进程**。子进程只回传答案文本（`probe` 事件，一个
+  `metrics.iteration_record` 加上 `suite/task/depth/sample/prediction_text`），父进程持有真值
+  并打分。因此 `trial_runner` 不 import `accuracy`，一次运行也能在不重载 14–33 GB 模型的前提下
+  重新打分。`_run_accuracy_probes` 与 `_run_throughput_iterations` 是 `run_case` 加载一次
+  pipeline 后的两条分支，`probes=None`（默认）走吞吐路径，逐字未变。
+- **多 insert 的定长构造，但容差不为零**。`context_builder.build_probe_prompt` 把单 needle
+  推广为多 insert：按深度排序后，用**累计**切分（而非逐段各自取整）分配相邻深度之间的 filler，
+  使各段之和恰好等于 filler 预算；insert 的字节固定，全部校正进 filler。聚合任务用 `filler`
+  参数整体替换语料——它们的上下文就是被数的那份数据。
+
+  与吞吐路径不同的是，这里**不要求精确 token 数**（`trial_runner.PROBE_TOKEN_TOLERANCE = 16`）。
+  每个 insert 带来两处 tokenizer 接缝（`vt` 探测有 34 处），而校正循环只用一个数（filler 预算）
+  去抵消所有接缝漂移之和，因此可能永远绕着目标值差 1 个 token 而落不上去。吞吐指标要**除以**
+  token 数，少一个 token 就不是同一个测量；检索结论不是——"模型能否找到植入在 8000 token 上下文
+  深度 0.25 处的码"在 8001 token 时是同一个问题。用 Qwen3.8 的 tokenizer 实测，全部探测偏差
+  ≤ 2 token。实际使用的 token 数会回传并记进 `probes.csv`，所有按 token 计的比率都用它，
+  不会出现"用一个前向从没见过的数去除"的情况。
+
+  这条以前不是这样：原来 `build_probe_prompt` 差 1 个 token 就抛异常，结果一次 8001/8000 的
+  舍入把整个 case（一次模型加载 + 已经跑完的四十分钟探测）全丢了。现在单个探测构造失败只**跳过
+  该探测并打印说明**，不再中止整个 case——模型已经加载好且工作正常，部分结果远胜于没有结果。
+- **每个 (task, depth, sample) 用不同的植入值**，由 `(seed, context, task, depth, sample)`
+  派生，避免 profile 靠记住一个答案刷分；值经 `tasks.draw_value` 校验与语料不重叠，否则
+  `recall` 会误报。`cwe`/`fwe` 的词表按每次重复都携带目标:干扰 = 10:1 的比例构造，所以把它切到
+  任意 token 数都不会改变排名（实测 390 次 vs 40 次）。
+- **每个探测自带解码预算**。检索答案是 6 字符码，生成答案是一段散文；用同一个
+  `output_tokens` 会让前者浪费大半时间解码 padding，或让后者被截断——截断测的是截断，不是保真度。
+- **保真度打分是跨 case 的**，因为参考答案是另一个 profile 的输出，而那个 case 可能后跑。因此
+  `_fill_generation_fidelity` 在**报告期**执行（按 `(task, depth, sample)` 配对，prompt 由这些
+  坐标种子化，故必然同一个 prompt），并且是幂等的——`write_reports` 每个 case 后都会重跑，所以
+  一个先于基线完成的 case 会在基线落地时立刻补上保真度列。`probes.csv` 也因此改为**整体重写**
+  而非逐 case 追加。
+- **三族指标并排放**，因为每一族都对某种情况失明：`similarity`（语义，WWB 的 embedding 余弦）
+  对改写打 ~1.0；`rouge1/2/L` 与 `chrf`（词面/字面）会因改写下降；`fdt`/`sdt_norm`
+  （[divergent token metrics](https://arxiv.org/abs/2311.01544)，token 级）是唯一能说出"贪心
+  解码在第 3 个 token 就不再可复现"的。只报第一个会把明显改写的答案叫作"无损"；只报
+  `identical`（即旧的 `output_sha256` 检查）又会把一次合理的 tie-break 叫作"回归"。
+- **唯一的可选依赖被隔离在 `wwb_adapter`**。`similarity` 由一个特定的 420 MB embedding 模型
+  定义，手搓一个"看起来像 WWB 的数"是不诚实的，所以这一项委托给 who_what_benchmark；其余
+  全部原生实现，缺了 WWB 时该列显示 `--` 并在报告里说明原因，别的指标不受影响、运行不失败。
+  上游返回形状在版本间变过且不是公开 API，`_as_similarities` 因此逐形状归一化，遇到不认识的
+  形状降级为"不可用"而不是猜。
+- **词面指标不能用 SQuAD 分词**。SQuAD 归一化会丢掉 `a`/`an`/`the`——这对"在句子里找植入码"是
+  对的，对 ROUGE 是错的：`on a mat` 与 `on the mat` 会变成同一个串，把一次真实改写报成 1.00。
+  故 `scoring.lexical_tokens`（保留冠词）与 `scoring.tokens`（SQuAD）分开，`intersection_over_union`
+  同理用前者，否则一个恰好是冠词的目标词会从真值两侧同时消失。
+- **报告另开文件**。`probes.csv` 每探测一行，两个 suite **共用一套 schema**（某一族不产生的列
+  留空），所以"按 recall 排序看最差的几条"是一次表格操作；`summary.md` 每 context 出 RULER 按任务
+  表（带 `Delta vs <baseline>`）、深度 × profile 矩阵、以及生成保真度表；`summary.json` 每 case 挂
+  一个按 suite 分键的嵌套 `accuracy` 对象。**`summary.csv` / `CASE_FIELDS` 不变**——加准确率不动
+  吞吐路径的表头，一条测试断言这一点。
+
+`accuracy` 配置段仅在传 `--accuracy` 时读取，且在任何模型加载前校验（suite/task/option 名称、
+深度 ∈ [0,1]、`baseline_profile` 在本轮 profile 内），与 `_resolve_profiles` 同样是零成本的早失败
+（`benchmark._resolve_accuracy`）。`options` 里的任务名也校验，否则一个拼错的键会被静默丢弃，
+报告出来的是默认值却看着像配过。全量 suite 叠加深度扫描的探测数增长很快，`--list-profiles` 会在
+加载任何东西之前把每 case 的探测数打出来。
+
 ## 7. 内存采样
 
 ### 7.1 在父进程采样
@@ -494,10 +577,11 @@ RAM 或 GPU 采样不可用时保持 None，不伪装成 0。即使 generation �
 
 | 文件 | 内容 |
 |---|---|
-| `iterations.csv` | 每迭代一行，warmup 含在内并标记，附该迭代的内存窗口 |
-| `summary.csv` | 每 (model, profile, context) 一行聚合值，含 `pipeline_mode` 与 `cache_size_gb` |
-| `summary.md` | 按 context 分组的排行榜（带 `Pipeline` 列）+ TTFT 最快项单独点名 + TPOT 冠军配置原文 |
-| `summary.json` | 同数据的结构化版本，含硬件信息 |
+| `iterations.csv` | 每迭代一行，warmup 含在内并标记，附该迭代的内存窗口（吞吐路径） |
+| `probes.csv` | 每个准确率探测一行，两 suite 共用 schema：suite/task、植入真值与干扰项、答案，以及全部分数（RULER recall/EM/F1/decoys、ROUGE/chrF、FDT/SDT、similarity、fact coverage）。仅 `--accuracy`，且每次报告整体重写（保真度列是跨 case 的） |
+| `summary.csv` | 每 (model, profile, context) 一行聚合值，含 `pipeline_mode` 与 `cache_size_gb`；表头与是否 `--accuracy` 无关 |
+| `summary.md` | 吞吐：按 context 的排行榜 + TTFT 最快项 + TPOT 冠军配置。准确率：depth × profile 的 recall 矩阵 + `Delta Recall` 列 |
+| `summary.json` | 同数据的结构化版本，含硬件信息，准确率运行下每 case 挂按 suite 分键的嵌套 `accuracy` 对象 |
 
 TPOT 排行第一名与 TTFT 最快项**可以是不同的 profile**，两者都打印正是为此：160K 下 TTFT 约占墙钟
 96%，一个 TPOT 略优但首 token 慢 100s 的 profile 不是该上线的那个（`_leaderboard` /
@@ -515,7 +599,8 @@ TPOT 排行第一名与 TTFT 最快项**可以是不同的 profile**，两者都
 | `test_context_bench_context_builder.py` | 精确 token 数构造、模板开销扣除、边界漂移校正、pipeline tokenizer 计数 |
 | `test_context_bench_kv_estimate.py` | 架构级 KV 估算（hybrid / VLM / 压缩精度）、linear-attention 状态按 `max_num_seqs` 预留、`cache_size: auto` 上下界、两份配置的不变量（§4.3：profile 对、`ov` 逐字相同、stateful 无 scheduler、paged 有池上限且 `max_num_seqs=1`） |
 | `test_context_bench_metrics.py` | llm_bench 字段与单位、配置校验（含 profile 未知键、override 换管线告警）、TPOT 优先排序与 TTFT 排序、`pipeline_mode` 落库、中位数、时间加权均值（权重、缺失计数器、采样率无关性）、`perf_metrics` 逐字段回退 |
-| `test_context_bench_trial_lifecycle.py` | 子进程退出顺序、prefill milestone、父进程回收竞态结果、失败分类、内存沉降 |
+| `test_context_bench_trial_lifecycle.py` | 子进程退出顺序、prefill milestone、父进程回收竞态结果、失败分类、内存沉降；吞吐循环外提为 `_run_throughput_iterations` 后，"prompt 构造在循环外""不判断质量"等结构断言指向该函数 |
+| `test_context_bench_accuracy.py` | 全部打分函数（SQuAD、RULER item-recall/IoU、ROUGE、chrF、FDT/SDT），含"词面指标不得用丢冠词的 SQuAD 分词"这一陷阱；各 RULER 任务的形状、值确定性与语料不重叠，以及 `cwe`/`fwe` 真值在 filler 被切到精确 token 数后仍成立；最多 16 个 insert 的定深度精确 token 构造；探测集规模、按 suite 打分与对部分适用指标的聚合；跨 case 的生成保真度配对；用桩包测试的 who_what_benchmark 适配器；`accuracy` 配置校验；以及"准确率模式不改动 `CASE_FIELDS`/`ITERATION_CSV_FIELDS`"的不变量 |
 
 全部不依赖 GPU、模型或 OpenVINO 栈。测试策略上有意包含若干**源码结构断言**（例如
 `run_case` 中不得出现 `del pipe`、prompt 必须构造在迭代循环之外）：这些约束的违反不会让任何
@@ -523,7 +608,11 @@ TPOT 排行第一名与 TTFT 最快项**可以是不同的 profile**，两者都
 
 ## 11. 已知限制
 
-1. **不是质量测试**：不验证长距离事实召回或摘要正确性。
+1. **默认不做质量测试**：吞吐路径不验证长距离事实召回或摘要正确性。可选的 `--accuracy` 模式
+   （§6.7）覆盖 RULER 检索与 WWB 生成保真度，但仍有边界：探测全部是**合成**的；`qa` 用生成段落
+   代替 RULER 的 SQuAD/HotpotQA，故分数不能与已发表的 RULER QA 数字对比；`generation` suite
+   量的是**相对基线 profile 的漂移**，不是绝对的摘要质量——基线本身写得不好它看不出来；
+   `similarity` 需要可选的 who_what_benchmark，缺失时该列为空。都不替代对真实转录的人工核验。
 2. **系统级内存噪声**：权重与 KV 的拆分是近似差分，机器上的其他活动会计入。
 3. **GPU 指标平台相关**：采样器面向 Windows Intel iGPU。
 4. **OOM 文本启发式**：未收录的新 runtime 错误文本会落入通用 `error`。
@@ -562,4 +651,7 @@ TPOT 排行第一名与 TTFT 最快项**可以是不同的 profile**，两者都
 | KV 估算与 cache_size | `theoretical_kv_bytes_per_token`, `fixed_state_cache_bytes`, `mtp_head_layers`, `auto_cache_size_gb` |
 | 状态判定 | `benchmark._status`, `trial_runner.classify_error`, `trial_runner.failing_stage` |
 | Prompt 定长 | `context_builder.build_benchmark_prompt`, `render_prompt` |
+| 准确率任务定义 | `tasks.py`（`ProbeSpec`, `build_spec`, `draw_value`, `DEPTH_SWEPT_TASKS`, `RETRIEVAL_TASKS`, `GENERATION_TASKS`） |
+| 准确率打分 | `scoring.py`（`normalize`/`tokens` vs `lexical_tokens`, `exact_match`, `string_match_all`/`_part`, `intersection_over_union`, `token_f1`, `distractor_rate`, `rouge_n`, `rouge_l`, `chrf`, `first_divergent_token`, `divergent_tokens`）, `wwb_adapter.similarity` |
+| 准确率编排 | `accuracy.py`（`build_probe_specs`, `score_retrieval`, `score_grounding`, `score_fidelity`, `fill_similarity`, `aggregate`, `group_aggregate`, `delta`）, `context_builder.build_probe_prompt`, `trial_runner._run_accuracy_probes`, `benchmark._resolve_accuracy`, `_score_case_accuracy`, `_summarize_suite`, `_fill_generation_fidelity`, `_accuracy_leaderboard`, `_accuracy_section`, `_write_probes` |
 | 报告输出 | `write_reports`, `_append_iterations`, `_leaderboard`, `_ttft_leaderboard` |

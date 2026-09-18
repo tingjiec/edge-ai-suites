@@ -116,7 +116,9 @@ class TestChildReportsBeforeTeardown(unittest.TestCase):
         self.assertNotIn("result_queue.put(done)", code)
 
     def test_prompt_count_mismatch_is_checked_before_the_prompt_milestone(self):
-        code = _executable_source(trial_runner.run_case)
+        # The throughput loop was lifted out of run_case into _run_throughput_iterations for
+        # the accuracy dispatch; the ordering invariant it must keep moved with it.
+        code = _executable_source(trial_runner._run_throughput_iterations)
 
         mismatch = code.index("if hf_tokens != context_tokens or prompt_tokens != context_tokens:")
         milestone = code.index('done["stage_reached"] = STAGE_PROMPT_BUILT')
@@ -128,7 +130,7 @@ class TestChildReportsBeforeTeardown(unittest.TestCase):
     def test_prompt_is_built_once_outside_the_iteration_loop(self):
         # Rebuilding it per iteration would charge tokenization to every measurement and
         # break the like-for-like comparison llm_bench's repeated-prompt design gives.
-        code = _executable_source(trial_runner.run_case)
+        code = _executable_source(trial_runner._run_throughput_iterations)
 
         self.assertLess(code.index("build_benchmark_prompt"), code.index("for index in range("))
 
@@ -480,12 +482,14 @@ class TestGeneratedOutputIsNotQualityJudged(unittest.TestCase):
     ran. Only producing nothing at all is a failure."""
 
     def test_no_tokens_generated_raises_rather_than_reporting_a_zero_rate(self):
-        code = _executable_source(trial_runner.run_case)
-
-        self.assertIn("no_output", code)
-        # The token count comes from the runtime or the tokenizer -- never from
-        # inspecting whether the text looks like a good answer.
-        self.assertNotIn("strip()", code)
+        # The guard lives in both generation loops now (throughput and accuracy); neither may
+        # turn model behaviour into a hardware verdict by inspecting the text.
+        for func in (trial_runner._run_throughput_iterations, trial_runner._run_accuracy_probes):
+            code = _executable_source(func)
+            self.assertIn("no_output", code)
+            # The token count comes from the runtime or the tokenizer -- never from
+            # inspecting whether the text looks like a good answer.
+            self.assertNotIn("strip()", code)
 
 
 class TestMtpIsRejectedBeforeTheModelLoads(unittest.TestCase):

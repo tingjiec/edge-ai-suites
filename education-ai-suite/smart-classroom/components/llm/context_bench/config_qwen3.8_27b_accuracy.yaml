@@ -1,0 +1,179 @@
+# Copyright (C) 2026 Intel Corporation
+# SPDX-License-Identifier: Apache-2.0
+#
+# Long-context ACCURACY config for Qwen3.8-27B, run with `--accuracy`.
+#
+# This is the accuracy counterpart to config_qwen3.8_27b.yaml. Where that config measures
+# throughput (TPOT/TTFT) across an MTP sweep, this one measures whether the model is still
+# CORRECT at long context -- the question throughput cannot answer.
+#
+# It ships ONE profile, the plain paged baseline, so what it reports is the model's own
+# accuracy on this box rather than a comparison. That is the measurement to take first:
+# a retrieval rate for an MTP or u8-KV profile means nothing without it. See the `profiles`
+# section at the bottom for how to extend this into a precision-loss sweep.
+#
+# Two suites, because "still correct" has two halves that fail independently:
+#
+#   retrieval   RULER's synthetic probes, scored against known ground truth. Single needle,
+#               needle among decoys, all values of a key, one value of every key, variable
+#               tracking (multi-hop), word-frequency aggregation, and a planted-paragraph QA.
+#               A profile can hold niah_single at 100% and collapse on vt or cwe, which is
+#               exactly what a single-needle run used to hide.
+#
+#   generation  The real classroom task at a realistic answer length, scored the way
+#               who_what_benchmark scores a compressed model: against the BASELINE profile's
+#               own answer to the identical prompt. Embedding similarity, ROUGE/chrF and the
+#               FDT/SDT divergent-token metrics, side by side -- each is blind to something
+#               the next one catches.
+#
+# Run it:
+#
+#   .\components\llm\context_bench\run_benchmark.ps1 `
+#     --config components/llm/context_bench/config_qwen3.8_27b_accuracy.yaml --accuracy
+#
+# See the probe count before committing to the run:
+#
+#   ... --config <this file> --accuracy --list-profiles
+#
+# Cut it down while iterating:
+#
+#   ... --accuracy --accuracy-tasks niah_single summary --accuracy-samples 1
+#
+# Output lands in monitoring/executionlogs/.../: probes.csv (one row per scored probe, both
+# suites, one schema), summary.md (the per-task and depth matrices plus the fidelity table),
+# summary.json.
+#
+# The context here is larger than the throughput config's 8K: accuracy is only interesting
+# where the fact is far from the question, so a needle at depth 0.0 of a 32K context is the
+# case that actually stresses recall.
+
+model:
+  provider: openvino
+  device: GPU
+  weight_format: int8
+  models_base_path: "models"
+  model_dirs:
+    Qwen3.8-27B: models/openvino/Qwen3.8-27B-int8-ov
+
+benchmark:
+  models: [Qwen3.8-27B]
+  context_tokens: [8000]
+  # output_tokens here is the THROUGHPUT knob and is unused in accuracy mode -- each suite
+  # sets its own decode budget below. Kept valid so the config also runs without --accuracy.
+  output_tokens: 64
+  # Warm-up still absorbs first-run kernel compilation; the accuracy path runs it on a
+  # throwaway probe prompt. `iterations` is unused in accuracy mode (the probe set drives it).
+  warmup: 1
+  iterations: 3
+  timeout_sec: 5400
+  max_system_memory_pct: 100
+  gpu_memory_budget_gb: 59
+  cache_dir: null
+  output_dir: monitoring/executionlogs/context_bench/qwen3.8_27b_accuracy
+
+# The accuracy probe set. Only read when --accuracy is passed.
+accuracy:
+  suites: [retrieval, generation]
+
+  # Every profile is reported against this one: retrieval as a signed delta, and generation
+  # as a direct comparison (its answers ARE the reference). Must be one of the profiles below.
+  # With the single profile this config ships, that profile IS the baseline, so the deltas
+  # are 0 and the fidelity columns are 1.00 by construction -- they become meaningful as soon
+  # as a second profile is added.
+  baseline_profile: paged_min
+
+  # Fixes every planted value, so a re-run reproduces the same probes and is comparable with
+  # the last one line by line.
+  seed: 20260917
+
+  # who_what_benchmark's embedding model, used for the `Similarity` column only. WWB is an
+  # OPTIONAL dependency and is not required to run this config -- when it is absent the
+  # column reports `--` with the reason, and every other metric is computed natively. To get
+  # the column, install:
+  #
+  #   pip install "whowhatbench @ git+https://github.com/openvinotoolkit/openvino.genai.git#subdirectory=tools/who_what_benchmark"
+  #
+  # Set to null to switch the semantic column off deliberately (the report says so, rather
+  # than leaving an unexplained blank).
+  embedding_model: sentence-transformers/all-mpnet-base-v2
+
+  retrieval:
+    # The full RULER suite. Drop names to shorten the run -- `niah_single` alone reproduces
+    # the classic Needle-in-a-Haystack sweep.
+    tasks:
+      - niah_single      # one planted code
+      - niah_multikey    # one code among decoys -- measures precision, not just recall
+      - niah_multivalue  # every value of one key
+      - niah_multiquery  # one value of every key
+      - vt               # variable tracking: multi-hop coreference chains
+      - cwe              # common word extraction: aggregation over the whole context
+      - fwe              # frequent word extraction, Zeta-distributed
+      - qa               # natural-language question over a planted paragraph
+    # Where the fact is planted, as a fraction: 0.0 is the very top (hardest -- furthest from
+    # the question at the end), 1.0 the very bottom. Applies to the depth-swept tasks only
+    # (niah_single, niah_multikey, qa); the rest spread their needles by construction.
+    #
+    # Three depths, not five. Top/middle/bottom is what answers "does this profile lose the
+    # front of the context"; the quarter points cost 40% more wall clock to refine a curve
+    # nobody reads. Add them back for a publication-shaped NIAH plot.
+    depths: [0.0, 0.5, 1.0]
+    # Distinct probes per task (and per depth, for the swept ones). Each carries different
+    # planted values, so a profile cannot score a hit by memorizing one answer.
+    #
+    # 2 is an indication, not a rate -- a task scored over 2 probes can only report 0%, 50% or
+    # 100%. That is the right default for a run measured in minutes per probe; raise it once a
+    # profile looks suspect and the question becomes "how often".
+    samples: 2
+    # Answers are codes and short word lists. `cwe` returns ten words, so this is not as
+    # generous as it looks.
+    output_tokens: 64
+    options:
+      niah_multikey: {num_distractors: 3}
+      niah_multivalue: {num_values: 4}
+      niah_multiquery: {num_queries: 4}
+      # 3 chains of 3 is 9 planted statements. The previous 4x4 planted 16, which made this
+      # the heaviest prompt in the suite to build and spread the target chain thin enough that
+      # a miss said more about the prompt than the model.
+      vt: {chain_length: 3, num_chains: 3}
+      cwe: {num_target_words: 10}
+      fwe: {top_k: 3}
+
+  generation:
+    tasks:
+      - summary     # open-ended classroom work, scored purely against the baseline
+      - fact_sheet  # long-form answer that also has its own ground truth
+    # `summary` and `fact_sheet` are not depth-swept, so this is unused; kept explicit
+    # because the planted facts in `fact_sheet` still have to go somewhere sensible.
+    depths: [0.5]
+    # Distinct prompts per task -- the WWB "dataset" analog. A fidelity number from a single
+    # summarization request says less than one taken across a summarize / explain / list /
+    # quiz spread, which exercise different output shapes. These decode 256 tokens each, so
+    # they are the most expensive probes in the run; 2 per task is enough to see drift.
+    samples: 2
+    # Prose. Scoring a summary at 64 tokens would measure truncation, not fidelity.
+    output_tokens: 256
+    options:
+      fact_sheet: {num_facts: 6}
+
+# A single paged profile, no MTP.
+#
+# This config measures the model's own long-context accuracy at 32K -- what the box scores
+# when nothing is trading precision for speed. That is the number every comparison needs
+# first: a retrieval rate for an MTP or u8-KV profile means nothing without knowing what the
+# unaccelerated baseline scored on the same probes.
+#
+# To turn it into a comparison, add profiles here (an MTP sweep, a KV_CACHE_PRECISION change,
+# a stateful/paged pair) and keep `accuracy.baseline_profile: paged_min`. Every added profile
+# is then reported as a signed delta against this row in the retrieval tables, and its
+# generation output is compared against this row's answers to the identical prompts. With one
+# profile those columns are self-comparisons and read 1.00 -- correct, and not a result.
+profiles:
+  - name: paged_min
+    ov:
+      ATTENTION_BACKEND: PA
+      GPU_ENABLE_LARGE_ALLOCATIONS: "YES"
+      KV_CACHE_PRECISION: f16
+    scheduler:
+      max_num_batched_tokens: 32768
+      max_num_seqs: 1
+      enable_prefix_caching: false

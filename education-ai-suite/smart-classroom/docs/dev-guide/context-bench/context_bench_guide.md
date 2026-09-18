@@ -33,10 +33,15 @@ own model-specific configs —
 
 ```
 components/llm/context_bench/
-  config_qwen3.5_9b.yaml       Qwen3.5-9B 160K: stateful vs paged_min
-  config_qwen3.6_35b_a3b.yaml  Qwen3.6-35B-A3B 160K: stateful vs paged_min
-  config_qwen3.8_27b.yaml      Qwen3.8-27B 8K: no-MTP baseline vs a num_assistant_tokens sweep
-  context_builder.py     synthetic transcript sized to an exact token count
+  config_qwen3.5_9b.yaml           Qwen3.5-9B 160K: stateful vs paged_min
+  config_qwen3.6_35b_a3b.yaml      Qwen3.6-35B-A3B 160K: stateful vs paged_min
+  config_qwen3.8_27b.yaml          Qwen3.8-27B 8K: no-MTP baseline vs a num_assistant_tokens sweep
+  config_qwen3.8_27b_accuracy.yaml Qwen3.8-27B 32K accuracy, one paged profile (extend to compare)
+  context_builder.py     synthetic transcript sized to an exact token count (+ probe placement)
+  tasks.py               the RULER + generation task registry: what is planted and what is asked
+  scoring.py             pure-Python metrics: SQuAD, RULER, ROUGE/chrF, FDT/SDT
+  accuracy.py            probe sets, score dispatch and aggregation (opt-in --accuracy)
+  wwb_adapter.py         optional bridge to who_what_benchmark for embedding similarity
   metrics.py             llm_bench-unit iteration records and their aggregation
   trial_runner.py        runs ONE (model, profile, context) case, in a subprocess
   benchmark.py           CLI orchestrator: run matrix, memory sampling, reporting
@@ -44,9 +49,12 @@ components/llm/context_bench/
   run_benchmark.ps1      one-command launcher
 ```
 
-> **Scope — capacity and speed, not answer quality.** Prompt content is irrelevant here;
-> only token volume and the clock matter. This tool does not score whether the model
-> *understood* the long context. Validate recall separately against real transcripts.
+> **Scope — the default run measures capacity and speed, not answer quality.** Prompt content
+> is irrelevant on the throughput path; only token volume and the clock matter. To score
+> whether the model *understood* the long context, use the opt-in
+> [`--accuracy` mode](#long-context-accuracy-ruler--wwb-fidelity), which runs RULER's
+> retrieval probes and a who_what_benchmark-style fidelity comparison. The two paths never mix:
+> with `--accuracy` off, everything else here is unchanged.
 
 ## Quick start
 
@@ -207,6 +215,195 @@ python -m components.llm.context_bench.benchmark
 If a model's OpenVINO IR is missing, the tool prints the exact `optimum-cli export openvino`
 command to produce it and moves on to the next model.
 
+## Long-Context Accuracy (RULER + WWB fidelity)
+
+The throughput path proves the box can *run* a context length; it says nothing about whether the
+model still *used* it correctly. `--accuracy` measures that. This is the axis where
+**quantization and speculative decoding silently regress**: a u8/int4 KV cache or an MTP draft
+head is a decode-side speedup that is *supposed* to preserve the output, and accuracy mode is
+what checks it did.
+
+```powershell
+.\components\llm\context_bench\run_benchmark.ps1 `
+  --config components/llm/context_bench/config_qwen3.8_27b_accuracy.yaml --accuracy
+```
+
+The shipped accuracy config runs **one** paged profile, so what it reports is the model's own
+accuracy on this box. Take that measurement first: a retrieval rate for an MTP or u8-KV profile
+means nothing without knowing what the unaccelerated baseline scored on the same probes. To turn
+it into a precision-loss sweep, add profiles to that config and keep `baseline_profile` pointing
+at the plain one — every added profile is then reported as a signed delta against it. With a
+single profile the delta and fidelity columns are self-comparisons and read 0 / 1.00 by
+construction: correct, and not a result.
+
+Two suites, because "still correct" has two halves that fail independently. A profile can return
+every planted code and write visibly worse prose; it can also summarize fluently while having
+lost the middle of the context.
+
+### Suite 1 — retrieval (RULER)
+
+Synthetic probes with known ground truth, following
+[RULER](https://github.com/NVIDIA/RULER) (Hsieh et al., COLM 2024), which generalizes
+[Needle-in-a-Haystack](https://github.com/gkamradt/LLMTest_NeedleInAHaystack) into three
+behaviours that break separately:
+
+| Task | Behaviour | What it plants |
+|---|---|---|
+| `niah_single` | retrieval | one high-entropy code at one depth — the classic NIAH probe |
+| `niah_multikey` | retrieval under distraction | the target code plus decoy codes under other keys |
+| `niah_multivalue` | exhaustive retrieval | several values of **one** key, spread through the context |
+| `niah_multiquery` | exhaustive retrieval | one value for **each** of several keys |
+| `vt` | multi-hop tracing | chains of variable assignments that must be followed to the end |
+| `cwe` | aggregation | a word list whose 10 most frequent words must be **counted** out |
+| `fwe` | aggregation | the same, with Zeta-distributed frequencies (no clean split) |
+| `qa` | comprehension | a planted paragraph answered in natural language |
+
+Scored with RULER's own rules, all pure Python — no reference model, no embedding dependency,
+unit-testable without a GPU:
+
+| Metric | Meaning |
+|---|---|
+| `recall` | the **primary** score, and the task's own RULER scorer: the share of ground-truth items found, or intersection-over-union for `cwe`/`fwe` (which must punish over-answering), or any-acceptable-answer for `qa` |
+| `exact_match` | SQuAD exact match — the answer is the ground truth and nothing else |
+| `token_f1` | SQuAD token-level F1, the graded fallback |
+| `distractor_rate` | share of planted **decoys** that wrongly appeared — lower is better. A profile losing precision does not stop answering, it starts answering with the wrong key's value, and recall alone reads that as a plain miss |
+
+`niah_single`, `niah_multikey` and `qa` are swept across `depths` (0.0 = very top of the
+transcript, the hardest); the rest place their needles by construction and run `samples` probes
+each. Every `(task, depth, sample)` gets **distinct** planted values seeded from the config, so a
+profile cannot score a hit by memorizing one answer.
+
+> **Probe prompts are sized to within a few tokens of the configured context, not exactly to
+> it** — the throughput path's `configured == HF == OpenVINO` check still demands exactness,
+> and the two differ on purpose. Each planted insert adds two tokenizer seams (a `vt` probe
+> has 34), and the size correction moves one number, the filler budget, against the sum of all
+> that drift; it can orbit the target by a token forever without landing on it. Throughput
+> *divides* by the token count, so a token matters there. A retrieval verdict does not: "did
+> the model find the code planted at depth 0.25 of an 8,000-token context" is the same
+> question at 8,001. Measured with the Qwen3.8 tokenizer, every probe lands within 2 tokens.
+> The count actually used is what `probes.csv` records and what any per-token figure divides
+> by, so nothing is reported against a number no forward pass saw.
+>
+> A probe whose prompt cannot be built at all is **skipped with a note** rather than failing
+> the case — the model is loaded and working, and a partial accuracy result is worth far more
+> than losing the probes that already ran.
+
+> RULER draws its QA tasks from SQuAD and HotpotQA. Those datasets are not shipped here, so `qa`
+> plants a generated paragraph instead: the task shape is the same, but a score from it is not
+> comparable with a published RULER QA number.
+
+### Suite 2 — generation fidelity (who_what_benchmark)
+
+The model does the **real** classroom task (`summary`: summarize, explain, list, write quiz
+questions; `fact_sheet`: a long-form report over planted facts) at a realistic answer length, and
+its answer is compared with the answer the **baseline profile** gave to the identical prompt.
+That is [WWB](https://github.com/openvinotoolkit/openvino.genai/blob/master/tools/who_what_benchmark/README.md)'s
+framing — how far did the optimized model drift from the reference — and it replaces the old
+binary `output_sha256` check with a graded one.
+
+Three families of number, kept side by side because each is blind to something:
+
+| Metric | Family | Meaning |
+|---|---|---|
+| `similarity` | semantic | WWB's sentence-embedding cosine against the baseline answer. A paraphrase scores ~1.0 |
+| `rouge1` / `rouge2` / `rouge_l` | lexical | n-gram and LCS F-measure. Falls when the wording changes even if the meaning did not |
+| `chrf` | lexical | character n-gram F-score, so a near-miss still scores |
+| `fdt` / `sdt_norm` | token-exact | [divergent token metrics](https://arxiv.org/abs/2311.01544): how many tokens the two agreed on before the first difference, and the share of the answer that differs |
+| `identical` | token-exact | byte-for-byte match — the old `output_sha256` answer |
+| `fact_coverage` | ground truth | share of the facts planted for `fact_sheet` that the answer named. The one column here scored against real ground truth rather than another model's output |
+
+Reporting only `similarity` would call a visibly reworded answer "lossless"; reporting only
+`identical` would call a legitimate tie-break "a regression".
+
+> **`similarity` needs who_what_benchmark, which is optional and not required to run.** Every
+> other metric is computed natively. When WWB is absent the column reports `--` and the report
+> says why; nothing else changes and no run fails. To get the column:
+>
+> ```powershell
+> pip install "whowhatbench @ git+https://github.com/openvinotoolkit/openvino.genai.git#subdirectory=tools/who_what_benchmark"
+> ```
+>
+> Set `accuracy.embedding_model: null` to switch it off deliberately.
+
+### Configuring an accuracy run
+
+Add an `accuracy` section to a config; it is read only when `--accuracy` is passed. Both suites
+are optional and each defaults to its full task list, so `accuracy: {suites: [retrieval]}` is a
+complete RULER run.
+
+```yaml
+accuracy:
+  suites: [retrieval, generation]
+  baseline_profile: paged_min     # every profile is reported against this one
+  seed: 20260917                  # fixes the planted values, so a re-run reproduces them
+  embedding_model: sentence-transformers/all-mpnet-base-v2   # null to skip `similarity`
+
+  retrieval:
+    tasks: [niah_single, niah_multikey, niah_multivalue, niah_multiquery, vt, cwe, fwe, qa]
+    depths: [0.0, 0.5, 1.0]               # depth-swept tasks only; 0.0 = very top (hardest)
+    samples: 2                            # distinct probes per task (and per depth)
+    output_tokens: 64                     # codes and short word lists
+    options:                              # per-task knobs; unknown task names are rejected
+      niah_multikey: {num_distractors: 3}
+      vt: {chain_length: 3, num_chains: 3}
+      cwe: {num_target_words: 10}
+
+  generation:
+    tasks: [summary, fact_sheet]
+    samples: 2                            # distinct prompts per task -- WWB's "dataset"
+    output_tokens: 256                    # prose; 64 would measure truncation, not fidelity
+    options:
+      fact_sheet: {num_facts: 6}
+```
+
+**Keep it small by default.** A probe at 32K costs about a minute of prefill on this box, so
+the shipped settings above are 32 probes per case — top/middle/bottom depths, 2 samples —
+rather than the 68 a five-depth three-sample sweep would be. 2 samples is an *indication*, not
+a rate: a task scored over 2 probes can only report 0%, 50% or 100%. Raise `samples` once a
+profile looks suspect and the question becomes "how often"; add the quarter-point depths when
+you want a publication-shaped NIAH curve rather than a pass/fail.
+
+The section is validated **before any model loads**: unknown suite, task or option names are
+rejected, depths must be in `[0, 1]`, and `baseline_profile` must name a profile in the run — a
+typo is a configuration error, not something to discover after an hour of probes.
+
+`--accuracy-suites`, `--accuracy-tasks`, `--accuracy-depths` and `--accuracy-samples` override
+the config for one run, across every suite being run. Check the probe count before committing to
+a long sweep — the full suite across a depth sweep multiplies faster than it looks:
+
+```powershell
+... --config <accuracy config> --accuracy --list-profiles
+... --accuracy --accuracy-tasks niah_single summary --accuracy-samples 1   # a quick pass
+```
+
+### Reading the result
+
+`summary.md` prints, per context:
+
+* a **per-task table** — the headline, because it is where a profile holding `niah_single` at
+  100% while collapsing on `vt` or `cwe` becomes visible — with `Overall` / `EM` / `F1` /
+  `Decoys` columns and a `Delta vs <baseline>` column. A negative delta is accuracy that
+  profile's speed cost.
+* the classic **depth sweep** matrix over the depth-swept tasks. A profile that holds the bottom
+  and loses the top has a context window shorter than the one it was given.
+* the **generation fidelity** table, one row per profile, with all three metric families. The
+  baseline row compares against itself, so it reads 1.00 throughout — that row is the sanity
+  check, not a result.
+
+Every probe — its planted ground truth, the model's answer and all of its scores — is a row in
+**`probes.csv`**, the accuracy analog of `iterations.csv`. Both suites share one schema; a row
+leaves blank the metrics its suite does not produce, so sorting every probe by `recall` and
+reading the worst is one spreadsheet operation.
+
+Because accuracy mode replaces the timing iterations with probes, `summary.csv` / `CASE_FIELDS`
+are **unchanged** — accuracy lives in `probes.csv`, the `summary.md` sections, and a nested
+`accuracy` object (keyed by suite) in `summary.json`. A throughput run's headers never move.
+
+> **The generation suite's fidelity scores are cross-case**, so they are filled at report time
+> rather than when a case finishes: the reference is the baseline profile's output, and that
+> profile may run after the profile being scored. `probes.csv` is rewritten in full on every
+> report pass for the same reason.
+
 ## What gets measured
 
 Per iteration, in llm_bench's field names and units (milliseconds for latency, seconds for
@@ -336,6 +533,10 @@ context of 0.
 `--models` `--contexts` `--profiles` `--iterations` `--warmup` `--output-tokens` `--device`
 `--weight-format` `--output-dir` `--config` override config values for one run.
 `--mtp-tokens K` sweeps the candidate count on the profiles that already enable MTP.
+`--accuracy` switches the run to the
+[accuracy mode](#long-context-accuracy-ruler--wwb-fidelity) (the config needs an `accuracy`
+section); `--accuracy-suites`, `--accuracy-tasks`, `--accuracy-depths` and
+`--accuracy-samples` narrow it for one run, across every suite being run.
 
 `--pipeline-config KEY=VALUE` and `--scheduler-config KEY=VALUE` add to or override every
 profile's properties; `KEY=` with an empty value removes one. This exists so a one-off
@@ -358,10 +559,11 @@ Each run writes to `<output_dir>/<YYYYMMDD-HHMMSS>/`, so runs never mix:
 
 | File | Contents |
 |---|---|
-| `iterations.csv` | one row per iteration, warm-up included and flagged, with its own peak and mean memory window |
-| `summary.csv` | one row per (model, profile, context) with aggregated metrics, including `pipeline_mode`, `cache_size_gb`, `mtp` and `num_assistant_tokens` |
-| `summary.md` | ranked leaderboard per context with `Pipeline` and `MTP` columns, the fastest-TTFT call-out, the MTP speedup line, and the exact config of the TPOT winner |
-| `summary.json` | the same data structured, including hardware info |
+| `iterations.csv` | one row per iteration, warm-up included and flagged, with its own peak and mean memory window (throughput runs) |
+| `probes.csv` | one row per scored accuracy probe, both suites in one schema: the suite and task, the planted ground truth and decoys, the model's answer, and every score (RULER recall/EM/F1/decoys, ROUGE/chrF, FDT/SDT, similarity, fact coverage). Only on `--accuracy` runs, and rewritten in full on every report pass because the fidelity columns are cross-case |
+| `summary.csv` | one row per (model, profile, context) with aggregated metrics, including `pipeline_mode`, `cache_size_gb`, `mtp` and `num_assistant_tokens`. Header is identical whether or not `--accuracy` is on |
+| `summary.md` | throughput runs: ranked leaderboard per context with `Pipeline`/`MTP` columns, the fastest-TTFT call-out, the MTP speedup line, and the winner's config. Accuracy runs: the RULER per-task table with the `Delta` column, the depth × profile sweep, and the generation-fidelity table |
+| `summary.json` | the same data structured, including hardware info and (on accuracy runs) each case's nested `accuracy` object, keyed by suite |
 
 The TPOT ranking and the fastest-TTFT line can name different profiles — that is the point of
 printing both. At 160K, TTFT is ~96% of the wall clock, so a profile that wins on TPOT while
@@ -452,8 +654,9 @@ python -m unittest discover -s components/tests -p "test_context_bench_*.py"
 | `test_context_bench_kv_estimate.py` | architecture-derived KV size, the per-sequence linear-attention reservation `max_num_seqs` controls, `cache_size: auto`, the MTP draft head's own KV surcharge, and the shipped configs' invariants (the 9B/35B pair differ only in the pipeline; the Qwen3.8 matrix differs only in MTP) |
 | `test_context_bench_metrics.py` | llm_bench units, TPOT-first ranking, the TTFT ranking, `pipeline_mode` recording, `mtp` profile resolution, the MTP yield/acceptance arithmetic, medians, the time-weighted mean occupancy, `perf_metrics` fallback |
 | `test_context_bench_trial_lifecycle.py` | child exit path, parent recovery, failure classification, MTP rejected before the model loads |
+| `test_context_bench_accuracy.py` | every scorer (SQuAD, RULER item-recall/IoU, ROUGE, chrF, FDT/SDT) including the trap that the lexical metrics must not use the article-stripping SQuAD tokenizer; each RULER task's shape, value determinism and corpus-disjointness, and that `cwe`/`fwe` ground truth survives the filler being sliced to an exact token count; exact-token prompt construction for up to sixteen inserts at their depths; probe-set sizing, per-suite scoring and aggregation over partially-applicable metrics; the cross-case generation-fidelity pairing; the who_what_benchmark adapter against a stubbed package; `accuracy` config validation; and the invariant that accuracy mode leaves `CASE_FIELDS`/`ITERATION_CSV_FIELDS` untouched |
 
-All four run without a GPU, a model, or the OpenVINO stack.
+All five run without a GPU, a model, or the OpenVINO stack.
 
 ## Environment
 

@@ -8,12 +8,12 @@
 model:
   provider: openvino
   device: GPU
-  weight_format: int8
+  weight_format: int4
   models_base_path: "models"
 
 benchmark:
-  models: [Qwen/Qwen3.6-35B-A3B]
-  context_tokens: [160000]
+  models: [Qwen3.6-35B-A3B]
+  context_tokens: [32000]
   output_tokens: 64
   warmup: 0
   iterations: 1

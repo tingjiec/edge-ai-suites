@@ -13,7 +13,7 @@ model:
 
 benchmark:
   models: [Qwen/Qwen3.5-9B]
-  context_tokens: [160000]
+  context_tokens: [32000]
   output_tokens: 64
   warmup: 0
   iterations: 1

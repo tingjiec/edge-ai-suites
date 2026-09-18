@@ -18,8 +18,14 @@ previously measured at 247.0s and 349.5s on two single-shot runs; a single
 sample cannot tell a configuration difference from noise, which is the whole
 reason iterations are not optional here.
 
-It does NOT judge answer quality -- content is irrelevant to a capacity and
-throughput measurement, only the token volume and the clock matter.
+The default (throughput) path does NOT judge answer quality -- content is irrelevant to a
+capacity and throughput measurement, only the token volume and the clock matter. The opt-in
+`--accuracy` mode does the opposite, in two suites: RULER's synthetic probes (retrieval,
+multi-hop tracing, aggregation) scored against known ground truth, and a who_what_benchmark
+-style fidelity comparison of the real task's output against the baseline profile's. So
+precision loss from quantization or speculative decoding is visible next to the speed it
+bought, whether it shows up as a missed fact or as worse prose. See `accuracy.py`. The two
+paths never mix -- with `--accuracy` off, everything below is byte-for-byte the throughput tool.
 
 Standalone diagnostic: reads its own bundled model config, never
 smart-classroom/config.yaml, and running it never affects the application.
@@ -56,7 +62,14 @@ from datetime import datetime
 from queue import Empty
 from types import SimpleNamespace
 
-from components.llm.context_bench import metrics, trial_runner
+from components.llm.context_bench import (
+    accuracy,
+    metrics,
+    scoring,
+    tasks,
+    trial_runner,
+    wwb_adapter,
+)
 from utils.config_loader import load_config
 from utils.storage_manager import StorageManager
 
@@ -194,6 +207,21 @@ CASE_FIELDS = [
 ITERATION_CSV_FIELDS = [
     "model", "profile", "context_tokens", *metrics.ITERATION_FIELDS,
     *_ITERATION_MEMORY_FIELDS,
+]
+
+# probes.csv -- the accuracy analog of iterations.csv: the per-generate record plus what was
+# planted, the answer, and every score. A separate file, deliberately, so summary.csv and
+# CASE_FIELDS stay frozen and a throughput run's headers never change when accuracy is added.
+#
+# One schema across both suites rather than a file each: a row leaves blank the metrics its
+# suite does not produce (a retrieval probe has no `chrf`, a `summary` probe has no
+# `exact_match`), and one file is what makes "sort every probe by recall and look at the
+# worst" a single spreadsheet operation.
+PROBE_CSV_FIELDS = [
+    "model", "profile", "context_tokens", "suite", "task", "depth", "sample",
+    "truth", "distractors", "prediction",
+    *accuracy.PROBE_SCORE_FIELDS,
+    *metrics.ITERATION_FIELDS, *_ITERATION_MEMORY_FIELDS,
 ]
 
 
@@ -922,6 +950,30 @@ def _parse_args():
              "profiles without an `mtp` section stay the no-MTP baseline",
     )
     parser.add_argument(
+        "--accuracy", action="store_true",
+        help="measure long-context accuracy (RULER retrieval + WWB-style generation fidelity) "
+             "instead of throughput; requires an `accuracy` section in the config",
+    )
+    parser.add_argument(
+        "--accuracy-suites", nargs="+", metavar="S",
+        choices=(accuracy.SUITE_RETRIEVAL, accuracy.SUITE_GENERATION),
+        help="run only these accuracy suites (overrides accuracy.suites)",
+    )
+    parser.add_argument(
+        "--accuracy-tasks", nargs="+", metavar="T",
+        help="run only these accuracy tasks, by name, across every suite being run. "
+             f"Known tasks: {', '.join(tasks.KNOWN_TASKS)}",
+    )
+    parser.add_argument(
+        "--accuracy-depths", type=float, nargs="+", metavar="D",
+        help="override the depths of the depth-swept tasks "
+             f"({', '.join(tasks.DEPTH_SWEPT_TASKS)}); fractions in [0,1]",
+    )
+    parser.add_argument(
+        "--accuracy-samples", type=int, metavar="N",
+        help="override accuracy.<suite>.samples (distinct probes measured per task/depth)",
+    )
+    parser.add_argument(
         "--list-profiles", action="store_true",
         help="print the resolved run matrix and exit -- no model, GPU or OpenVINO needed",
     )
@@ -933,6 +985,219 @@ def _whole_number(value, message: str, minimum: int = 1) -> int:
     if not isinstance(value, int) or isinstance(value, bool) or value < minimum:
         raise SystemExit(message)
     return value
+
+
+_ACCURACY_KEYS = (
+    "suites", "baseline_profile", "seed", "embedding_model",
+    accuracy.SUITE_RETRIEVAL, accuracy.SUITE_GENERATION,
+)
+_SUITE_KEYS = ("tasks", "depths", "samples", "output_tokens", "options")
+
+# Defaults per suite, applied when the section leaves a key out. Retrieval answers are short
+# codes and word lists; generation answers are prose, and scoring prose at 24 tokens would
+# measure truncation rather than fidelity.
+#
+# Deliberately small. A probe at 32K costs about a minute of prefill on this box, so the
+# defaults are sized to be a run someone will actually wait for: 2 samples over 3 depths is
+# 22 retrieval probes across the full eight tasks, not the 60 a five-depth three-sample sweep
+# would be. Raise `samples` when a rate rather than an indication is needed -- a task scored
+# over 2 probes can only report 0%, 50% or 100%.
+_SUITE_DEFAULTS = {
+    accuracy.SUITE_RETRIEVAL: {
+        "tasks": list(tasks.RETRIEVAL_TASKS), "depths": [0.0, 0.5, 1.0],
+        "samples": 2, "output_tokens": 64,
+    },
+    accuracy.SUITE_GENERATION: {
+        "tasks": list(tasks.GENERATION_TASKS), "depths": [0.5],
+        "samples": 2, "output_tokens": 256,
+    },
+}
+
+
+def _resolve_accuracy(cfg, args, profiles) -> dict | None:
+    """Resolve and validate the `accuracy` config section, or None when --accuracy is off.
+
+    Off by default: an accuracy section may sit unused in a config, and only --accuracy turns
+    it on. Every rule is checked before a model loads -- an unknown task name, a depth outside
+    [0,1] or a `baseline_profile` naming a profile that is not in the run is a configuration
+    error, not a thing to discover after an hour of probes, exactly like `_resolve_profiles`.
+
+    The shape is one nested section per suite::
+
+        accuracy:
+          suites: [retrieval, generation]
+          baseline_profile: paged_min
+          retrieval: {tasks: [...], depths: [...], samples: 2, output_tokens: 64}
+          generation: {tasks: [...], samples: 3, output_tokens: 256}
+
+    Both suites are optional and each defaults to its full task list, so `suites: [retrieval]`
+    with nothing else is a complete RULER run.
+    """
+    if not getattr(args, "accuracy", False):
+        return None
+    section = _namespace_to_dict(getattr(cfg, "accuracy", None))
+    if not isinstance(section, dict) or not section:
+        raise SystemExit(
+            "--accuracy needs an `accuracy` section in the config. The minimum is "
+            "`accuracy: {suites: [retrieval]}`; see "
+            "docs/dev-guide/context-bench/context_bench_guide.md."
+        )
+    unknown = [k for k in section if k not in _ACCURACY_KEYS]
+    if unknown:
+        raise SystemExit(
+            f"accuracy has unknown key(s): {', '.join(sorted(unknown))}. "
+            f"An accuracy section is {{{', '.join(_ACCURACY_KEYS)}}}."
+        )
+
+    wanted = args.accuracy_suites if args.accuracy_suites else section.get(
+        "suites", [accuracy.SUITE_RETRIEVAL, accuracy.SUITE_GENERATION]
+    )
+    if not isinstance(wanted, list) or not wanted or any(
+        suite not in _SUITE_DEFAULTS for suite in wanted
+    ):
+        raise SystemExit(
+            f"accuracy.suites must be a non-empty subset of "
+            f"{{{', '.join(_SUITE_DEFAULTS)}}}"
+        )
+
+    resolved = {
+        "suites": [s for s in _SUITE_DEFAULTS if s in wanted],  # canonical order
+        "baseline_profile": _accuracy_baseline(section, profiles),
+        "seed": _accuracy_seed(section),
+        "embedding_model": section.get("embedding_model", wwb_adapter.DEFAULT_EMBEDDING_MODEL),
+        accuracy.SUITE_RETRIEVAL: None,
+        accuracy.SUITE_GENERATION: None,
+    }
+    for suite in list(resolved["suites"]):
+        resolved[suite] = _resolve_suite(suite, _namespace_to_dict(section.get(suite)), args)
+        if resolved[suite] is None:
+            # `--accuracy-tasks` spans every suite, so narrowing to retrieval tasks leaves the
+            # generation suite with nothing to run. Dropping it is what the user meant;
+            # refusing the whole run and telling them to also pass --accuracy-suites is not.
+            resolved["suites"].remove(suite)
+            print(
+                f"[info] --accuracy-tasks selects no {suite} task, so the {suite} suite is "
+                "not being run",
+                flush=True,
+            )
+    if not resolved["suites"]:
+        raise SystemExit(
+            f"--accuracy-tasks {' '.join(args.accuracy_tasks)} selects no task in any suite "
+            "being run"
+        )
+    return resolved
+
+
+def _accuracy_baseline(section: dict, profiles: list) -> str | None:
+    baseline = section.get("baseline_profile")
+    names = [p["name"] for p in profiles]
+    if baseline is not None and baseline not in names:
+        raise SystemExit(
+            f"accuracy.baseline_profile {baseline!r} is not one of the profiles being run: "
+            f"{', '.join(names)}"
+        )
+    return baseline
+
+
+def _accuracy_seed(section: dict) -> int:
+    seed = section.get("seed", 0)
+    if not isinstance(seed, int) or isinstance(seed, bool):
+        raise SystemExit("accuracy.seed must be an integer")
+    return seed
+
+
+def _resolve_suite(suite: str, section, args) -> dict:
+    """One suite's settings, defaulted, validated and with the CLI overrides applied.
+
+    CLI overrides (`--accuracy-tasks`, `--accuracy-depths`, `--accuracy-samples`) apply to
+    every suite being run: they exist to cut a long sweep down to one task or one depth while
+    debugging, and having to say which suite as well would make the common case wordy.
+    """
+    defaults = _SUITE_DEFAULTS[suite]
+    section = section if isinstance(section, dict) else {}
+    unknown = [k for k in section if k not in _SUITE_KEYS]
+    if unknown:
+        raise SystemExit(
+            f"accuracy.{suite} has unknown key(s): {', '.join(sorted(unknown))}. "
+            f"A suite section is {{{', '.join(_SUITE_KEYS)}}}."
+        )
+
+    names = args.accuracy_tasks if args.accuracy_tasks else section.get(
+        "tasks", defaults["tasks"]
+    )
+    if not isinstance(names, list) or not names:
+        raise SystemExit(f"accuracy.{suite}.tasks must be a non-empty list of task names")
+    # A CLI --accuracy-tasks list spans both suites, so keep only the ones that belong here;
+    # a name belonging to no suite at all is still an error.
+    for task in names:
+        if not isinstance(task, str) or not tasks.is_known(task):
+            raise SystemExit(
+                f"accuracy.{suite}.tasks has unknown task {task!r}. Known tasks are "
+                f"retrieval: {', '.join(tasks.RETRIEVAL_TASKS)}; "
+                f"generation: {', '.join(tasks.GENERATION_TASKS)}."
+            )
+    selected = [t for t in names if tasks.suite_of(t) == suite]
+    if not selected:
+        if args.accuracy_tasks:
+            # A CLI filter that selects nothing here means "not this suite this time"; the
+            # caller prunes it. A *config* that does the same is a mistake worth refusing.
+            return None
+        raise SystemExit(
+            f"accuracy.{suite}.tasks selects no {suite} task; it lists only "
+            f"{', '.join(names)}. Drop `{suite}` from accuracy.suites instead."
+        )
+
+    depths = args.accuracy_depths if args.accuracy_depths is not None else section.get(
+        "depths", defaults["depths"]
+    )
+    if not isinstance(depths, list) or not depths or any(
+        not isinstance(d, (int, float)) or isinstance(d, bool) or not 0.0 <= d <= 1.0
+        for d in depths
+    ):
+        raise SystemExit(
+            f"accuracy.{suite}.depths must be a non-empty list of fractions in [0.0, 1.0]"
+        )
+
+    return {
+        "tasks": selected,
+        "depths": sorted({float(d) for d in depths}),
+        "samples": _whole_number(
+            args.accuracy_samples if args.accuracy_samples is not None
+            else section.get("samples", defaults["samples"]),
+            f"accuracy.{suite}.samples must be a positive integer",
+        ),
+        "output_tokens": _whole_number(
+            section.get("output_tokens", defaults["output_tokens"]),
+            f"accuracy.{suite}.output_tokens must be a positive integer",
+        ),
+        "options": _resolve_task_options(suite, section.get("options")),
+    }
+
+
+def _resolve_task_options(suite: str, options) -> dict:
+    """Per-task knobs (`num_distractors`, `chain_length`, ...), keyed by task name.
+
+    Left as a free-form dict on purpose -- each task reads the keys it knows and ignores the
+    rest -- but the *task names* are validated, because `options: {niah_multkey: ...}` with a
+    typo would otherwise be silently dropped and the run would report the defaults as if they
+    had been configured.
+    """
+    options = _namespace_to_dict(options)
+    if options in (None, {}):
+        return {}
+    if not isinstance(options, dict):
+        raise SystemExit(f"accuracy.{suite}.options must be a mapping of task name to settings")
+    resolved = {}
+    for task, values in options.items():
+        if not tasks.is_known(task) or tasks.suite_of(task) != suite:
+            raise SystemExit(
+                f"accuracy.{suite}.options names {task!r}, which is not a {suite} task"
+            )
+        values = _namespace_to_dict(values)
+        if not isinstance(values, dict):
+            raise SystemExit(f"accuracy.{suite}.options.{task} must be a mapping")
+        resolved[task] = values
+    return resolved
 
 
 def _load_settings(args) -> dict:
@@ -993,6 +1258,14 @@ def _load_settings(args) -> dict:
     if not math.isfinite(gpu_memory_budget_gb) or gpu_memory_budget_gb <= 0:
         raise SystemExit("benchmark.gpu_memory_budget_gb must be a finite positive number")
 
+    resolved_profiles = _resolve_profiles(
+        getattr(cfg, "profiles", None),
+        args.profiles,
+        _parse_overrides(args.pipeline_config),
+        _parse_overrides(args.scheduler_config),
+        args.mtp_tokens,
+    )
+
     return {
         "provider": model.provider,
         "models_base_path": model.models_base_path,
@@ -1012,13 +1285,9 @@ def _load_settings(args) -> dict:
         "gpu_memory_budget_gb": gpu_memory_budget_gb,
         "cache_dir": getattr(bench, "cache_dir", None),
         "output_dir": args.output_dir or bench.output_dir,
-        "profiles": _resolve_profiles(
-            getattr(cfg, "profiles", None),
-            args.profiles,
-            _parse_overrides(args.pipeline_config),
-            _parse_overrides(args.scheduler_config),
-            args.mtp_tokens,
-        ),
+        "profiles": resolved_profiles,
+        # None unless --accuracy is passed; selects the Needle-in-a-Haystack path per case.
+        "accuracy": _resolve_accuracy(cfg, args, resolved_profiles),
     }
 
 
@@ -1108,6 +1377,8 @@ def _run_case_subprocess(
     scheduler_config: dict,
     mtp: dict | None = None,
     on_iteration=None,
+    probes: list | None = None,
+    on_probe=None,
     sample_interval: float = 0.5,
     poll_interval: float = 0.25,
     drain_timeout: float = 5.0,
@@ -1133,7 +1404,7 @@ def _run_case_subprocess(
         target=trial_runner.run_case,
         args=(
             model_dir, device, context_tokens, output_tokens, warmup, iterations,
-            result_queue, ov_config, scheduler_config, mtp,
+            result_queue, ov_config, scheduler_config, mtp, probes,
         ),
     )
     process.start()
@@ -1147,6 +1418,8 @@ def _run_case_subprocess(
         "prompt_tokens": None,
         "gpu_budget_driver_gb": None,
         "iterations": [],
+        # Only the accuracy path fills this; kept present so both modes read one shape.
+        "probes": [],
     }
 
     def _consume(msg: dict, child_alive: bool) -> bool:
@@ -1176,6 +1449,15 @@ def _run_case_subprocess(
             state["iterations"].append(record)
             if on_iteration:
                 on_iteration(record)
+        elif event == "probe":
+            # An accuracy probe: same handling as `iteration` (memory window merged in) plus
+            # the planted depth/sample and the answer text, which the parent scores.
+            state["stage_reached"] = trial_runner.STAGE_DECODED
+            record = {k: v for k, v in msg.items() if k != "event"}
+            record.update(sampler.window())
+            state["probes"].append(record)
+            if on_probe:
+                on_probe(record)
         elif event == "done":
             result = msg
             return True
@@ -1241,6 +1523,7 @@ def _run_case_subprocess(
         result.pop("event", None)
         # The parent's per-iteration records carry the memory windows the child cannot see.
         result["iterations"] = state["iterations"] or result.get("iterations") or []
+        result["probes"] = state["probes"] or result.get("probes") or []
         # Renamed on the way out: the driver's own figure must not sit under a name that
         # could be mistaken for the configured budget the tool actually enforces.
         from_done = result.pop("gpu_budget_gb", None)
@@ -1259,6 +1542,7 @@ def _run_case_subprocess(
         "prompt_tokens": state["prompt_tokens"],
         "stage_reached": state["stage_reached"],
         "iterations": state["iterations"],
+        "probes": state["probes"],
         "gpu_budget_driver_gb": state["gpu_budget_driver_gb"],
         "error": "timeout" if timed_out else _crash_reason(process.exitcode),
         **mem,
@@ -1271,7 +1555,8 @@ def _status(result: dict) -> str:
     `oom` / `unsupported` / `gpu_abort` come from the child's own error text."""
     error = str(result.get("error") or "")
     if not error:
-        return "ok" if metrics.measured(result.get("iterations")) else "no_output"
+        measured = metrics.measured(result.get("iterations")) or result.get("probes")
+        return "ok" if measured else "no_output"
     if error == "timeout":
         return "timeout"
     if error.startswith("crashed"):
@@ -1378,9 +1663,18 @@ def _run_case(model_name, model_dir, profile, context_tokens, settings, static) 
     # reported mode has to be the one the child will run.
     mode = pipeline_mode(scheduler_config)
 
+    accuracy_cfg = settings.get("accuracy")
+    # Built before the banner so the probe count printed is the number that will actually run.
+    specs = accuracy.build_probe_specs(accuracy_cfg, context_tokens) if accuracy_cfg else []
+    if accuracy_cfg:
+        work = (
+            f"{settings['warmup']} warmup + {len(specs)} accuracy probe(s) across "
+            f"{', '.join(accuracy_cfg['suites'])}"
+        )
+    else:
+        work = f"{settings['warmup']} warmup + {settings['iterations']} iterations"
     print(
-        f"\n[{model_name} | {profile['name']} | {context_tokens:,} tok] "
-        f"{settings['warmup']} warmup + {settings['iterations']} iterations, timeout "
+        f"\n[{model_name} | {profile['name']} | {context_tokens:,} tok] {work}, timeout "
         f"{settings['timeout_sec']:g}s",
         flush=True,
     )
@@ -1404,27 +1698,59 @@ def _run_case(model_name, model_dir, profile, context_tokens, settings, static) 
             flush=True,
         )
 
+    # Accuracy mode: ship the built probe specs to the child, which only renders and generates
+    # them. `probes=None` (the default) leaves the throughput path untouched.
+    probes = [
+        {
+            "suite": s.suite, "task": s.task, "sample": s.sample, "depth": s.depth,
+            "inserts": s.inserts, "question": s.question, "filler": s.filler,
+            "output_tokens": s.output_tokens,
+        }
+        for s in specs
+    ] or None
+    # The child's fallback decode length; each probe carries its own, since a retrieval answer
+    # is a six-character code and a generation answer is a paragraph.
+    output_tokens = max((s.output_tokens for s in specs), default=settings["output_tokens"])
+
     def _echo(record):
         print("  " + metrics.format_iteration(record), flush=True)
 
+    def _echo_probe(record):
+        answer = (record.get("prediction_text") or "").replace("\n", " ").strip()
+        if len(answer) > 60:
+            answer = answer[:57] + "..."
+        depth = record.get("depth")
+        where = f" d={depth:.2f}" if isinstance(depth, (int, float)) else ""
+        print(
+            f"  probe {record.get('task')}{where} #{record.get('sample')}: "
+            f"{metrics.format_iteration(record)} | answer: {answer!r}",
+            flush=True,
+        )
+
     try:
         result = _run_case_subprocess(
-            model_dir, device, context_tokens, settings["output_tokens"],
+            model_dir, device, context_tokens, output_tokens,
             settings["warmup"], settings["iterations"], settings["timeout_sec"],
             ov_config, scheduler_config, mtp, on_iteration=_echo,
+            probes=probes, on_probe=_echo_probe,
         )
     except Exception as exc:  # noqa: BLE001 - a case the orchestrator could not carry out
         # Spawning a fresh interpreter that re-imports the OpenVINO stack is itself work the
         # box can fail at, and letting that unwind would discard every measurement taken so far.
         traceback.print_exc()
-        result = {"error": f"orchestrator:error:{exc}", "iterations": [], "load_ok": False}
+        result = {"error": f"orchestrator:error:{exc}", "iterations": [], "probes": [],
+                  "load_ok": False}
 
     peak_gpu = result.get("peak_gpu_gb")
     budget = settings["gpu_memory_budget_gb"]
     ram_pct = result.get("peak_ram_pct")
     # Aggregated first because `mean_gpu_pct_of_budget` is derived from a median the
-    # aggregation produces, and the case row below is assembled in one expression.
-    aggregated = metrics.aggregate(result.get("iterations"))
+    # aggregation produces, and the case row below is assembled in one expression. In accuracy
+    # mode there are no timing iterations; the probes carry the same per-generate record shape,
+    # so latency and memory aggregate from them instead.
+    aggregated = metrics.aggregate(
+        result.get("probes") if accuracy_cfg else result.get("iterations")
+    )
     mean_gpu = aggregated.get("mean_gpu_gb")
 
     case = {
@@ -1473,10 +1799,86 @@ def _run_case(model_name, model_dir, profile, context_tokens, settings, static) 
         **aggregated,
     }
     case["_iterations"] = result.get("iterations") or []
+    if accuracy_cfg:
+        # Keyed by suite and nothing else -- the baseline profile's name belongs to the run,
+        # not to a case, and lives in settings["accuracy"] (and so in summary.json). Mixing a
+        # scalar in here made the delta pass walk a string as though it were a suite.
+        scored, summary = _score_case_accuracy(result.get("probes") or [], specs)
+        case["accuracy"] = summary
+        case["_probes"] = scored
+        case["_model_dir"] = model_dir
 
     # A measurement taken past the memory ceiling is a real measurement of an unusable
     # configuration, so it keeps its numbers and is demoted rather than deleted.
     return _apply_memory_status(case)
+
+
+def _depth_label(depth) -> str:
+    """A stable string key for a depth fraction, shared by the score map, the per-depth
+    aggregate, summary.json and the report matrix so they cannot drift. Tasks that place their
+    needles by construction have no single depth and key as "-"; see `tasks.ProbeSpec`."""
+    return "-" if depth is None else f"{float(depth):.2f}"
+
+
+def _score_case_accuracy(probes: list, specs: list) -> tuple:
+    """Score each probe's answer against what its spec planted, and aggregate per suite.
+
+    Returns ``(scored, summary)``. `scored` are the probe records with the ground truth, the
+    prediction and every score merged in -- the rows probes.csv writes. `summary` is the
+    nested ``case["accuracy"]``: per-suite overall rates, the per-task and per-depth
+    breakdowns, and the probe count.
+
+    Only what a case can score *alone* is done here. The retrieval suite has its own ground
+    truth, so it is fully scored; the generation suite gets its grounded `fact_coverage` now
+    and its fidelity columns later, in `_fill_generation_fidelity`, because those compare
+    against the baseline profile's answers and that case may not have run yet.
+
+    Scored in the parent because it holds the ground truth; the child only returned text.
+    """
+    by_coord = {s.coordinate: s for s in specs}
+    scored, by_suite = [], {}
+    for probe in probes:
+        coordinate = (probe.get("task"), _depth_label(probe.get("depth")), probe.get("sample"))
+        spec = by_coord.get(coordinate)
+        if spec is None:
+            continue
+        prediction = probe.get("prediction_text", "")
+        score = (
+            accuracy.score_grounding(prediction, spec)
+            if spec.suite == accuracy.SUITE_GENERATION
+            else accuracy.score_retrieval(prediction, spec)
+        )
+        row = {
+            **probe,
+            "suite": spec.suite,
+            "task": spec.task,
+            "truth": " | ".join(spec.truths),
+            "distractors": " | ".join(spec.distractors),
+            "prediction": prediction,
+            **score,
+        }
+        scored.append(row)
+        by_suite.setdefault(spec.suite, []).append(row)
+
+    return scored, {suite: _summarize_suite(suite, rows) for suite, rows in by_suite.items()}
+
+
+def _summarize_suite(suite: str, rows: list) -> dict:
+    """One suite's overall / per-task / per-depth aggregates.
+
+    The per-depth breakdown covers only the depth-swept tasks -- it is the NIAH matrix, and
+    folding in tasks that spread their needles by construction would put a column header on a
+    number that has no depth. The per-task breakdown covers everything, and is the table that
+    shows a profile holding `niah_single` while it loses `vt`.
+    """
+    fields = accuracy.metrics_for(suite)
+    summary = accuracy.aggregate(rows, fields)
+    summary["per_task"] = accuracy.group_aggregate(rows, fields, lambda r: r["task"])
+    swept = [r for r in rows if tasks.is_depth_swept(r["task"])]
+    summary["per_depth"] = accuracy.group_aggregate(
+        swept, fields, lambda r: _depth_label(r.get("depth"))
+    )
+    return summary
 
 
 def _format_case(case: dict) -> str:
@@ -1488,6 +1890,30 @@ def _format_case(case: dict) -> str:
             if stage and stage != trial_runner.STAGE_DECODED else ""
         )
         return f"  => {case['status'].upper()}{where}{detail}"
+    if case.get("accuracy"):
+        parts = []
+        retrieval = case["accuracy"].get(accuracy.SUITE_RETRIEVAL)
+        if retrieval:
+            parts.append(
+                f"retrieval recall {_acc_pct(retrieval.get('recall_rate'))} "
+                f"(EM {_acc_pct(retrieval.get('exact_match_rate'))}, "
+                f"F1 {_acc_pct(retrieval.get('token_f1'))}) over "
+                f"{retrieval.get('probe_count')} probes"
+            )
+        generation = case["accuracy"].get(accuracy.SUITE_GENERATION)
+        if generation:
+            # Fidelity columns are filled at report time, so this line shows what the case
+            # could score on its own plus whatever is already in hand.
+            parts.append(
+                f"generation ROUGE-L {_acc_pct(generation.get('rouge_l'))}, "
+                f"coverage {_acc_pct(generation.get('fact_coverage'))} over "
+                f"{generation.get('probe_count')} probes"
+            )
+        return (
+            f"  => {case['status'].upper()} | " + " | ".join(parts or ["no probes scored"])
+            + f" | TPOT {_fmt(case.get('other_tokens_avg_latency'))} ms/token "
+            f"| TTFT {_ttft_seconds(case)}s"
+        )
     line = (
         f"  => {case['status'].upper()} | TPOT {_fmt(case.get('other_tokens_avg_latency'))} ms/token "
         f"{_mtp_cell(case, prefix='| MTP ')}"
@@ -1628,6 +2054,451 @@ def _ttft_leaderboard(cases: list) -> list:
     )
 
 
+def _suite_summary(case: dict, suite: str) -> dict:
+    return (case.get("accuracy") or {}).get(suite) or {}
+
+
+def _accuracy_leaderboard(cases: list, suite: str = accuracy.SUITE_RETRIEVAL) -> list:
+    """Usable accuracy cases for one suite, best first.
+
+    The accuracy analog of `_leaderboard`: where the throughput ranking answers "which config
+    is fastest", this answers "which config is still right" -- the question the whole mode
+    exists for, and the one a quantized or MTP profile can lose while winning on TPOT.
+
+    Retrieval ranks by recall, then exact match, then token-F1. Recall is primary because it
+    is RULER's own scorer and is robust to a model that answers "the code is X" rather than
+    "X". Generation ranks by embedding similarity to the baseline, then ROUGE-L, then chrF --
+    semantic first, because a rewording that preserves the content is not the regression this
+    suite is hunting, and the lexical scores are there to catch the case where similarity is
+    the metric being fooled.
+    """
+    keys = (
+        ("similarity", "rouge_l", "chrf") if suite == accuracy.SUITE_GENERATION
+        else ("recall_rate", "exact_match_rate", "token_f1")
+    )
+    # Ranked on *any* of the keys, not just the first: the generation suite's primary key is
+    # the embedding similarity, and that column is empty whenever who_what_benchmark is not
+    # installed. Requiring it would leave the whole leaderboard -- and the "largest drift"
+    # finding the suite exists to surface -- silently empty on the common install.
+    ranked = [
+        c for c in cases
+        if c.get("status") == "ok"
+        and any(_suite_summary(c, suite).get(k) is not None for k in keys)
+    ]
+    return sorted(
+        ranked,
+        key=lambda c: tuple(-(_suite_summary(c, suite).get(k) or 0.0) for k in keys),
+    )
+
+
+def _baseline_case(cases: list, settings: dict):
+    """The case the deltas and the fidelity references are taken from, or None.
+
+    `cases` is one context group: a baseline is per (model, context), because a profile's
+    answers are only comparable with another profile's on the identical prompt.
+    """
+    name = (settings.get("accuracy") or {}).get("baseline_profile")
+    if not name:
+        return None
+    return next(
+        (c for c in cases if c["profile"] == name and c.get("status") == "ok"), None
+    )
+
+
+def _context_groups(cases: list) -> dict:
+    groups = {}
+    for case in cases:
+        if case.get("accuracy"):
+            groups.setdefault((case["model"], case["context_tokens"]), []).append(case)
+    return groups
+
+
+def _fill_accuracy_deltas(cases: list, settings: dict) -> None:
+    """Attach each suite's per-metric delta against the baseline profile.
+
+    Computed here rather than in `_run_case` because the baseline profile's own case may not
+    have run yet when a given case finishes; by report time the whole context group is in hand.
+    A negative delta on recall is a profile retrieving less often than the baseline precision.
+    """
+    for group in _context_groups(cases).values():
+        baseline = _baseline_case(group, settings)
+        if baseline is None:
+            continue
+        for case in group:
+            # Over the known suite names, not over whatever keys the dict happens to hold:
+            # `case["accuracy"]` is suite-keyed by contract, and walking it blindly is how a
+            # stray scalar in there becomes an AttributeError at the end of a long run.
+            for suite in (accuracy.SUITE_RETRIEVAL, accuracy.SUITE_GENERATION):
+                summary = _suite_summary(case, suite)
+                base = _suite_summary(baseline, suite)
+                if summary and base:
+                    summary["deltas"] = accuracy.delta(
+                        summary, base, accuracy.metrics_for(suite)
+                    )
+
+
+def _fill_generation_fidelity(cases: list, settings: dict) -> None:
+    """Score every generation probe against the baseline profile's answer to the same prompt.
+
+    This is the WWB measurement and it is inherently cross-case, which is why it cannot happen
+    in `_run_case`: the reference is another profile's output, and that profile may run after
+    this one. By report time the whole (model, context) group is in hand, so each probe is
+    paired with the baseline's probe of the same `(task, depth, sample)` -- the identical
+    prompt, by construction, because the specs are seeded from those coordinates.
+
+    Idempotent: `write_reports` runs after every case, so this re-scores the group each time
+    rather than accumulating. That is also what makes the report correct mid-run -- a case
+    measured before the baseline gets its fidelity columns as soon as the baseline lands.
+    """
+    if not any(
+        accuracy.SUITE_GENERATION in (c.get("accuracy") or {}) for c in cases
+    ):
+        return
+    embedding_model = (settings.get("accuracy") or {}).get("embedding_model")
+
+    for (model, _context), group in _context_groups(cases).items():
+        baseline = _baseline_case(group, settings)
+        if baseline is None:
+            continue
+        references = {
+            _probe_key(p): p.get("prediction", "")
+            for p in baseline.get("_probes", [])
+            if p.get("suite") == accuracy.SUITE_GENERATION
+        }
+        if not references:
+            continue
+        encode = _answer_encoder(baseline.get("_model_dir"))
+        reference_ids = {key: encode(text) for key, text in references.items()}
+
+        for case in group:
+            paired = [
+                probe for probe in case.get("_probes", [])
+                if probe.get("suite") == accuracy.SUITE_GENERATION
+                and _probe_key(probe) in references
+            ]
+            for probe in paired:
+                key = _probe_key(probe)
+                probe.update(accuracy.score_fidelity(
+                    probe.get("prediction", ""), references[key],
+                    prediction_ids=encode(probe.get("prediction", "")),
+                    reference_ids=reference_ids[key],
+                ))
+            if not paired:
+                pass
+            elif embedding_model:
+                result = accuracy.fill_similarity(
+                    paired, [references[_probe_key(p)] for p in paired], embedding_model
+                )
+                if not result.available:
+                    _note_similarity_unavailable(settings, result.reason)
+            else:
+                _note_similarity_unavailable(
+                    settings,
+                    "accuracy.embedding_model is null, so the semantic column was switched "
+                    "off deliberately. The lexical (ROUGE/chrF) and token-exact (FDT/SDT) "
+                    "fidelity columns are unaffected.",
+                )
+            _resummarize_generation(case)
+        _note_fidelity_tokenizer(settings, model, encode)
+
+
+def _probe_key(probe: dict) -> tuple:
+    return (probe.get("task"), _depth_label(probe.get("depth")), probe.get("sample"))
+
+
+def _resummarize_generation(case: dict) -> None:
+    """Rebuild the generation suite's aggregates now that the fidelity columns exist."""
+    rows = [
+        p for p in case.get("_probes", [])
+        if p.get("suite") == accuracy.SUITE_GENERATION
+    ]
+    if rows:
+        case["accuracy"][accuracy.SUITE_GENERATION] = _summarize_suite(
+            accuracy.SUITE_GENERATION, rows
+        )
+
+
+# One loaded tokenizer per model directory: FDT/SDT are defined over model tokens, and
+# re-reading a tokenizer for every probe in the sweep would dominate the scoring pass.
+_ANSWER_ENCODERS: dict = {}
+
+
+def _answer_encoder(model_dir):
+    """A `text -> token ids` function for FDT/SDT, falling back to normalized words.
+
+    FDT/SDT are token metrics, so the model's own tokenizer is the right unit and is what
+    who_what_benchmark uses. But the accuracy path is otherwise runnable with nothing
+    installed, and a report that refuses to compute a lexical metric because transformers is
+    missing would be worse than one that computes it over words and says so -- the *shape* of
+    the finding ("these two answers diverged after 3 units of 200") survives the change of
+    unit. `_note_fidelity_tokenizer` records which was used.
+    """
+    if model_dir in _ANSWER_ENCODERS:
+        return _ANSWER_ENCODERS[model_dir]
+
+    encoder = None
+    if model_dir:
+        try:
+            tokenizer = trial_runner._load_tokenizer(model_dir)
+            encoder = lambda text: list(  # noqa: E731 - a named def buys nothing here
+                tokenizer.encode(text or "", add_special_tokens=False)
+            )
+            encoder.unit = "model tokens"
+        except Exception as exc:  # noqa: BLE001 - an optional unit must not end the run
+            print(
+                f"  [warn] could not load the tokenizer at {model_dir} for FDT/SDT "
+                f"({type(exc).__name__}: {exc}); falling back to word-level divergence",
+                flush=True,
+            )
+            encoder = None
+    if encoder is None:
+        # `lexical_tokens`, not the SQuAD `tokens`: the latter drops articles, which would
+        # make "on a mat" and "on the mat" identical and report a divergence as agreement.
+        encoder = lambda text: scoring.lexical_tokens(text)  # noqa: E731
+        encoder.unit = "words"
+    _ANSWER_ENCODERS[model_dir] = encoder
+    return encoder
+
+
+def _note_fidelity_tokenizer(settings: dict, model: str, encode) -> None:
+    settings.setdefault("_fidelity_units", {})[model] = encode.unit
+
+
+def _note_similarity_unavailable(settings: dict, reason) -> None:
+    if reason:
+        settings.setdefault("_similarity_notes", set()).add(reason)
+
+
+def _acc_pct(value) -> str:
+    return f"{value * 100:.0f}%" if isinstance(value, (int, float)) else "--"
+
+
+def _acc_delta_pp(value) -> str:
+    """A delta as signed percentage points, e.g. -12pp; '--' when it was not computed."""
+    if not isinstance(value, (int, float)):
+        return "--"
+    return f"{value * 100:+.0f}pp"
+
+
+def _acc_num(value, spec="{:.2f}") -> str:
+    return spec.format(value) if isinstance(value, (int, float)) else "--"
+
+
+def _ordered_cases(cases: list, suite: str) -> list:
+    """Every case carrying `suite`, best first, with the unrankable ones kept at the end.
+
+    Identity, not equality: two profiles can produce byte-identical rows, and `in` on dicts
+    would drop the duplicate from the report entirely -- the same reason the throughput table
+    ranks by `id`.
+    """
+    ranked = _accuracy_leaderboard(cases, suite)
+    ranked_ids = {id(c) for c in ranked}
+    return ranked + [
+        c for c in cases if id(c) not in ranked_ids and _suite_summary(c, suite)
+    ]
+
+
+def _accuracy_section(cases: list, context: int, settings: dict) -> list:
+    """Every accuracy table for one context, one section per suite that ran."""
+    lines = []
+    for suite in settings["accuracy"]["suites"]:
+        if not any(_suite_summary(c, suite) for c in cases):
+            continue
+        lines += (
+            _generation_section(cases, context, settings)
+            if suite == accuracy.SUITE_GENERATION
+            else _retrieval_section(cases, context, settings)
+        )
+    return lines
+
+
+def _retrieval_section(cases: list, context: int, settings: dict) -> list:
+    """RULER accuracy for one context: a per-task table, then the NIAH depth matrix.
+
+    Two tables rather than one because they answer different questions. The per-task table is
+    the headline -- a profile can hold `niah_single` at 100% and collapse on `vt` or `cwe`,
+    and that is precisely the regression a single-needle number used to hide. The depth matrix
+    is the classic NIAH presentation and covers only the depth-swept tasks, because a probe
+    that spreads eight needles by construction has no depth to put in a column.
+    """
+    section = settings["accuracy"][accuracy.SUITE_RETRIEVAL]
+    baseline_name = settings["accuracy"].get("baseline_profile")
+    ordered = _ordered_cases(cases, accuracy.SUITE_RETRIEVAL)
+    task_names = section["tasks"]
+
+    lines = [
+        f"## {context:,} tokens -- Retrieval Accuracy (RULER)",
+        "",
+        "Synthetic probes with known answers, following RULER: `niah_*` plant high-entropy "
+        "codes (one, one among decoys, all values of a key, one value of every key), `vt` "
+        "chains variable assignments that have to be traced to the end, `cwe`/`fwe` replace "
+        "the transcript with a word list that has to be **counted** rather than searched, and "
+        "`qa` asks a natural-language question about a planted paragraph. Cells are the "
+        "task's own RULER score: share of ground-truth items found, "
+        "intersection-over-union for the aggregation tasks. "
+        + (
+            f"`Delta` is the overall recall gap to the baseline profile `{baseline_name}` -- "
+            "a negative value is accuracy that row's speed cost."
+            if baseline_name else ""
+        ),
+        "",
+        f"| Profile | Pipeline | MTP | {' | '.join(task_names)} | Overall | EM | F1 | "
+        f"Decoys | Delta vs {baseline_name or '--'} |",
+        "|---|---|---|" + "|".join(["---"] * len(task_names)) + "|---|---|---|---|---|",
+    ]
+    for case in ordered:
+        summary = _suite_summary(case, accuracy.SUITE_RETRIEVAL)
+        per_task = summary.get("per_task", {})
+        cells = [
+            _acc_pct((per_task.get(task) or {}).get("recall_rate")) for task in task_names
+        ]
+        lines.append(
+            f"| {case['profile']} | {case.get('pipeline_mode') or '--'} "
+            f"| {_mtp_cell(case, empty='off').strip() or 'off'} | "
+            + " | ".join(cells)
+            + f" | {_acc_pct(summary.get('recall_rate'))} "
+            f"| {_acc_pct(summary.get('exact_match_rate'))} "
+            f"| {_acc_pct(summary.get('token_f1'))} "
+            f"| {_acc_pct(summary.get('distractor_rate'))} "
+            f"| {_acc_delta_pp((summary.get('deltas') or {}).get('recall_rate_delta'))} |"
+        )
+    lines += [
+        "",
+        "`Decoys` is the share of *planted decoy* values that wrongly appeared in an answer, "
+        "over the tasks that plant them (`niah_multikey`, `vt`) -- lower is better. It is the "
+        "precision signal recall cannot give: a profile losing precision does not stop "
+        "answering, it starts answering with the wrong key's value.",
+        "",
+    ]
+    lines += _depth_matrix(ordered, section, baseline_name)
+
+    ranked = _accuracy_leaderboard(cases, accuracy.SUITE_RETRIEVAL)
+    if ranked:
+        best = _suite_summary(ranked[0], accuracy.SUITE_RETRIEVAL)
+        lines += [
+            f"**Best retrieval at {context:,} tokens: `{ranked[0]['profile']}`** on "
+            f"{ranked[0]['model']} -- recall {_acc_pct(best.get('recall_rate'))}, exact match "
+            f"{_acc_pct(best.get('exact_match_rate'))}, token-F1 "
+            f"{_acc_pct(best.get('token_f1'))} over {best.get('probe_count')} probes.",
+            "",
+        ]
+    return lines
+
+
+def _depth_matrix(ordered: list, section: dict, baseline_name) -> list:
+    """The classic NIAH depth x profile matrix, over the depth-swept tasks only."""
+    depths = section["depths"]
+    swept = [t for t in section["tasks"] if tasks.is_depth_swept(t)]
+    if not swept or not depths:
+        return []
+    header = " | ".join(f"d={_depth_label(d)}" for d in depths)
+    lines = [
+        "### Depth sweep",
+        "",
+        f"Recall by where the fact was planted, over {', '.join(swept)} -- 0.00 is the very "
+        "top of the transcript (furthest from the question) and 1.00 the very bottom. A "
+        "profile that holds the bottom and loses the top has a context window shorter than "
+        "the one it was given.",
+        "",
+        f"| Profile | {header} |",
+        "|---|" + "|".join(["---"] * len(depths)) + "|",
+    ]
+    for case in ordered:
+        per_depth = _suite_summary(case, accuracy.SUITE_RETRIEVAL).get("per_depth", {})
+        cells = [
+            _acc_pct((per_depth.get(_depth_label(d)) or {}).get("recall_rate")) for d in depths
+        ]
+        lines.append(f"| {case['profile']} | " + " | ".join(cells) + " |")
+    lines.append("")
+    return lines
+
+
+def _generation_section(cases: list, context: int, settings: dict) -> list:
+    """WWB-style fidelity for one context: each profile's real-task output against the
+    baseline profile's output on the identical prompt.
+
+    Three families of number side by side, because each is blind to something the next one
+    catches. `Similarity` is who_what_benchmark's embedding cosine -- semantic, so a
+    reworded but equivalent answer scores near 1.0. `ROUGE`/`chrF` are lexical, so they fall
+    when the wording changes even if the meaning did not. `FDT`/`SDT` are token-exact, and
+    are the only ones that can say greedy decoding stopped being reproducible at token 3.
+    Reporting only the first would call a visibly reworded answer "lossless"; reporting only
+    the last would call a legitimate tie-break "a regression".
+    """
+    baseline_name = settings["accuracy"].get("baseline_profile")
+    ordered = _ordered_cases(cases, accuracy.SUITE_GENERATION)
+    unit = (settings.get("_fidelity_units") or {}).get(
+        ordered[0]["model"] if ordered else None, "tokens"
+    )
+
+    lines = [
+        f"## {context:,} tokens -- Generation Fidelity (who_what_benchmark)",
+        "",
+        "The model does the **real** task -- summarize the lesson, explain a relationship, "
+        "list the recorded codes -- at a realistic answer length, and its answer is compared "
+        f"with the answer the baseline profile `{baseline_name or '--'}` gave to the "
+        "identical prompt. This is the measurement retrieval cannot make: a profile can "
+        "return every planted code and still write worse prose.",
+        "",
+        f"| Profile | Pipeline | MTP | Similarity | ROUGE-1 | ROUGE-2 | ROUGE-L | chrF "
+        f"| FDT ({unit}) | SDT norm | Identical | Coverage |",
+        "|---|---|---|---|---|---|---|---|---|---|---|---|",
+    ]
+    for case in ordered:
+        summary = _suite_summary(case, accuracy.SUITE_GENERATION)
+        lines.append(
+            f"| {case['profile']} | {case.get('pipeline_mode') or '--'} "
+            f"| {_mtp_cell(case, empty='off').strip() or 'off'} "
+            f"| {_acc_num(summary.get('similarity'), '{:.4f}')} "
+            f"| {_acc_num(summary.get('rouge1'))} | {_acc_num(summary.get('rouge2'))} "
+            f"| {_acc_num(summary.get('rouge_l'))} | {_acc_num(summary.get('chrf'))} "
+            f"| {_acc_num(summary.get('fdt'), '{:.1f}')} "
+            f"| {_acc_num(summary.get('sdt_norm'))} "
+            f"| {_acc_pct(summary.get('identical_rate'))} "
+            f"| {_acc_pct(summary.get('fact_coverage'))} |"
+        )
+    lines += [
+        "",
+        "**Similarity** is who_what_benchmark's embedding cosine (1.0 = same meaning); "
+        "**ROUGE-1/2/L** and **chrF** are lexical overlap with the baseline answer (1.0 = "
+        "same words); **FDT** is how many "
+        f"{unit} the two agreed on before they first differed, and **SDT norm** the share of "
+        "the baseline answer that differs (lower is better). **Identical** is the share of "
+        "probes whose output matched the baseline byte for byte -- the old `output_sha256` "
+        "check, now with the graded columns that say *how far* the rest drifted. "
+        "**Coverage** is the share of planted facts the `fact_sheet` answers named, and is "
+        "the one column here scored against real ground truth rather than another model's "
+        "output.",
+        "",
+        f"The baseline row `{baseline_name or '--'}` compares against itself, so its "
+        "similarity is 1.0 and its FDT the full answer length. That row is the sanity check, "
+        "not a result.",
+        "",
+    ]
+    for note in sorted(settings.get("_similarity_notes") or ()):
+        lines += [f"> **Similarity not measured.** {note}", ""]
+
+    ranked = _accuracy_leaderboard(cases, accuracy.SUITE_GENERATION)
+    drifted = [c for c in ranked if c["profile"] != baseline_name]
+    if drifted:
+        worst = _suite_summary(drifted[-1], accuracy.SUITE_GENERATION)
+        # The similarity clause is dropped rather than printed as "--": a sentence that reads
+        # "similarity --, ROUGE-L 0.37" invites the reader to treat the dash as a low score.
+        semantic = (
+            f"similarity {_acc_num(worst.get('similarity'), '{:.4f}')}, "
+            if worst.get("similarity") is not None else ""
+        )
+        lines += [
+            f"**Largest drift at {context:,} tokens: `{drifted[-1]['profile']}`** -- "
+            f"{semantic}ROUGE-L {_acc_num(worst.get('rouge_l'))}, chrF "
+            f"{_acc_num(worst.get('chrf'))}, first divergence after "
+            f"{_acc_num(worst.get('fdt'), '{:.1f}')} {unit} over "
+            f"{worst.get('probe_count')} probes.",
+            "",
+        ]
+    return lines
+
+
 def _mtp_speedup(cases: list) -> str | None:
     """The one sentence an MTP sweep exists to produce, or None when it cannot be formed.
 
@@ -1709,6 +2580,15 @@ def write_reports(output_dir: str, settings: dict, cases: list, platform_info: d
     described an earlier run -- reporting a PASS at 160K that the real trials had just
     disproved. A stale report that looks current is worse than none.
     """
+    # The generation suite's fidelity scores and every delta need the whole context group,
+    # which only exists at report time -- fill them before summary.json is built so the
+    # structured output and probes.csv carry them too.
+    accuracy_mode = any(c.get("accuracy") for c in cases)
+    if accuracy_mode:
+        _fill_generation_fidelity(cases, settings)
+        _fill_accuracy_deltas(cases, settings)
+        _write_probes(output_dir, cases)
+
     summary = {
         "generated_at": datetime.now().isoformat(timespec="seconds"),
         "completed": completed,
@@ -1720,6 +2600,7 @@ def write_reports(output_dir: str, settings: dict, cases: list, platform_info: d
         "iterations": settings["iterations"],
         "max_system_memory_pct": settings["max_system_memory_pct"],
         "gpu_memory_budget_gb": settings["gpu_memory_budget_gb"],
+        "accuracy": settings.get("accuracy"),
         "hardware": platform_info,
         "cases": [{k: v for k, v in c.items() if not k.startswith("_")} for c in cases],
     }
@@ -1740,49 +2621,93 @@ def write_reports(output_dir: str, settings: dict, cases: list, platform_info: d
         "",
     ]
     lines = [
-        "# Long-Context Benchmark Summary",
+        "# Long-Context Retrieval Accuracy Summary" if accuracy_mode
+        else "# Long-Context Benchmark Summary",
         "",
         *banner,
         f"Generated: {summary['generated_at']}",
         "",
         f"Hardware: {platform_info.get('Processor', '--')}, {platform_info.get('Memory', '--')} RAM, "
         f"{platform_info.get('iGPU', '--')}",
-        f"Device: {settings['device']} | Weights: {settings['weight_format']} | "
-        f"Output: {settings['output_tokens']} tokens | "
-        f"{settings['warmup']} warmup + {settings['iterations']} measured iterations",
+        f"Device: {settings['device']} | Weights: {settings['weight_format']}",
         f"Budgets: system RAM <= {settings['max_system_memory_pct']:g}%, "
         f"GPU <= {settings['gpu_memory_budget_gb']:g} GB",
         "",
-        "Latencies are milliseconds and throughputs tokens/second, in llm_bench's units. "
-        "Every figure is the **median** of the measured iterations; the warm-up is excluded. "
-        "Profiles are ranked by TPOT (lower is better), with TTFT as the tie-breaker; because "
-        "TTFT dominates the wall clock at long context, the fastest TTFT is called out "
-        "separately under each table.",
-        "",
-        "The `Pipeline` column is the measured variable when a config ships both a `stateful` "
-        "and a `paged` profile: `stateful` prefills the whole context in one SDPA pass and has "
-        "no KV pool to size, `paged` runs continuous batching with the `cache_size` shown.",
-        "",
-        "The `MTP` column is the measured variable when a config sweeps multi-token "
-        "prediction: `k` is how many candidates the model's own draft head offered per step, "
-        "`tok/step` is how many output tokens each main-model verification pass actually "
-        "produced, and `% accepted` is the share of those candidates that survived. A profile "
-        "with MTP off yields exactly 1.00 tok/step by definition. MTP only runs on the paged "
-        "pipeline and only shortens decode -- expect TPOT to move and TTFT not to.",
-        "",
-        "Memory is reported as **peak / mean**, and the two are not interchangeable. Peak is "
-        "the high-water mark over the whole case, load included, and is what decides whether "
-        "the box can run the configuration at all -- it is set by the transient prefill "
-        "workspace. Mean is the time-weighted average over the measured iterations only, so it "
-        "excludes model load, and is what the configuration costs for the minutes it actually "
-        "runs -- the figure to use when the same budget has to hold the rest of the "
-        "application. A large peak/mean gap is a spiky workload, not a cheap one.",
-        "",
     ]
+    if accuracy_mode:
+        acc = settings["accuracy"]
+        lines += [
+            "This is an **accuracy** run, not a throughput one: instead of timing generation "
+            "it asks whether each profile still *uses* the long context correctly after "
+            "whatever KV quantization, weight compression or speculative decoding bought its "
+            "speed. Two suites, measuring things that fail independently:",
+            "",
+        ]
+        if acc.get(accuracy.SUITE_RETRIEVAL):
+            retrieval = acc[accuracy.SUITE_RETRIEVAL]
+            lines += [
+                f"* **Retrieval** ({', '.join(retrieval['tasks'])}) -- RULER's synthetic "
+                "probes, scored against known ground truth. Retrieval, multi-hop tracing and "
+                "aggregation are separate behaviours, and a profile can hold one while losing "
+                f"another. {retrieval['samples']} sample(s) per task, depth-swept tasks also "
+                f"across {len(retrieval['depths'])} depth(s), answers capped at "
+                f"{retrieval['output_tokens']} tokens.",
+            ]
+        if acc.get(accuracy.SUITE_GENERATION):
+            generation = acc[accuracy.SUITE_GENERATION]
+            lines += [
+                f"* **Generation fidelity** ({', '.join(generation['tasks'])}) -- the real "
+                "classroom task at "
+                f"{generation['output_tokens']} tokens, scored the way "
+                "who_what_benchmark scores a compressed model: against the baseline "
+                f"profile's own answer to the identical prompt. "
+                f"{generation['samples']} prompt(s) per task.",
+            ]
+        lines += [
+            "",
+            "`Delta` columns compare each profile against the baseline profile "
+            f"`{acc.get('baseline_profile') or '--'}`, so a quantization- or MTP-induced loss "
+            "reads as a negative number next to whatever speed that profile bought. Every "
+            "probe -- its planted ground truth, the model's answer and all of its scores -- "
+            "is a row in `probes.csv`.",
+            "",
+        ]
+    else:
+        lines += [
+            "Latencies are milliseconds and throughputs tokens/second, in llm_bench's units. "
+            "Every figure is the **median** of the measured iterations; the warm-up is excluded. "
+            "Profiles are ranked by TPOT (lower is better), with TTFT as the tie-breaker; "
+            "because TTFT dominates the wall clock at long context, the fastest TTFT is called "
+            "out separately under each table.",
+            "",
+            "The `Pipeline` column is the measured variable when a config ships both a "
+            "`stateful` and a `paged` profile: `stateful` prefills the whole context in one SDPA "
+            "pass and has no KV pool to size, `paged` runs continuous batching with the "
+            "`cache_size` shown.",
+            "",
+            "The `MTP` column is the measured variable when a config sweeps multi-token "
+            "prediction: `k` is how many candidates the model's own draft head offered per step, "
+            "`tok/step` is how many output tokens each main-model verification pass actually "
+            "produced, and `% accepted` is the share of those candidates that survived. A "
+            "profile with MTP off yields exactly 1.00 tok/step by definition. MTP only runs on "
+            "the paged pipeline and only shortens decode -- expect TPOT to move and TTFT not to.",
+            "",
+            "Memory is reported as **peak / mean**, and the two are not interchangeable. Peak is "
+            "the high-water mark over the whole case, load included, and is what decides whether "
+            "the box can run the configuration at all -- it is set by the transient prefill "
+            "workspace. Mean is the time-weighted average over the measured iterations only, so "
+            "it excludes model load, and is what the configuration costs for the minutes it "
+            "actually runs -- the figure to use when the same budget has to hold the rest of the "
+            "application. A large peak/mean gap is a spiky workload, not a cheap one.",
+            "",
+        ]
 
     for context in settings["context_tokens"]:
         at_context = [c for c in cases if c["context_tokens"] == context]
         if not at_context:
+            continue
+        if accuracy_mode:
+            lines += _accuracy_section(at_context, context, settings)
             continue
         lines += [
             f"## {context:,} tokens",
@@ -1889,6 +2814,71 @@ def _append_iterations(output_dir: str, case: dict) -> None:
         StorageManager.save_csv(path, row, headers=ITERATION_CSV_FIELDS, append=True)
 
 
+def _write_probes(output_dir: str, cases: list) -> None:
+    """One row per scored accuracy probe -- the accuracy analog of `iterations.csv`.
+
+    Rewritten in full on every report pass rather than appended per case, which is what
+    `summary.csv` does and what the generation suite requires: a probe's fidelity columns are
+    filled once the baseline profile's case has run, so a row appended when its case finished
+    would be missing the scores that arrive later. Only accuracy cases carry `_probes`, so a
+    throughput run never creates the file.
+    """
+    path = os.path.join(output_dir, "probes.csv")
+    written = 0
+    for case in cases:
+        for record in case.get("_probes", []):
+            row = {
+                "model": case["model"],
+                "profile": case["profile"],
+                "context_tokens": case["context_tokens"],
+                **{
+                    field: record.get(field)
+                    for field in PROBE_CSV_FIELDS
+                    if field not in ("model", "profile", "context_tokens")
+                },
+            }
+            StorageManager.save_csv(
+                path, row, headers=PROBE_CSV_FIELDS,
+                append=written > 0,  # the first row truncates the previous rewrite
+            )
+            written += 1
+
+
+def _print_accuracy_result(at_context: list, context: int, settings: dict) -> None:
+    """The console counterpart of the summary.md accuracy sections: the best profile per
+    suite, and the largest fidelity drift, which is the finding the run exists to surface."""
+    baseline_name = (settings.get("accuracy") or {}).get("baseline_profile")
+
+    best = _accuracy_leaderboard(at_context, accuracy.SUITE_RETRIEVAL)
+    if best:
+        summary = _suite_summary(best[0], accuracy.SUITE_RETRIEVAL)
+        print(
+            f"\nBest retrieval at {context:,} tokens: {best[0]['profile']} on "
+            f"{best[0]['model']} -- recall {_acc_pct(summary.get('recall_rate'))}, exact "
+            f"match {_acc_pct(summary.get('exact_match_rate'))}, F1 "
+            f"{_acc_pct(summary.get('token_f1'))} over {summary.get('probe_count')} probes",
+            flush=True,
+        )
+
+    ranked = _accuracy_leaderboard(at_context, accuracy.SUITE_GENERATION)
+    drifted = [c for c in ranked if c["profile"] != baseline_name]
+    if drifted:
+        worst = _suite_summary(drifted[-1], accuracy.SUITE_GENERATION)
+        semantic = (
+            f"similarity {_acc_num(worst.get('similarity'), '{:.4f}')}, "
+            if worst.get("similarity") is not None else ""
+        )
+        print(
+            f"Largest generation drift at {context:,} tokens: {drifted[-1]['profile']} vs "
+            f"{baseline_name} -- {semantic}ROUGE-L {_acc_num(worst.get('rouge_l'))}, "
+            f"chrF {_acc_num(worst.get('chrf'))}, "
+            f"identical {_acc_pct(worst.get('identical_rate'))}",
+            flush=True,
+        )
+    for note in sorted(settings.get("_similarity_notes") or ()):
+        print(f"Similarity not measured: {note}", flush=True)
+
+
 def _safe_platform_info() -> dict:
     """Collect report metadata without WMI/COM calls.
 
@@ -1918,6 +2908,40 @@ def _safe_platform_info() -> dict:
     return info
 
 
+def _print_accuracy_plan(settings: dict) -> None:
+    """What `--accuracy` will actually run, before anything loads.
+
+    The probe count is the number that decides whether this is a ten-minute run or an
+    overnight one -- `--list-profiles` exists so that is knowable in advance, and the full
+    RULER suite across a depth sweep multiplies faster than it looks.
+    """
+    acc = settings["accuracy"]
+    total = 0
+    print(f"\nAccuracy mode -- suites: {', '.join(acc['suites'])}")
+    for suite in acc["suites"]:
+        section = acc[suite]
+        count = sum(
+            (len(section["depths"]) if tasks.is_depth_swept(task) else 1) * section["samples"]
+            for task in section["tasks"]
+        )
+        total += count
+        print(
+            f"  {suite}: {count} probe(s) per case -- {', '.join(section['tasks'])}; "
+            f"{section['samples']} sample(s), depths {section['depths']} "
+            f"(depth-swept tasks only), {section['output_tokens']} output tokens"
+        )
+    print(
+        f"  {total} probe(s) per case x "
+        f"{len(settings['models']) * len(settings['context_tokens']) * len(settings['profiles'])}"
+        f" case(s); baseline {acc.get('baseline_profile') or '(none)'}"
+    )
+    if acc.get("embedding_model"):
+        print(
+            f"  similarity: {acc['embedding_model']} via who_what_benchmark "
+            "(optional -- the column reports '--' if it is not installed)"
+        )
+
+
 # ---------------------------------------------------------------------------
 def main() -> None:
     args = _parse_args()
@@ -1942,6 +2966,8 @@ def main() -> None:
                 + (format_config(profile["scheduler"]) if profile["scheduler"] else "(none)")
             )
             print(f"    mtp:       {format_mtp(profile['mtp'], settings['device'])}")
+        if settings.get("accuracy"):
+            _print_accuracy_plan(settings)
         return
 
     _preflight_environment_check()
@@ -1998,6 +3024,8 @@ def main() -> None:
                     print(_format_case(case), flush=True)
                     cases.append(case)
                     _append_iterations(output_dir, case)
+                    # probes.csv is rewritten inside write_reports, not appended here: the
+                    # generation suite's fidelity columns are filled across cases.
                     write_reports(output_dir, settings, cases, platform_info, completed=False)
         completed = True
     finally:
@@ -2008,8 +3036,12 @@ def main() -> None:
         except Exception:  # noqa: BLE001 - must not mask whatever is already unwinding
             traceback.print_exc()
         else:
+            accuracy_mode = settings.get("accuracy") is not None
             for context in settings["context_tokens"]:
                 at_context = [case for case in cases if case.get("context_tokens") == context]
+                if accuracy_mode:
+                    _print_accuracy_result(at_context, context, settings)
+                    continue
                 ranked = _leaderboard(at_context)
                 if ranked:
                     print(
@@ -2033,9 +3065,14 @@ def main() -> None:
                 output_check = _mtp_output_check(at_context)
                 if output_check:
                     print(output_check.replace("**", "").replace("`", ""), flush=True)
+            artifacts = (
+                "probes.csv, summary.csv, summary.md, summary.json"
+                if accuracy_mode
+                else "iterations.csv, summary.csv, summary.md, summary.json"
+            )
             print(
-                f"Reports written to {output_dir} (iterations.csv, summary.csv, summary.md, "
-                "summary.json)" + ("" if completed else " -- run ended early, marked incomplete"),
+                f"Reports written to {output_dir} ({artifacts})"
+                + ("" if completed else " -- run ended early, marked incomplete"),
                 flush=True,
             )
 

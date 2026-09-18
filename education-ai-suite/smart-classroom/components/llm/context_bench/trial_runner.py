@@ -44,7 +44,20 @@ import time
 import traceback
 
 from components.llm.context_bench import metrics
-from components.llm.context_bench.context_builder import build_benchmark_prompt
+from components.llm.context_bench.context_builder import (
+    build_benchmark_prompt,
+    build_probe_prompt,
+)
+
+# How far an accuracy probe's prompt may land from the configured context length.
+#
+# Not a loosening of the throughput path's exactness -- that stays at zero. A probe prompt has
+# two tokenizer seams per planted insert (thirty-four on a `vt` probe), and the size correction
+# moves one number against the sum of all that drift, so it can orbit the target by a token
+# indefinitely. Throughput divides by the token count and so needs it exact; a retrieval
+# verdict does not -- finding a code planted at depth 0.25 of an 8,000-token context is the
+# same question at 8,016. The count actually used is what gets recorded and divided by.
+PROBE_TOKEN_TOLERANCE = 16
 
 # Text that says outright that memory was never handed over. Includes OpenCL's own
 # vocabulary, because at the capacity ceiling the exception is the GPU plugin's, not
@@ -514,8 +527,10 @@ def run_case(
     ov_config: dict | None = None,
     scheduler_config: dict | None = None,
     mtp: dict | None = None,
+    probes: list | None = None,
 ) -> None:
-    """Load once, generate ``warmup + iterations`` times, report each one.
+    """Load once, then either time ``warmup + iterations`` generations or run the accuracy
+    probes, and report each one.
 
     Messages posted to `result_queue`:
       ``device``          plugin diagnostics, before anything is loaded
@@ -523,8 +538,18 @@ def run_case(
       ``prompt``          context tokenized to exactly `context_tokens`
       ``iteration_start`` about to generate (parent opens a fresh memory window)
     ``prefilled``       first token produced (parent can distinguish decode failures)
-      ``iteration``       one completed generation, as a metrics.iteration_record
+      ``iteration``       one completed throughput generation, as a metrics.iteration_record
+      ``probe``           one completed accuracy probe: a metrics.iteration_record plus the
+                          suite/task/depth/sample coordinates and the generated answer text
       ``done``            terminal: every record, plus any error
+
+    `probes` selects the mode. ``None`` (the default) runs the throughput path unchanged:
+    one prompt, ``warmup + iterations`` timed generations, ``iteration`` events. A list of
+    ``{task, inserts, question, filler, depth, sample, output_tokens}`` dicts runs the
+    accuracy path instead: one prompt per probe, greedy generation, ``probe`` events carrying
+    the answer for the parent to score. The child never scores anything or imports the
+    accuracy module -- it only builds prompts and returns text, which is what lets a run be
+    re-scored without reloading the model.
 
     Does not return: every path exits via `_post_and_exit()`, which posts `done` and ends
     the process before OpenVINO's destructors can run. `pipe` is deliberately left alive.
@@ -538,6 +563,8 @@ def run_case(
         # Unknown until the prompt has been built and tokenized.
         "prompt_tokens": None,
         "iterations": [],
+        # Present on every run so the parent finds one shape; only the accuracy path fills it.
+        "probes": [],
         "stage_reached": STAGE_START,
         "error": None,
     }
@@ -571,6 +598,26 @@ def run_case(
         done["error"] = f"load:{classify_error(exc)}:{exc}"
         _post_and_exit(result_queue, done)
 
+    if probes is None:
+        _run_throughput_iterations(
+            pipe, accepts_tokenized_input, tokenizer, result_queue, done,
+            context_tokens, output_tokens, warmup, iterations, mtp,
+        )
+    else:
+        _run_accuracy_probes(
+            pipe, accepts_tokenized_input, tokenizer, result_queue, done,
+            context_tokens, output_tokens, warmup, mtp, probes,
+        )
+
+    # No `del pipe` / gc.collect() here on purpose -- see _post_and_exit().
+    _post_and_exit(result_queue, done)
+
+
+def _run_throughput_iterations(pipe, accepts_tokenized_input, tokenizer, result_queue, done,
+                               context_tokens, output_tokens, warmup, iterations, mtp) -> None:
+    """The default path: one prompt, ``warmup + iterations`` timed generations, `iteration`
+    events. Lifted unchanged from `run_case` -- it is the measurement contract the reports and
+    tests already pin, so nothing here should drift when the accuracy path changes."""
     import openvino_genai as ov_genai
 
     try:
@@ -681,5 +728,148 @@ def run_case(
         print(f"[trial_runner] {stage} failed: {traceback.format_exc()}", file=sys.stderr)
         done["error"] = f"{stage}:{classify_error(exc)}:{exc}"
 
-    # No `del pipe` / gc.collect() here on purpose -- see _post_and_exit().
-    _post_and_exit(result_queue, done)
+
+def _run_accuracy_probes(pipe, accepts_tokenized_input, tokenizer, result_queue, done,
+                         context_tokens, output_tokens, warmup, mtp, probes) -> None:
+    """The accuracy path: one prompt per probe, greedy generation, `probe` events.
+
+    Each probe is a *different* prompt -- its planted facts sit at their own depths, and the
+    aggregation tasks replace the haystack entirely -- so unlike the throughput path there is
+    no reused prompt and no prefix-cache hazard. The generated answer is shipped back verbatim
+    for the parent to score; scoring never happens here, which keeps this module free of the
+    accuracy scorer and lets a run be re-scored without reloading the model.
+
+    Decode length is per probe, not per case: a retrieval probe answers with a six-character
+    code and a generation probe writes a paragraph, and giving the first the second's budget
+    would spend most of the run decoding padding.
+    """
+    import openvino_genai as ov_genai
+
+    def _build(spec):
+        prompt, hf_tokens = build_probe_prompt(
+            tokenizer, context_tokens, spec["inserts"], spec["question"], spec.get("filler"),
+            tolerance=PROBE_TOKEN_TOLERANCE,
+        )
+        pipeline_input, prompt_tokens = prepare_pipeline_input(
+            pipe, prompt, accepts_tokenized_input
+        )
+        # The throughput path requires all three counts to agree exactly. Here they only have
+        # to agree within `PROBE_TOKEN_TOLERANCE` -- see build_probe_prompt for why exactness
+        # is the wrong contract for a retrieval verdict. Still checked, because a prompt off by
+        # *hundreds* of tokens means the builder or the split is broken, and that would change
+        # which part of the context the needle is in.
+        for source, count in (("huggingface", hf_tokens), ("openvino", prompt_tokens)):
+            if abs(count - context_tokens) > PROBE_TOKEN_TOLERANCE:
+                raise ValueError(
+                    f"Probe prompt token count mismatch: requested={context_tokens}, "
+                    f"{source}={count}, tolerance={PROBE_TOKEN_TOLERANCE}"
+                )
+        return pipeline_input, prompt_tokens
+
+    try:
+        warmup_config = generation_config(min(4, output_tokens), mtp)
+        assistant_tokens = (
+            mtp["num_assistant_tokens"] if (mtp or {}).get("enabled") else None
+        )
+
+        # Warm-up on the first probe's prompt: absorbs first-run kernel compilation the same
+        # way the throughput warm-up does, at the same prefill shape the probes will use. Not
+        # scored, not emitted as a probe.
+        for index in range(warmup):
+            warmup_input, _ = _build(probes[0])
+            result_queue.put({"event": "iteration_start", "iteration": index, "warmup": True})
+            pipe.generate(warmup_input, generation_config=warmup_config)
+
+        input_size_reported = False
+        for probe_index, spec in enumerate(probes):
+            index = warmup + probe_index
+            gen_config = generation_config(spec.get("output_tokens") or output_tokens, mtp)
+            try:
+                pipeline_input, prompt_tokens = _build(spec)
+            except ValueError as exc:
+                # One task's prompt geometry failing must not cost the probes that already ran
+                # or the ones still to come: the model is loaded and working, and a partial
+                # accuracy result is worth far more than none. Build errors only -- a failed
+                # generate() is a real pipeline failure and still aborts the case below.
+                print(
+                    f"[trial_runner] skipping probe {spec.get('task')} "
+                    f"#{spec.get('sample')}: {exc}",
+                    file=sys.stderr,
+                )
+                continue
+            done["prompt_tokens"] = prompt_tokens
+            done["stage_reached"] = STAGE_PROMPT_BUILT
+            result_queue.put({"event": "prompt", "prompt_tokens": prompt_tokens})
+            result_queue.put({"event": "iteration_start", "iteration": index, "warmup": False})
+
+            ttft_ms = None
+            t1 = time.perf_counter()
+
+            def _on_token(_: str):
+                nonlocal ttft_ms
+                if ttft_ms is None:
+                    ttft_ms = (time.perf_counter() - t1) * 1000.0
+                    done["stage_reached"] = STAGE_PREFILLED
+                    result_queue.put({"event": "prefilled", "iteration": index})
+                return ov_genai.StreamingStatus.RUNNING
+
+            result = pipe.generate(
+                pipeline_input, generation_config=gen_config, streamer=_on_token
+            )
+            wall_seconds = time.perf_counter() - t1
+            done["stage_reached"] = STAGE_DECODED
+
+            perf = read_perf_metrics(result)
+            output_size = perf.get("output_size") or generated_token_count(
+                result, pipe.get_tokenizer()
+            )
+            if not output_size:
+                raise RuntimeError("no_output: generate() produced no tokens")
+
+            input_size = perf.get("input_size") or prompt_tokens
+            if input_size != prompt_tokens and not input_size_reported:
+                input_size_reported = True
+                print(
+                    f"[trial_runner] runtime prefilled {input_size:,} tokens where the "
+                    f"prompt measured {prompt_tokens:,}; throughputs use the runtime's count.",
+                    file=sys.stderr,
+                )
+
+            prediction_text = generated_text(result)
+            record = metrics.iteration_record(
+                iteration=index,
+                input_size=input_size,
+                output_size=output_size,
+                generation_time=perf.get("generation_time", wall_seconds),
+                first_token_latency=perf.get("first_token_latency", ttft_ms),
+                other_tokens_avg_latency=perf.get("other_tokens_avg_latency"),
+                tokenization_time=perf.get("tokenization_time", 0.0),
+                detokenization_time=perf.get("detokenization_time", 0.0),
+                warmup=False,
+                num_assistant_tokens=assistant_tokens,
+                verification_steps=perf.get("verification_steps"),
+                mtp_acceptance_rate=perf.get("mtp_acceptance_rate"),
+                mtp_draft_tokens=perf.get("mtp_draft_tokens"),
+                mtp_accepted_tokens=perf.get("mtp_accepted_tokens"),
+                mtp_rejected_tokens=perf.get("mtp_rejected_tokens"),
+                mtp_draft_to_main_ratio=perf.get("mtp_draft_to_main_ratio"),
+                output_sha256=hashlib.sha256(prediction_text.encode("utf-8")).hexdigest(),
+            )
+            probe = {
+                **record,
+                # The coordinates the parent pairs this answer back to its spec with -- and,
+                # for the generation suite, to the baseline profile's answer to the same work.
+                "suite": spec.get("suite"),
+                "task": spec.get("task"),
+                "depth": spec.get("depth"),
+                "sample": spec["sample"],
+                "prompt_tokens": prompt_tokens,
+                # The answer, back to the parent to score against the ground truth it holds.
+                "prediction_text": prediction_text,
+            }
+            done["probes"].append(probe)
+            result_queue.put({"event": "probe", **probe})
+    except Exception as exc:  # noqa: BLE001
+        stage = failing_stage(done["stage_reached"])
+        print(f"[trial_runner] {stage} failed: {traceback.format_exc()}", file=sys.stderr)
+        done["error"] = f"{stage}:{classify_error(exc)}:{exc}"
