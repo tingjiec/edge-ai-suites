@@ -199,7 +199,7 @@ def build_probe_prompt(tokenizer: Tokenizer, target_tokens: int, inserts: list,
     That trade is right for throughput and wrong here. Throughput *divides* by the token count,
     so a token matters; a retrieval verdict does not -- "did the model find the code planted at
     depth 0.25 of an 8,000-token context" is the same question at 8,001. The count actually
-    used is returned, recorded per probe in `probes.csv`, and used for any per-token figure, so
+    used is returned, recorded per probe in the report, and used for any per-token figure, so
     nothing is reported against a number no forward pass saw. Callers wanting the old contract
     pass `tolerance=0` (the default) and still get an exact prompt or an exception.
 

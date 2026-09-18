@@ -287,82 +287,76 @@ class TestCacheSizePreflight(unittest.TestCase):
 
 class TestShippedConfigs(unittest.TestCase):
     """The shipped configs are the single source of truth for the run matrix, so these
-    assert the values as configured rather than the values history recommends -- the point
-    of the benchmark is to re-measure candidates. What they do pin is the invariants the
-    measurement depends on: exact 160K, no prefix caching, and -- now that each config ships a
-    stateful/paged pair -- that the pipeline really is the *only* difference between the two.
-    A stray KV-precision edit to one of the pair would silently turn the comparison into a
-    two-variable experiment whose TTFT gap nothing in the report could attribute."""
+    assert only the invariants the *measurement* depends on -- never the tuned values, since
+    re-measuring candidates is the whole point and pinning them would make every tuning edit
+    a test failure.
 
-    CONFIGS = {
-        "config_qwen3.5_9b.yaml": "Qwen/Qwen3.5-9B",
-        "config_qwen3.6_35b_a3b.yaml": "Qwen/Qwen3.6-35B-A3B",
-    }
+    One config per model now carries both the throughput matrix and the accuracy suites, so
+    the load-bearing check is that `accuracy.baseline_profile` names a profile that is
+    actually in the run: a typo there is a SystemExit, but only after a model has loaded.
+    """
 
-    def _profiles(self, filename) -> list:
+    CONFIGS = ("config_qwen3.6_35b.yaml", "config_qwen3.8_27b.yaml")
+
+    def _config(self, filename):
         path = Path(__file__).parents[1] / "llm" / "context_bench" / filename
-        return load_config(str(path)).profiles
+        return load_config(str(path))
 
-    def test_each_config_ships_a_measurable_160k_pipeline_pair(self):
-        for filename, model in self.CONFIGS.items():
+    def test_every_config_is_loadable_and_names_a_measurable_matrix(self):
+        for filename in self.CONFIGS:
             with self.subTest(config=filename):
-                path = Path(__file__).parents[1] / "llm" / "context_bench" / filename
-                config = load_config(str(path))
+                config = self._config(filename)
 
-                self.assertEqual(config.benchmark.models, [model])
-                self.assertEqual(config.benchmark.context_tokens, [160000])
+                self.assertTrue(config.benchmark.models)
+                self.assertTrue(all(c > 0 for c in config.benchmark.context_tokens))
                 # At least 2 output tokens, or there is no decode phase to average.
                 self.assertGreaterEqual(config.benchmark.output_tokens, 2)
-                self.assertEqual(
-                    [profile["name"] for profile in config.profiles], ["stateful", "paged_min"]
+                names = [p["name"] for p in config.profiles]
+                self.assertTrue(names)
+                self.assertEqual(len(names), len(set(names)), "duplicate profile name")
+
+    def test_the_accuracy_baseline_names_a_profile_that_runs(self):
+        for filename in self.CONFIGS:
+            with self.subTest(config=filename):
+                config = self._config(filename)
+                section = benchmark._namespace_to_dict(getattr(config, "accuracy", None))
+                self.assertTrue(
+                    section, f"{filename} no longer carries an accuracy section"
+                )
+                self.assertIn(
+                    section.get("baseline_profile"), [p["name"] for p in config.profiles]
                 )
 
-    def test_only_the_pipeline_differs_between_the_two_profiles(self):
+    def test_every_paged_profile_keeps_the_measurement_valid(self):
         for filename in self.CONFIGS:
-            with self.subTest(config=filename):
-                stateful, paged = self._profiles(filename)
+            for profile in self._config(filename).profiles:
+                scheduler = profile.get("scheduler")
+                if not scheduler:
+                    # No SchedulerConfig at all is the stateful pipeline -- a single key
+                    # here would quietly make the profile paged instead.
+                    self.assertEqual(pipeline_mode(scheduler), PIPELINE_STATEFUL)
+                    continue
+                with self.subTest(config=filename, profile=profile["name"]):
+                    self.assertEqual(pipeline_mode(scheduler), PIPELINE_PAGED)
+                    # Explicit, not OpenVINO's default of 256, which would prefill a long
+                    # context in hundreds of chunks and measure that instead.
+                    self.assertGreater(scheduler["max_num_batched_tokens"], 256)
+                    # One schedulable sequence: on a hybrid model the paged backend reserves
+                    # a full linear-attention state per sequence out of the same pool the KV
+                    # blocks come from, and genai's default of 256 exhausts it after load.
+                    self.assertEqual(scheduler["max_num_seqs"], 1)
+                    # The throughput path reuses one prompt across iterations, so a warm
+                    # prefix cache would report a TTFT no first request ever sees.
+                    self.assertFalse(scheduler["enable_prefix_caching"])
 
-                self.assertEqual(stateful["ov"], paged["ov"])
-                # A precision this tool can size, so `expected_kv_gb` is not silently
-                # falling back to fp16 for both rows of the comparison.
-                self.assertIn(stateful["ov"]["KV_CACHE_PRECISION"], _KV_PRECISION_BYTES)
-
-    def test_the_stateful_profile_configures_no_scheduler_at_all(self):
-        # Any SchedulerConfig selects continuous batching, so a single scheduler key here
-        # would quietly make both profiles paged and the pair meaningless.
+    def test_kv_precision_is_one_this_tool_can_size(self):
+        # Otherwise `expected_kv_gb` silently falls back to fp16 and the estimate is wrong.
         for filename in self.CONFIGS:
-            with self.subTest(config=filename):
-                stateful = self._profiles(filename)[0]
-
-                self.assertFalse(stateful.get("scheduler"))
-                self.assertEqual(pipeline_mode(stateful.get("scheduler")), PIPELINE_STATEFUL)
-
-    def test_the_paged_profile_caps_the_pool_and_leaves_prefix_caching_off(self):
-        for filename in self.CONFIGS:
-            with self.subTest(config=filename):
-                scheduler = self._profiles(filename)[1]["scheduler"]
-
-                self.assertEqual(pipeline_mode(scheduler), PIPELINE_PAGED)
-                # A fixed cap, not `auto` and not omitted: bounding the KV pool is the whole
-                # reason this profile is paged rather than stateful.
-                cache_size = scheduler["cache_size"]
-                self.assertIsInstance(cache_size, (int, float))
-                self.assertGreater(cache_size, 0)
-                # A positive prefill chunk, not a specific one: this is the value the
-                # benchmark exists to sweep, so pinning it here would make every
-                # measurement of a new candidate a test failure. What matters is that it is
-                # set at all -- OpenVINO's default of 256 would prefill 160K in ~625 chunks.
-                chunk = scheduler["max_num_batched_tokens"]
-                self.assertIsInstance(chunk, int)
-                self.assertGreater(chunk, 256)
-                # Pinned, not tuning: both shipped models are hybrid, and on the paged path
-                # every schedulable sequence costs one full linear-attention reservation out
-                # of `cache_size`. genai's default of 256 reserves 12.75 GB on the 9B alone
-                # and the 160K request is dropped after the model has loaded.
-                self.assertEqual(scheduler["max_num_seqs"], 1)
-                # The prompt is reused across iterations, so a warm prefix cache would
-                # report a TTFT no first request ever sees.
-                self.assertFalse(scheduler["enable_prefix_caching"])
+            for profile in self._config(filename).profiles:
+                precision = profile["ov"].get("KV_CACHE_PRECISION")
+                if precision is not None:
+                    with self.subTest(config=filename, profile=profile["name"]):
+                        self.assertIn(precision, _KV_PRECISION_BYTES)
 
 
 class TestFixedStateCacheBytes(unittest.TestCase):

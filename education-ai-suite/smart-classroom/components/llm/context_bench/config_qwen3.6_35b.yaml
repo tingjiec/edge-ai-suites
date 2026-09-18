@@ -1,78 +1,104 @@
 # Copyright (C) 2026 Intel Corporation
 # SPDX-License-Identifier: Apache-2.0
 #
-# PTL 64 GB / 59 GB shared-GPU configuration for Qwen3.6-35B-A3B int8 at 160K.
-# Two profiles that differ ONLY in the pipeline: stateful (SDPA) vs paged attention with a
-# capped KV pool. TTFT is the figure under test.
+# Qwen3.6-35B-A3B long-context benchmark: one config for both questions.
+#
+#   speed + resources   always measured -- TTFT, TPOT, throughput, RAM/GPU peak and mean
+#   accuracy            add --accuracy to also score RULER retrieval and generation fidelity
+#
+# Both land in ONE report.txt, printed to the console at the end of the run.
+#
+#   .\components\llm\context_bench\run_benchmark.ps1 --config components/llm/context_bench/config_qwen3.6_35b.yaml
+#   ... --accuracy                      # + the accuracy suites below
+#   ... --accuracy --list-profiles      # probe count and run matrix, loads nothing
+#   ... --profiles paged_min            # narrow the matrix
+#
+# The measured variable here is the PIPELINE: `stateful` and `paged_min` differ only in
+# whether a `scheduler` section is present, so the TTFT gap between them is attributable.
 
 model:
   provider: openvino
   device: GPU
-  weight_format: int4
+  weight_format: int8
   models_base_path: "models"
+  model_dirs:
+    Qwen3.6-35B-A3B: models/openvino/Qwen3.6-35B-A3B_int8
 
 benchmark:
   models: [Qwen3.6-35B-A3B]
-  context_tokens: [32000]
+  # 8K is the quick default. Raise for a real long-context measurement -- but note accuracy
+  # probes cost roughly one prefill each, so 32K multiplies the run by about 4.
+  context_tokens: [8000]
+  # Throughput decode length. Accuracy probes use the per-suite budgets under `accuracy`.
   output_tokens: 64
-  warmup: 0
-  iterations: 1
-  # Seconds without ANY progress event from the child, not a wall-clock cap on the case.
-  # The longest silent interval is one prefill, so this is effectively a TTFT ceiling. The
-  # historical 160K TTFT here was 432s with paged attention and a fixed pool, on top of 33 GB
-  # of weights; the stateful single-pass prefill has never been measured on this box. 1800s
-  # keeps a slow-but-real TTFT reportable instead of collapsing it into `timeout`.
-  timeout_sec: 1800
+  warmup: 1
+  iterations: 3
+  timeout_sec: 5400
   max_system_memory_pct: 100
   gpu_memory_budget_gb: 59
   cache_dir: null
-  output_dir: monitoring/executionlogs/context_bench/qwen3.6_35b_a3b
+  output_dir: monitoring/executionlogs/context_bench/qwen3.6_35b
 
-# Both profiles carry the SAME `ov` block, so the pipeline is the only variable between them
-# and the two TTFTs are comparable. u8 KV is kept because it is what this model's only
-# capacity evidence used (1.61 GiB persistent 160K cache); with 33 GB of weights in the same
-# shared 59 GB budget, doubling cache bytes is a separate experiment from this one.
-#
-# `cache_size` is a SchedulerConfig property, and passing any SchedulerConfig selects
-# continuous batching, so a capped KV pool and the stateful pipeline are alternatives, not
-# settings to combine: on genai 2026.4 nothing in the GPU plugin's 51 properties bounds the
-# cache on the stateful path. Hence two profiles rather than one.
-# See docs/dev-guide/context-bench/.
+# Only read when --accuracy is passed. Delete the section to make that flag an error.
+accuracy:
+  suites: [retrieval, generation]
+  # Every profile is reported against this one: retrieval as a signed delta, generation as a
+  # direct comparison (its answers ARE the reference). Must name a profile below.
+  baseline_profile: paged_min
+  # Fixes every planted value, so a re-run is comparable line by line.
+  seed: 20260917
+  # who_what_benchmark's embedding model, for the `Similarity` column only. WWB is OPTIONAL --
+  # without it that one column reports `--` and everything else is computed natively:
+  #   pip install "whowhatbench @ git+https://github.com/openvinotoolkit/openvino.genai.git#subdirectory=tools/who_what_benchmark"
+  # Set to null to switch the semantic column off deliberately.
+  embedding_model: sentence-transformers/all-mpnet-base-v2
+
+  retrieval:
+    # RULER's three behaviours, which fail independently: retrieval (niah_*), multi-hop
+    # tracing (vt), aggregation (cwe/fwe). `qa` asks in natural language. Drop names to
+    # shorten the run -- `niah_single` alone is the classic Needle-in-a-Haystack sweep.
+    tasks: [niah_single, niah_multikey, niah_multivalue, niah_multiquery, vt, cwe, fwe, qa]
+    # Fraction of the transcript the fact is planted at; 0.0 is the very top and hardest.
+    # Applies to niah_single / niah_multikey / qa only -- the rest spread by construction.
+    depths: [0.0, 0.5, 1.0]
+    # 2 is an indication, not a rate (0%, 50% or 100%). Raise once a profile looks suspect.
+    samples: 2
+    output_tokens: 64
+    options:
+      niah_multikey: {num_distractors: 3}
+      niah_multivalue: {num_values: 4}
+      niah_multiquery: {num_queries: 4}
+      vt: {chain_length: 3, num_chains: 3}
+      cwe: {num_target_words: 10}
+      fwe: {top_k: 3}
+
+  generation:
+    # The real classroom task, scored against the baseline profile's answer to the same
+    # prompt. `fact_sheet` also carries its own ground truth (the Coverage column).
+    tasks: [summary, fact_sheet]
+    depths: [0.5]
+    samples: 2
+    # Prose. Scoring a summary at 64 tokens would measure truncation, not fidelity.
+    output_tokens: 256
+    options:
+      fact_sheet: {num_facts: 6}
+
+# Two profiles, identical `ov` except the KV precision each pipeline was measured with, so
+# the pipeline is the variable. `max_num_batched_tokens` must be explicit: SchedulerConfig
+# defaults to 256, which would chunk the prefill into hundreds of passes and measure that
+# instead. `max_num_seqs: 1` likewise -- the paged backend reserves a full linear-attention
+# state per schedulable sequence out of the same pool the KV blocks come from.
 profiles:
-  # No scheduler section at all -> the stateful (SDPA) pipeline. Prefill is one pass over the
-  # whole 160K context, and the KV cache is model state that grows with it. This is the riskier
-  # of the two here: the single-pass attention workspace is added to 33 GB of resident weights,
-  # so `oom` or `gpu_abort` is a plausible outcome and is itself the finding.
   - name: stateful
     ov:
       GPU_ENABLE_LARGE_ALLOCATIONS: "YES"
       KV_CACHE_PRECISION: u8
 
-  # Continuous batching with the KV pool capped, and nothing else hand-tuned. cache_size=4 GiB
-  # is the pool the historical 8K-224K baseline ran on with u8 KV, comfortably above the
-  # 1.61 GiB the persistent cache needs at 160K.
-  #
-  # max_num_batched_tokens is set rather than left at OpenVINO's default because that default
-  # is 256: with dynamic_split_fuse on, a 160K prefill would run as ~625 chunks and the
-  # comparison against the stateful pass would measure the chunk count, not the pipeline.
-  # 32768 is the best value ever screened on this model (TTFT 432.34s, 8.0% better than 16K);
-  # 64K was abandoned after 449s with no first token and system RAM at 93.2%.
-  # dynamic_split_fuse is left at its default of true -- one 160K request does not need it
-  # tuned.
   - name: paged_min
     ov:
       GPU_ENABLE_LARGE_ALLOCATIONS: "YES"
       KV_CACHE_PRECISION: f16
     scheduler:
       max_num_batched_tokens: 65536
-      # NOT a concurrency setting on this model, and not safe to leave at genai's default of
-      # 256. Qwen3.6-35B-A3B is hybrid (10 full_attention + 30 linear_attention layers), and
-      # the paged backend reserves one whole linear-attention state -- 63.75 MiB here -- per
-      # schedulable sequence, out of the same `cache_size` pool the KV blocks come from. At 256
-      # that reservation is 15.9 GB, which on its own is four times this pool: the 160K request
-      # is then dropped as out-of-memory *after* 33 GB of weights have loaded. Confirmed on the
-      # 9B, where the same default produced exactly that failure at 160K.
       max_num_seqs: 1
-      # Mandatory, not tuning: iterations reuse one prompt, so a warm prefix cache would
-      # report a TTFT no first request ever sees.
       enable_prefix_caching: false

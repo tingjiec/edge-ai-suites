@@ -25,11 +25,12 @@ against a stub injected into `sys.modules`: what matters is that every return sh
 has used is read correctly and that an unrecognized one degrades to "unavailable" rather than
 ending the run.
 
-The load-bearing invariant -- that turning accuracy ON does not change the throughput path's
-CSV headers -- is asserted at the end.
+`main()`'s own wiring is pinned at the end: two silent failures have come from its call
+order rather than from any of the pieces below.
 """
 
 import sys
+import tempfile
 import types
 import unittest
 from collections import Counter
@@ -868,7 +869,7 @@ class TestAccuracyReport(unittest.TestCase):
 
     def test_the_retrieval_section_renders_a_per_task_table_and_a_depth_sweep(self):
         text = "\n".join(benchmark._accuracy_section(self.cases, 8000, self.settings))
-        self.assertIn("Retrieval Accuracy (RULER)", text)
+        self.assertIn("RETRIEVAL ACCURACY (RULER)", text)
         self.assertIn("niah_single", text)
         self.assertIn("vt", text)
         self.assertIn("Depth sweep", text)
@@ -877,20 +878,45 @@ class TestAccuracyReport(unittest.TestCase):
 
     def test_the_generation_section_renders_every_fidelity_family(self):
         text = "\n".join(benchmark._accuracy_section(self.cases, 8000, self.settings))
-        self.assertIn("Generation Fidelity", text)
+        self.assertIn("GENERATION FIDELITY", text)
         for column in ("Similarity", "ROUGE-L", "chrF", "FDT", "SDT norm", "Identical",
                        "Coverage"):
             self.assertIn(column, text)
 
     def test_a_disabled_similarity_column_says_so(self):
         text = "\n".join(benchmark._accuracy_section(self.cases, 8000, self.settings))
-        self.assertIn("Similarity not measured", text)
+        self.assertIn("similarity not measured", text)
 
     def test_a_suite_that_did_not_run_renders_no_section(self):
         settings = {"accuracy": _accuracy_cfg(suites=[accuracy.SUITE_RETRIEVAL])}
         text = "\n".join(benchmark._accuracy_section(self.cases, 8000, settings))
-        self.assertIn("Retrieval Accuracy", text)
-        self.assertNotIn("Generation Fidelity", text)
+        self.assertIn("RETRIEVAL ACCURACY", text)
+        self.assertNotIn("GENERATION FIDELITY", text)
+
+
+class TestPerCaseConsoleLineSeesTheFidelityFill(unittest.TestCase):
+    """The per-case console line is `_format_case(case)`, and it prints whatever
+    `case["accuracy"]` holds -- so it reads "--" for every fidelity column until
+    `write_report` has filled them. `main()`'s call order is what makes that work; this
+    pins the behaviour at that boundary rather than on either piece alone."""
+
+    def test_the_fill_turns_the_dashes_into_the_self_comparison(self):
+        cfg = _accuracy_cfg()
+        specs = accuracy.build_probe_specs(cfg, 8000)
+        case = _case("paged_min", specs, correct=True)
+        settings = {
+            "accuracy": cfg, "models": ["Qwen3.8-27B"], "device": "GPU",
+            "weight_format": "int8", "context_tokens": [8000], "output_tokens": 64,
+            "warmup": 1, "iterations": 3, "max_system_memory_pct": 100,
+            "gpu_memory_budget_gb": 59,
+        }
+        # Before the fill: nothing has scored the generation probes against a reference.
+        self.assertIn("ROUGE-L --", benchmark._format_case(case))
+
+        with tempfile.TemporaryDirectory() as output_dir:
+            benchmark.write_report(output_dir, settings, [case], {}, completed=False)
+
+        self.assertIn("ROUGE-L 100%", benchmark._format_case(case))
 
 
 # ---------------------------------------------------------------------------
@@ -1006,55 +1032,48 @@ class TestAccuracyConfigResolution(unittest.TestCase):
 
 
 # ---------------------------------------------------------------------------
-# The load-bearing invariant: accuracy must not disturb the throughput headers
+# main()'s wiring, which no unit test on the pieces can reach
 # ---------------------------------------------------------------------------
-class TestThroughputHeadersAreUntouched(unittest.TestCase):
-    ACCURACY_ONLY = {
-        "suite", "task", "depth", "sample", "truth", "distractors", "prediction",
-        "accuracy", *accuracy.PROBE_SCORE_FIELDS,
-    }
+class TestMainWiring(unittest.TestCase):
+    """Structural assertions on `main()`, because the failures they catch are silent.
 
-    def test_case_fields_carry_no_accuracy_columns(self):
-        self.assertFalse(self.ACCURACY_ONLY & set(benchmark.CASE_FIELDS))
+    Both have happened. A helper defined immediately after the `--list-profiles` early
+    `return` swallowed the rest of `main`'s body into itself, so the tool parsed its
+    arguments and exited 0 having benchmarked nothing -- no error, no output. And printing
+    a case before `write_report` showed every fidelity column as "--", because that call is
+    what fills them. Every other test here calls the pieces directly and would miss both.
+    """
 
-    def test_iteration_csv_fields_carry_no_accuracy_columns(self):
-        self.assertFalse(self.ACCURACY_ONLY & set(benchmark.ITERATION_CSV_FIELDS))
-
-    def test_probes_csv_covers_both_suites_in_one_schema(self):
-        for field in ("suite", "task", "depth", "sample", "truth", "prediction",
-                      "exact_match", "recall", "token_f1", "distractor_rate",
-                      "similarity", "rouge_l", "chrf", "fdt", "sdt_norm", "fact_coverage"):
-            self.assertIn(field, benchmark.PROBE_CSV_FIELDS)
-
-    def test_main_still_runs_the_matrix_and_not_only_list_profiles(self):
-        """A structural assertion, because the failure it catches is silent.
-
-        `--list-profiles` returns early from `main`, and a helper defined immediately after
-        that `return` swallowed the rest of the function body into itself: `main` still
-        parsed its arguments, still resolved its settings, and then fell off the end and
-        exited 0 having benchmarked nothing. No error, no output, no report -- the run just
-        came back instantly. Nothing else in this file would have noticed, because every
-        other test calls the pieces directly.
-        """
+    def _main_calls(self):
         import ast
         import inspect
 
         tree = ast.parse(inspect.getsource(benchmark))
         main = next(n for n in tree.body if getattr(n, "name", "") == "main")
-        called = {
+        return [
             node.func.id for node in ast.walk(main)
             if isinstance(node, ast.Call) and isinstance(node.func, ast.Name)
-        }
-        for required in ("_preflight_environment_check", "_run_case", "write_reports"):
+        ]
+
+    def test_main_still_runs_the_matrix(self):
+        called = set(self._main_calls())
+        for required in ("_preflight_environment_check", "_run_case", "write_report"):
             self.assertIn(required, called, f"main() no longer calls {required}")
+
+    def test_main_writes_the_report_before_printing_a_case(self):
+        called = self._main_calls()
+        self.assertLess(
+            called.index("write_report"), called.index("_format_case"),
+            "main() prints a case before write_report fills its fidelity columns",
+        )
 
     def test_a_throughput_run_never_carries_accuracy_settings(self):
         # --accuracy off -> settings["accuracy"] is None, so _run_case passes probes=None and
         # the child takes the unchanged throughput path.
-        args = _accuracy_args(accuracy=False)
         self.assertIsNone(
             benchmark._resolve_accuracy(
-                SimpleNamespace(accuracy=None), args, [{"name": "paged_min"}]
+                SimpleNamespace(accuracy=None), _accuracy_args(accuracy=False),
+                [{"name": "paged_min"}],
             )
         )
 

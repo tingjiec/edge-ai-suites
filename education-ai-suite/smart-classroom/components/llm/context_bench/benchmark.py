@@ -19,20 +19,24 @@ sample cannot tell a configuration difference from noise, which is the whole
 reason iterations are not optional here.
 
 The default (throughput) path does NOT judge answer quality -- content is irrelevant to a
-capacity and throughput measurement, only the token volume and the clock matter. The opt-in
-`--accuracy` mode does the opposite, in two suites: RULER's synthetic probes (retrieval,
-multi-hop tracing, aggregation) scored against known ground truth, and a who_what_benchmark
--style fidelity comparison of the real task's output against the baseline profile's. So
-precision loss from quantization or speculative decoding is visible next to the speed it
-bought, whether it shows up as a missed fact or as worse prose. See `accuracy.py`. The two
-paths never mix -- with `--accuracy` off, everything below is byte-for-byte the throughput tool.
+capacity and throughput measurement, only the token volume and the clock matter. `--accuracy`
+adds two suites that do: RULER's synthetic probes (retrieval, multi-hop tracing, aggregation)
+scored against known ground truth, and a who_what_benchmark-style fidelity comparison of the
+real task's output against the baseline profile's. So precision loss from quantization or
+speculative decoding is visible next to the speed it bought, whether it shows up as a missed
+fact or as worse prose. See `accuracy.py`.
+
+An accuracy run reports speed and resources too: its probes carry the same timing records the
+throughput path produces, so one run gives TTFT, TPOT, memory and every accuracy metric. That
+is the shape of the whole tool -- ONE config per model (throughput matrix + accuracy suites)
+and ONE `report.txt`, rewritten after every case and printed to the console at the end.
 
 Standalone diagnostic: reads its own bundled model config, never
 smart-classroom/config.yaml, and running it never affects the application.
 
     .\\components\\llm\\context_bench\\run_benchmark.ps1
-    .\\components\\llm\\context_bench\\run_benchmark.ps1 --profiles stateful --iterations 1
-    .\\components\\llm\\context_bench\\run_benchmark.ps1 --list-profiles
+    .\\components\\llm\\context_bench\\run_benchmark.ps1 --accuracy
+    .\\components\\llm\\context_bench\\run_benchmark.ps1 --accuracy --list-profiles
 
 Equivalent with the right interpreter already active, run from smart-classroom/
 so relative model paths resolve:
@@ -71,10 +75,9 @@ from components.llm.context_bench import (
     wwb_adapter,
 )
 from utils.config_loader import load_config
-from utils.storage_manager import StorageManager
 
 _TOOL_DIR = os.path.dirname(os.path.abspath(__file__))
-_DEFAULT_CONFIG_PATH = os.path.join(_TOOL_DIR, "config_qwen3.5_9b.yaml")
+_DEFAULT_CONFIG_PATH = os.path.join(_TOOL_DIR, "config_qwen3.6_35b.yaml")
 
 # smart-classroom/ is 3 levels up (context_bench -> llm -> components -> smart-classroom).
 _SC_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(_TOOL_DIR)))
@@ -179,50 +182,7 @@ _CASE_MEMORY_FIELDS = (
 # configuration; mean says what it costs for the minutes it runs (see `_MemorySampler`).
 _ITERATION_MEMORY_FIELDS = ("peak_ram_gb", "peak_gpu_gb", *metrics.MEDIAN_ONLY_METRICS)
 
-CASE_FIELDS = [
-    "model", "profile", "context_tokens", "device", "weight_format", "pipeline_mode",
-    "status", "error", "stage_reached",
-    "kv_cache_precision", "cache_size_gb", "ov_config", "scheduler_config",
-    "mtp", "num_assistant_tokens", "mtp_device",
-    "mtp_draft_tokens", "mtp_draft_tokens_min", "mtp_draft_tokens_max",
-    "mtp_accepted_tokens", "mtp_accepted_tokens_min", "mtp_accepted_tokens_max",
-    "mtp_rejected_tokens", "mtp_rejected_tokens_min", "mtp_rejected_tokens_max",
-    "tokens_per_step", "tokens_per_step_min", "tokens_per_step_max",
-    "mtp_acceptance_rate", "mtp_acceptance_rate_min", "mtp_acceptance_rate_max",
-    "mtp_draft_to_main_ratio", "mtp_draft_to_main_ratio_min", "mtp_draft_to_main_ratio_max",
-    "load_ok", "load_time_s", "prompt_tokens", "iterations_measured",
-    "output_sha256", "output_consistent",
-    "generation_time", "generation_time_min", "generation_time_max",
-    "latency", "first_token_latency", "first_token_latency_min", "first_token_latency_max",
-    "other_tokens_avg_latency",
-    "prefill_throughput", "prefill_throughput_min", "prefill_throughput_max",
-    "decode_throughput", "e2e_throughput", "e2e_throughput_min", "e2e_throughput_max",
-    "weight_disk_gb", "expected_kv_gb",
-    *_CASE_MEMORY_FIELDS, *metrics.MEDIAN_ONLY_METRICS,
-    "gpu_budget_gb", "gpu_budget_driver_gb",
-    "peak_gpu_pct_of_budget", "mean_gpu_pct_of_budget",
-    "memory_measurement_error", "system_memory_limit_exceeded", "gpu_budget_exceeded",
-]
-
-ITERATION_CSV_FIELDS = [
-    "model", "profile", "context_tokens", *metrics.ITERATION_FIELDS,
-    *_ITERATION_MEMORY_FIELDS,
-]
-
-# probes.csv -- the accuracy analog of iterations.csv: the per-generate record plus what was
-# planted, the answer, and every score. A separate file, deliberately, so summary.csv and
-# CASE_FIELDS stay frozen and a throughput run's headers never change when accuracy is added.
-#
-# One schema across both suites rather than a file each: a row leaves blank the metrics its
-# suite does not produce (a retrieval probe has no `chrf`, a `summary` probe has no
-# `exact_match`), and one file is what makes "sort every probe by recall and look at the
-# worst" a single spreadsheet operation.
-PROBE_CSV_FIELDS = [
-    "model", "profile", "context_tokens", "suite", "task", "depth", "sample",
-    "truth", "distractors", "prediction",
-    *accuracy.PROBE_SCORE_FIELDS,
-    *metrics.ITERATION_FIELDS, *_ITERATION_MEMORY_FIELDS,
-]
+REPORT_NAME = "report.txt"
 
 
 # ---------------------------------------------------------------------------
@@ -732,7 +692,7 @@ def _apply_overrides(base: dict, overrides: dict, coerce: bool) -> dict:
 
 
 def format_config(config: dict) -> str:
-    """One-line rendering for the console, the CSV column and the summary."""
+    """One-line rendering for the console and the report."""
     if not config:
         return "(none)"
     return " ".join(f"{key}={value}" for key, value in sorted(config.items()))
@@ -925,7 +885,7 @@ def _parse_args():
     parser.add_argument(
         "--config",
         default=_DEFAULT_CONFIG_PATH,
-        help="model-specific benchmark config (default: config_qwen3.5_9b.yaml)",
+        help="model-specific benchmark config (default: config_qwen3.6_35b.yaml)",
     )
     parser.add_argument("--models", nargs="+", help="override benchmark.models")
     parser.add_argument("--contexts", type=int, nargs="+", help="override benchmark.context_tokens")
@@ -1751,6 +1711,14 @@ def _run_case(model_name, model_dir, profile, context_tokens, settings, static) 
     aggregated = metrics.aggregate(
         result.get("probes") if accuracy_cfg else result.get("iterations")
     )
+    if accuracy_cfg:
+        # `output_consistent` asks whether repeated greedy generations of the SAME prompt
+        # agreed -- the determinism check the MTP comparison rests on. Every accuracy probe
+        # is a different prompt, so their hashes differ by construction and the check reads
+        # False for every run, warning that a perfectly deterministic box is nondeterministic.
+        # Nothing measured it here, so report nothing rather than a false negative.
+        aggregated["output_consistent"] = None
+        aggregated["output_sha256"] = None
     mean_gpu = aggregated.get("mean_gpu_gb")
 
     case = {
@@ -1801,7 +1769,7 @@ def _run_case(model_name, model_dir, profile, context_tokens, settings, static) 
     case["_iterations"] = result.get("iterations") or []
     if accuracy_cfg:
         # Keyed by suite and nothing else -- the baseline profile's name belongs to the run,
-        # not to a case, and lives in settings["accuracy"] (and so in summary.json). Mixing a
+        # not to a case, and lives in settings["accuracy"]. Mixing a
         # scalar in here made the delta pass walk a string as though it were a suite.
         scored, summary = _score_case_accuracy(result.get("probes") or [], specs)
         case["accuracy"] = summary
@@ -1815,7 +1783,7 @@ def _run_case(model_name, model_dir, profile, context_tokens, settings, static) 
 
 def _depth_label(depth) -> str:
     """A stable string key for a depth fraction, shared by the score map, the per-depth
-    aggregate, summary.json and the report matrix so they cannot drift. Tasks that place their
+    aggregate and the report matrix so they cannot drift. Tasks that place their
     needles by construction have no single depth and key as "-"; see `tasks.ProbeSpec`."""
     return "-" if depth is None else f"{float(depth):.2f}"
 
@@ -1824,7 +1792,7 @@ def _score_case_accuracy(probes: list, specs: list) -> tuple:
     """Score each probe's answer against what its spec planted, and aggregate per suite.
 
     Returns ``(scored, summary)``. `scored` are the probe records with the ground truth, the
-    prediction and every score merged in -- the rows probes.csv writes. `summary` is the
+    prediction and every score merged in -- the rows the probe-detail section writes. `summary` is the
     nested ``case["accuracy"]``: per-suite overall rates, the per-task and per-depth
     breakdowns, and the probe count.
 
@@ -2012,7 +1980,7 @@ def _mtp_tuning_hint(case: dict) -> str | None:
 
 
 def _best_summary(case: dict) -> str:
-    """The winning profile's one-liner, shared by summary.md and the console tail."""
+    """The winning profile's one-liner."""
     return (
         f"TPOT {_fmt(case.get('other_tokens_avg_latency'))} ms/token "
         f"({_fmt(case.get('decode_throughput'), '{:.2f}')} decode tok/s), "
@@ -2326,21 +2294,13 @@ def _retrieval_section(cases: list, context: int, settings: dict) -> list:
     ordered = _ordered_cases(cases, accuracy.SUITE_RETRIEVAL)
     task_names = section["tasks"]
 
-    lines = [
-        f"## {context:,} tokens -- Retrieval Accuracy (RULER)",
-        "",
-        "Synthetic probes with known answers, following RULER: `niah_*` plant high-entropy "
-        "codes (one, one among decoys, all values of a key, one value of every key), `vt` "
-        "chains variable assignments that have to be traced to the end, `cwe`/`fwe` replace "
-        "the transcript with a word list that has to be **counted** rather than searched, and "
-        "`qa` asks a natural-language question about a planted paragraph. Cells are the "
-        "task's own RULER score: share of ground-truth items found, "
-        "intersection-over-union for the aggregation tasks. "
-        + (
-            f"`Delta` is the overall recall gap to the baseline profile `{baseline_name}` -- "
-            "a negative value is accuracy that row's speed cost."
-            if baseline_name else ""
-        ),
+    lines = _heading(f"{context:,} tokens -- RETRIEVAL ACCURACY (RULER)")
+    lines += [
+        "Cells are each task's own RULER score: share of planted items found, or "
+        "intersection-over-union for the aggregation tasks (cwe/fwe) which must punish "
+        "over-answering. Decoys is the share of planted decoys that wrongly appeared -- lower "
+        "is better, and it is the precision signal recall cannot give."
+        + (f" Delta is the overall recall gap to `{baseline_name}`." if baseline_name else ""),
         "",
         f"| Profile | Pipeline | MTP | {' | '.join(task_names)} | Overall | EM | F1 | "
         f"Decoys | Delta vs {baseline_name or '--'} |",
@@ -2362,45 +2322,36 @@ def _retrieval_section(cases: list, context: int, settings: dict) -> list:
             f"| {_acc_pct(summary.get('distractor_rate'))} "
             f"| {_acc_delta_pp((summary.get('deltas') or {}).get('recall_rate_delta'))} |"
         )
-    lines += [
-        "",
-        "`Decoys` is the share of *planted decoy* values that wrongly appeared in an answer, "
-        "over the tasks that plant them (`niah_multikey`, `vt`) -- lower is better. It is the "
-        "precision signal recall cannot give: a profile losing precision does not stop "
-        "answering, it starts answering with the wrong key's value.",
-        "",
-    ]
-    lines += _depth_matrix(ordered, section, baseline_name)
+    lines.append("")
+    lines += _depth_matrix(ordered, section)
 
     ranked = _accuracy_leaderboard(cases, accuracy.SUITE_RETRIEVAL)
     if ranked:
         best = _suite_summary(ranked[0], accuracy.SUITE_RETRIEVAL)
         lines += [
-            f"**Best retrieval at {context:,} tokens: `{ranked[0]['profile']}`** on "
-            f"{ranked[0]['model']} -- recall {_acc_pct(best.get('recall_rate'))}, exact match "
-            f"{_acc_pct(best.get('exact_match_rate'))}, token-F1 "
-            f"{_acc_pct(best.get('token_f1'))} over {best.get('probe_count')} probes.",
+            f"Best retrieval: {ranked[0]['profile']} -- recall "
+            f"{_acc_pct(best.get('recall_rate'))}, EM {_acc_pct(best.get('exact_match_rate'))}, "
+            f"F1 {_acc_pct(best.get('token_f1'))} over {best.get('probe_count')} probes",
             "",
         ]
     return lines
 
 
-def _depth_matrix(ordered: list, section: dict, baseline_name) -> list:
-    """The classic NIAH depth x profile matrix, over the depth-swept tasks only."""
+def _depth_matrix(ordered: list, section: dict) -> list:
+    """The classic NIAH depth x profile matrix, over the depth-swept tasks only.
+
+    A profile that holds the bottom of the context and loses the top has a working context
+    shorter than the one it was given, and that is only visible split out by depth.
+    """
     depths = section["depths"]
     swept = [t for t in section["tasks"] if tasks.is_depth_swept(t)]
     if not swept or not depths:
         return []
-    header = " | ".join(f"d={_depth_label(d)}" for d in depths)
     lines = [
-        "### Depth sweep",
+        f"Depth sweep -- recall by where the fact was planted ({', '.join(swept)}); "
+        "0.00 is the very top of the transcript and furthest from the question.",
         "",
-        f"Recall by where the fact was planted, over {', '.join(swept)} -- 0.00 is the very "
-        "top of the transcript (furthest from the question) and 1.00 the very bottom. A "
-        "profile that holds the bottom and loses the top has a context window shorter than "
-        "the one it was given.",
-        "",
-        f"| Profile | {header} |",
+        f"| Profile | {' | '.join(f'd={_depth_label(d)}' for d in depths)} |",
         "|---|" + "|".join(["---"] * len(depths)) + "|",
     ]
     for case in ordered:
@@ -2431,14 +2382,12 @@ def _generation_section(cases: list, context: int, settings: dict) -> list:
         ordered[0]["model"] if ordered else None, "tokens"
     )
 
-    lines = [
-        f"## {context:,} tokens -- Generation Fidelity (who_what_benchmark)",
-        "",
-        "The model does the **real** task -- summarize the lesson, explain a relationship, "
-        "list the recorded codes -- at a realistic answer length, and its answer is compared "
-        f"with the answer the baseline profile `{baseline_name or '--'}` gave to the "
-        "identical prompt. This is the measurement retrieval cannot make: a profile can "
-        "return every planted code and still write worse prose.",
+    lines = _heading(f"{context:,} tokens -- GENERATION FIDELITY (who_what_benchmark)")
+    lines += [
+        "The model does the real classroom task at full answer length; each answer is scored "
+        f"against the baseline profile `{baseline_name or '--'}`'s answer to the identical "
+        "prompt. This is the measurement retrieval cannot make -- a profile can return every "
+        "planted code and still write worse prose.",
         "",
         f"| Profile | Pipeline | MTP | Similarity | ROUGE-1 | ROUGE-2 | ROUGE-L | chrF "
         f"| FDT ({unit}) | SDT norm | Identical | Coverage |",
@@ -2459,41 +2408,48 @@ def _generation_section(cases: list, context: int, settings: dict) -> list:
         )
     lines += [
         "",
-        "**Similarity** is who_what_benchmark's embedding cosine (1.0 = same meaning); "
-        "**ROUGE-1/2/L** and **chrF** are lexical overlap with the baseline answer (1.0 = "
-        "same words); **FDT** is how many "
-        f"{unit} the two agreed on before they first differed, and **SDT norm** the share of "
-        "the baseline answer that differs (lower is better). **Identical** is the share of "
-        "probes whose output matched the baseline byte for byte -- the old `output_sha256` "
-        "check, now with the graded columns that say *how far* the rest drifted. "
-        "**Coverage** is the share of planted facts the `fact_sheet` answers named, and is "
-        "the one column here scored against real ground truth rather than another model's "
-        "output.",
-        "",
-        f"The baseline row `{baseline_name or '--'}` compares against itself, so its "
-        "similarity is 1.0 and its FDT the full answer length. That row is the sanity check, "
-        "not a result.",
+        "Similarity is an embedding cosine (semantic); ROUGE/chrF are lexical overlap; FDT is "
+        f"how many {unit} the two answers agreed on before first differing and SDT norm the "
+        "share that differs (lower better); Identical is a byte-for-byte match. Each family "
+        "is blind to something the next catches -- a reworded but equivalent answer scores "
+        "~1.0 on similarity and well below it on ROUGE. Coverage is the only column scored "
+        "against real ground truth rather than another profile's output.",
+        f"The `{baseline_name or '--'}` row compares against itself, so it reads 1.00 "
+        "throughout by construction: a sanity check, not a result.",
         "",
     ]
     for note in sorted(settings.get("_similarity_notes") or ()):
-        lines += [f"> **Similarity not measured.** {note}", ""]
+        lines += [f"NOTE: similarity not measured -- {note}", ""]
 
     ranked = _accuracy_leaderboard(cases, accuracy.SUITE_GENERATION)
-    drifted = [c for c in ranked if c["profile"] != baseline_name]
-    if drifted:
+    # Only profiles that actually drifted: calling a byte-identical profile the "largest
+    # drift" reads as a finding when the finding is that there was none.
+    drifted = [
+        c for c in ranked
+        if c["profile"] != baseline_name
+        and (_suite_summary(c, accuracy.SUITE_GENERATION).get("identical_rate") or 0.0) < 1.0
+    ]
+    if not drifted:
+        others = [c for c in ranked if c["profile"] != baseline_name]
+        if others:
+            lines += [
+                f"No drift: every one of {len(others)} profile(s) reproduced the baseline's "
+                "answers byte for byte.",
+                "",
+            ]
+    else:
         worst = _suite_summary(drifted[-1], accuracy.SUITE_GENERATION)
-        # The similarity clause is dropped rather than printed as "--": a sentence that reads
+        # The similarity clause is dropped rather than printed as "--": a sentence reading
         # "similarity --, ROUGE-L 0.37" invites the reader to treat the dash as a low score.
         semantic = (
             f"similarity {_acc_num(worst.get('similarity'), '{:.4f}')}, "
             if worst.get("similarity") is not None else ""
         )
         lines += [
-            f"**Largest drift at {context:,} tokens: `{drifted[-1]['profile']}`** -- "
-            f"{semantic}ROUGE-L {_acc_num(worst.get('rouge_l'))}, chrF "
-            f"{_acc_num(worst.get('chrf'))}, first divergence after "
-            f"{_acc_num(worst.get('fdt'), '{:.1f}')} {unit} over "
-            f"{worst.get('probe_count')} probes.",
+            f"Largest drift: {drifted[-1]['profile']} -- {semantic}ROUGE-L "
+            f"{_acc_num(worst.get('rouge_l'))}, chrF {_acc_num(worst.get('chrf'))}, first "
+            f"divergence after {_acc_num(worst.get('fdt'), '{:.1f}')} {unit} over "
+            f"{worst.get('probe_count')} probes",
             "",
         ]
     return lines
@@ -2570,313 +2526,209 @@ def _mtp_output_check(cases: list) -> str | None:
     return "**Greedy output check: all measured MTP profiles match the baseline exactly.**"
 
 
-def write_reports(output_dir: str, settings: dict, cases: list, platform_info: dict,
-                  completed: bool) -> None:
-    """(Re)write summary.json / summary.md / summary.csv for the run so far.
+def write_report(output_dir: str, settings: dict, cases: list, platform_info: dict,
+                 completed: bool) -> list:
+    """(Re)write the run's single `report.txt` and return its lines.
 
     Rewritten after every case, not once at the end, because this tool's job is to push the
     box until it breaks and it can break hard enough to take the orchestrator with it. When
-    that happened previously no summary was written at all and the file on disk still
-    described an earlier run -- reporting a PASS at 160K that the real trials had just
-    disproved. A stale report that looks current is worse than none.
+    that happened previously the file on disk still described an earlier run -- reporting a
+    PASS at 160K the real trials had just disproved. A stale report that looks current is
+    worse than none.
+
+    One file, not five. Everything the run measured -- speed, resources and (with
+    --accuracy) every accuracy metric and every individual probe -- is in here, and the
+    caller prints these same lines to the console, so the two can never disagree.
     """
-    # The generation suite's fidelity scores and every delta need the whole context group,
-    # which only exists at report time -- fill them before summary.json is built so the
-    # structured output and probes.csv carry them too.
-    accuracy_mode = any(c.get("accuracy") for c in cases)
-    if accuracy_mode:
+    # Generation fidelity and every delta are cross-case: the reference is the baseline
+    # profile's own output, which may not have run when a given case finished. By report
+    # time the whole group is in hand, so fill them before anything is rendered.
+    if any(c.get("accuracy") for c in cases):
         _fill_generation_fidelity(cases, settings)
         _fill_accuracy_deltas(cases, settings)
-        _write_probes(output_dir, cases)
 
-    summary = {
-        "generated_at": datetime.now().isoformat(timespec="seconds"),
-        "completed": completed,
-        "device": settings["device"],
-        "weight_format": settings["weight_format"],
-        "context_tokens": settings["context_tokens"],
-        "output_tokens": settings["output_tokens"],
-        "warmup": settings["warmup"],
-        "iterations": settings["iterations"],
-        "max_system_memory_pct": settings["max_system_memory_pct"],
-        "gpu_memory_budget_gb": settings["gpu_memory_budget_gb"],
-        "accuracy": settings.get("accuracy"),
-        "hardware": platform_info,
-        "cases": [{k: v for k, v in c.items() if not k.startswith("_")} for c in cases],
-    }
-    with open(os.path.join(output_dir, "summary.json"), "w", encoding="utf-8") as f:
-        json.dump(summary, f, indent=2, ensure_ascii=False)
+    lines = _report_lines(settings, cases, platform_info, completed)
+    with open(os.path.join(output_dir, REPORT_NAME), "w", encoding="utf-8") as f:
+        f.write("\n".join(lines) + "\n")
+    return lines
 
-    for index, case in enumerate(cases):
-        StorageManager.save_csv(
-            os.path.join(output_dir, "summary.csv"),
-            {field: case.get(field) for field in CASE_FIELDS},
-            headers=CASE_FIELDS,
-            append=index > 0,  # the first row truncates whatever the last rewrite left
-        )
 
-    banner = [] if completed else [
-        "> **Run in progress or ended early.** Only the cases below have been measured; "
-        "`iterations.csv` has every iteration that ran.",
-        "",
-    ]
+def _report_lines(settings: dict, cases: list, platform_info: dict,
+                  completed: bool) -> list:
+    """The whole report: header, then per context speed + accuracy, then probes and
+    failures. Speed and resources are reported for every run, accuracy only when it ran --
+    an accuracy run measures both, because its probes carry the same timing records the
+    throughput path produces."""
+    acc = settings.get("accuracy")
     lines = [
-        "# Long-Context Retrieval Accuracy Summary" if accuracy_mode
-        else "# Long-Context Benchmark Summary",
-        "",
-        *banner,
-        f"Generated: {summary['generated_at']}",
-        "",
-        f"Hardware: {platform_info.get('Processor', '--')}, {platform_info.get('Memory', '--')} RAM, "
-        f"{platform_info.get('iGPU', '--')}",
-        f"Device: {settings['device']} | Weights: {settings['weight_format']}",
-        f"Budgets: system RAM <= {settings['max_system_memory_pct']:g}%, "
+        "=" * 78,
+        f" Long-Context Benchmark -- {', '.join(settings['models'])}",
+        "=" * 78,
+        f"Generated : {datetime.now().isoformat(timespec='seconds')}"
+        f"   [{'complete' if completed else 'IN PROGRESS / ENDED EARLY'}]",
+        f"Hardware  : {platform_info.get('Processor', '--')}, "
+        f"{platform_info.get('Memory', '--')} RAM, {platform_info.get('iGPU', '--')}",
+        f"Device    : {settings['device']} | weights {settings['weight_format']} | "
+        f"budgets RAM <= {settings['max_system_memory_pct']:g}%, "
         f"GPU <= {settings['gpu_memory_budget_gb']:g} GB",
-        "",
+        f"Contexts  : {', '.join(f'{c:,}' for c in settings['context_tokens'])} tokens | "
+        f"{settings['warmup']} warmup + {settings['iterations']} iteration(s) @ "
+        f"{settings['output_tokens']} output tokens",
     ]
-    if accuracy_mode:
-        acc = settings["accuracy"]
-        lines += [
-            "This is an **accuracy** run, not a throughput one: instead of timing generation "
-            "it asks whether each profile still *uses* the long context correctly after "
-            "whatever KV quantization, weight compression or speculative decoding bought its "
-            "speed. Two suites, measuring things that fail independently:",
-            "",
-        ]
-        if acc.get(accuracy.SUITE_RETRIEVAL):
-            retrieval = acc[accuracy.SUITE_RETRIEVAL]
-            lines += [
-                f"* **Retrieval** ({', '.join(retrieval['tasks'])}) -- RULER's synthetic "
-                "probes, scored against known ground truth. Retrieval, multi-hop tracing and "
-                "aggregation are separate behaviours, and a profile can hold one while losing "
-                f"another. {retrieval['samples']} sample(s) per task, depth-swept tasks also "
-                f"across {len(retrieval['depths'])} depth(s), answers capped at "
-                f"{retrieval['output_tokens']} tokens.",
-            ]
-        if acc.get(accuracy.SUITE_GENERATION):
-            generation = acc[accuracy.SUITE_GENERATION]
-            lines += [
-                f"* **Generation fidelity** ({', '.join(generation['tasks'])}) -- the real "
-                "classroom task at "
-                f"{generation['output_tokens']} tokens, scored the way "
-                "who_what_benchmark scores a compressed model: against the baseline "
-                f"profile's own answer to the identical prompt. "
-                f"{generation['samples']} prompt(s) per task.",
-            ]
-        lines += [
-            "",
-            "`Delta` columns compare each profile against the baseline profile "
-            f"`{acc.get('baseline_profile') or '--'}`, so a quantization- or MTP-induced loss "
-            "reads as a negative number next to whatever speed that profile bought. Every "
-            "probe -- its planted ground truth, the model's answer and all of its scores -- "
-            "is a row in `probes.csv`.",
-            "",
-        ]
-    else:
-        lines += [
-            "Latencies are milliseconds and throughputs tokens/second, in llm_bench's units. "
-            "Every figure is the **median** of the measured iterations; the warm-up is excluded. "
-            "Profiles are ranked by TPOT (lower is better), with TTFT as the tie-breaker; "
-            "because TTFT dominates the wall clock at long context, the fastest TTFT is called "
-            "out separately under each table.",
-            "",
-            "The `Pipeline` column is the measured variable when a config ships both a "
-            "`stateful` and a `paged` profile: `stateful` prefills the whole context in one SDPA "
-            "pass and has no KV pool to size, `paged` runs continuous batching with the "
-            "`cache_size` shown.",
-            "",
-            "The `MTP` column is the measured variable when a config sweeps multi-token "
-            "prediction: `k` is how many candidates the model's own draft head offered per step, "
-            "`tok/step` is how many output tokens each main-model verification pass actually "
-            "produced, and `% accepted` is the share of those candidates that survived. A "
-            "profile with MTP off yields exactly 1.00 tok/step by definition. MTP only runs on "
-            "the paged pipeline and only shortens decode -- expect TPOT to move and TTFT not to.",
-            "",
-            "Memory is reported as **peak / mean**, and the two are not interchangeable. Peak is "
-            "the high-water mark over the whole case, load included, and is what decides whether "
-            "the box can run the configuration at all -- it is set by the transient prefill "
-            "workspace. Mean is the time-weighted average over the measured iterations only, so "
-            "it excludes model load, and is what the configuration costs for the minutes it "
-            "actually runs -- the figure to use when the same budget has to hold the rest of the "
-            "application. A large peak/mean gap is a spiky workload, not a cheap one.",
-            "",
-        ]
+    if acc:
+        lines.append(
+            f"Accuracy  : {', '.join(acc['suites'])} | baseline profile "
+            f"{acc.get('baseline_profile') or '(none)'} | seed {acc['seed']}"
+        )
+    lines.append("")
 
     for context in settings["context_tokens"]:
         at_context = [c for c in cases if c["context_tokens"] == context]
-        if not at_context:
-            continue
-        if accuracy_mode:
-            lines += _accuracy_section(at_context, context, settings)
-            continue
-        lines += [
-            f"## {context:,} tokens",
-            "",
-            "| Model | Profile | Pipeline | MTP | Status | TPOT ms/token | TTFT s | "
-            f"Decode tok/s | E2E tok/s | Prefill tok/s | RAM peak / mean | GPU peak / mean "
-            f"(% of {settings['gpu_memory_budget_gb']:g} GB) | Expected KV | cache_size |",
-            "|---|---|---|---|---|---|---|---|---|---|---|---|---|---|",
-        ]
-        ranked = _leaderboard(at_context)
-        # Identity, not equality: two profiles can produce byte-identical rows, and `in`
-        # on dicts would drop the duplicate from the report entirely.
-        ranked_ids = {id(c) for c in ranked}
-        rest = [c for c in at_context if id(c) not in ranked_ids]
-        for case in ranked + rest:
-            # A case that never produced a measurement still gets a row -- its status is
-            # the finding -- but its timing columns stay blank rather than reading as zeros.
-            timings = [
-                _fmt(case.get("other_tokens_avg_latency")),
-                _ttft_seconds(case),
-                _fmt(case.get("decode_throughput"), "{:.2f}"),
-                _fmt(case.get("e2e_throughput")),
-                _fmt(case.get("prefill_throughput")),
-            ]
-            if case["status"] not in _USABLE_STATUSES:
-                timings = ["--"] * len(timings)
-            lines.append(
-                f"| {case['model']} | {case['profile']} "
-                f"| {case.get('pipeline_mode') or '--'} "
-                f"| {_mtp_cell(case, empty='off').strip() or 'off'} | {case['status']} | "
-                + " | ".join(timings)
-                + f" | {_fmt(case.get('peak_ram_gb'))} / {_fmt(case.get('mean_ram_gb'))} GB "
-                f"| {_fmt(case.get('peak_gpu_gb'))} GB "
-                f"({_fmt(case.get('peak_gpu_pct_of_budget'))}%) "
-                f"/ {_fmt(case.get('mean_gpu_gb'))} GB "
-                f"({_fmt(case.get('mean_gpu_pct_of_budget'))}%) "
-                f"| {_fmt(case.get('expected_kv_gb'), '{:.2f}')} GB "
-                f"| {_fmt(case.get('cache_size_gb'), '{:g}')} |"
-            )
-        lines.append("")
+        if at_context:
+            lines += _speed_section(at_context, context, settings)
+            if acc:
+                lines += _accuracy_section(at_context, context, settings)
 
-        by_ttft = _ttft_leaderboard(at_context)
-        if by_ttft:
-            fastest = by_ttft[0]
-            lines += [
-                f"**Fastest TTFT at {context:,} tokens: `{fastest['profile']}`** "
-                f"({fastest.get('pipeline_mode') or '--'} pipeline) on {fastest['model']} -- "
-                f"TTFT {_ttft_seconds(fastest)}s, prefill "
-                f"{_fmt(fastest.get('prefill_throughput'))} tok/s, peak GPU "
-                f"{_fmt(fastest.get('peak_gpu_gb'))} GB.",
-                "",
-            ]
-
-        if ranked:
-            best = ranked[0]
-            lines += [
-                f"**Best TPOT at {context:,} tokens: `{best['profile']}`** on {best['model']} -- "
-                f"{_best_summary(best)}, e2e {_fmt(best.get('e2e_throughput'))} tok/s, peak GPU "
-                f"{_fmt(best.get('peak_gpu_gb'))} GB "
-                f"({_fmt(best.get('peak_gpu_pct_of_budget'))}% of configured budget).",
-                "",
-                f"    pipeline:  {best.get('pipeline_mode') or '--'}",
-                f"    ov:        {best['ov_config']}",
-                f"    scheduler: {best['scheduler_config']}",
-                f"    mtp:       {_mtp_cell(best, empty='off').strip() or 'off'}",
-                "",
-            ]
-
-        speedup = _mtp_speedup(at_context)
-        if speedup:
-            lines += [speedup, ""]
-        output_check = _mtp_output_check(at_context)
-        if output_check:
-            lines += [output_check, ""]
-
-    failures = [c for c in cases if c["status"] not in _USABLE_STATUSES]
-    if failures:
-        lines += ["## Cases that did not produce a measurement", "",
-                  "| Model | Profile | Context | Status | Error |", "|---|---|---|---|---|"]
-        for case in failures:
-            error = str(case.get("error") or "").replace("|", "/").replace("\n", " ")[:180]
-            lines.append(
-                f"| {case['model']} | {case['profile']} | {case['context_tokens']:,} | "
-                f"{case['status']} | {error} |"
-            )
-        lines.append("")
-
-    with open(os.path.join(output_dir, "summary.md"), "w", encoding="utf-8") as f:
-        f.write("\n".join(lines) + "\n")
+    lines += _probe_detail(cases)
+    lines += _failure_section(cases)
+    return lines
 
 
-def _append_iterations(output_dir: str, case: dict) -> None:
-    path = os.path.join(output_dir, "iterations.csv")
-    for record in case.get("_iterations", []):
-        row = {
-            "model": case["model"],
-            "profile": case["profile"],
-            "context_tokens": case["context_tokens"],
-            **{
-                field: record.get(field)
-                for field in (*metrics.ITERATION_FIELDS, *_ITERATION_MEMORY_FIELDS)
-            },
-        }
-        StorageManager.save_csv(path, row, headers=ITERATION_CSV_FIELDS, append=True)
+def _heading(text: str) -> list:
+    return ["-" * 78, f" {text}", "-" * 78, ""]
 
 
-def _write_probes(output_dir: str, cases: list) -> None:
-    """One row per scored accuracy probe -- the accuracy analog of `iterations.csv`.
+def _speed_section(at_context: list, context: int, settings: dict) -> list:
+    """TTFT, TPOT, throughput and RAM/GPU for one context, ranked by TPOT.
 
-    Rewritten in full on every report pass rather than appended per case, which is what
-    `summary.csv` does and what the generation suite requires: a probe's fidelity columns are
-    filled once the baseline profile's case has run, so a row appended when its case finished
-    would be missing the scores that arrive later. Only accuracy cases carry `_probes`, so a
-    throughput run never creates the file.
+    Latencies are milliseconds and throughputs tokens/second, in llm_bench's units; every
+    figure is the median of the measured generations with the warm-up excluded. Memory is
+    peak / mean and the two are not interchangeable: peak includes model load and decides
+    whether the box can run the configuration at all, mean excludes it and is what the
+    configuration costs for the minutes it runs.
     """
-    path = os.path.join(output_dir, "probes.csv")
-    written = 0
-    for case in cases:
-        for record in case.get("_probes", []):
-            row = {
-                "model": case["model"],
-                "profile": case["profile"],
-                "context_tokens": case["context_tokens"],
-                **{
-                    field: record.get(field)
-                    for field in PROBE_CSV_FIELDS
-                    if field not in ("model", "profile", "context_tokens")
-                },
-            }
-            StorageManager.save_csv(
-                path, row, headers=PROBE_CSV_FIELDS,
-                append=written > 0,  # the first row truncates the previous rewrite
+    lines = _heading(f"{context:,} tokens -- SPEED AND RESOURCES")
+    lines += [
+        "| Model | Profile | Pipeline | KV | MTP | Status | TPOT ms/tok | TTFT s "
+        f"| Decode tok/s | E2E tok/s | Prefill tok/s | RAM peak/mean GB | GPU peak/mean GB "
+        f"(% of {settings['gpu_memory_budget_gb']:g}) | KV est GB | cache |",
+        "|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|",
+    ]
+    ranked = _leaderboard(at_context)
+    # Identity, not equality: two profiles can produce byte-identical rows, and `in` on
+    # dicts would drop the duplicate from the report entirely.
+    ranked_ids = {id(c) for c in ranked}
+    for case in ranked + [c for c in at_context if id(c) not in ranked_ids]:
+        # A case that never produced a measurement still gets a row -- its status is the
+        # finding -- but its timing columns stay blank rather than reading as zeros.
+        timings = [
+            _fmt(case.get("other_tokens_avg_latency")),
+            _ttft_seconds(case),
+            _fmt(case.get("decode_throughput"), "{:.2f}"),
+            _fmt(case.get("e2e_throughput")),
+            _fmt(case.get("prefill_throughput")),
+        ]
+        if case["status"] not in _USABLE_STATUSES:
+            timings = ["--"] * len(timings)
+        lines.append(
+            f"| {case['model']} | {case['profile']} | {case.get('pipeline_mode') or '--'} "
+            # KV precision is a column and not a footnote because it is the variable most
+            # often changed by accident: two profiles meant to differ only in the pipeline,
+            # one edited to f16, and the TTFT gap between them is no longer attributable.
+            f"| {case.get('kv_cache_precision') or '--'} "
+            f"| {_mtp_cell(case, empty='off').strip() or 'off'} | {case['status']} | "
+            + " | ".join(timings)
+            + f" | {_fmt(case.get('peak_ram_gb'))}/{_fmt(case.get('mean_ram_gb'))} "
+            f"| {_fmt(case.get('peak_gpu_gb'))}/{_fmt(case.get('mean_gpu_gb'))} "
+            f"({_fmt(case.get('peak_gpu_pct_of_budget'))}%/"
+            f"{_fmt(case.get('mean_gpu_pct_of_budget'))}%) "
+            f"| {_fmt(case.get('expected_kv_gb'), '{:.2f}')} "
+            f"| {_fmt(case.get('cache_size_gb'), '{:g}')} |"
+        )
+    lines.append("")
+
+    if ranked:
+        best = ranked[0]
+        lines += [
+            f"Best TPOT  : {best['profile']} ({best.get('pipeline_mode') or '--'}) -- "
+            f"{_best_summary(best)}, peak GPU {_fmt(best.get('peak_gpu_gb'))} GB "
+            f"({_fmt(best.get('peak_gpu_pct_of_budget'))}% of budget)",
+            f"             ov {best['ov_config']}",
+            f"             scheduler {best['scheduler_config']}",
+        ]
+    by_ttft = _ttft_leaderboard(at_context)
+    if by_ttft:
+        fastest = by_ttft[0]
+        lines.append(
+            f"Fastest TTFT: {fastest['profile']} "
+            f"({fastest.get('pipeline_mode') or '--'}) -- {_ttft_seconds(fastest)}s, prefill "
+            f"{_fmt(fastest.get('prefill_throughput'))} tok/s"
+        )
+    for note in (_mtp_speedup(at_context), _mtp_output_check(at_context)):
+        if note:
+            lines.append(note.replace("**", ""))
+    lines.append("")
+    return lines
+
+
+def _probe_detail(cases: list) -> list:
+    """Every scored probe, one line each -- what was planted, what came back, what it scored.
+
+    This is the only place the model's
+    actual answers survive, and reading the worst-scoring ones is how a suspicious rate gets
+    explained, so it stays even though it is the longest section.
+    """
+    rows = [(c, p) for c in cases for p in c.get("_probes", [])]
+    if not rows:
+        return []
+    lines = _heading(f"PROBE DETAIL ({len(rows)} probe(s))")
+    for case, probe in rows:
+        depth = probe.get("depth")
+        where = f"d={depth:.2f}" if isinstance(depth, (int, float)) else "  -  "
+        if probe.get("suite") == accuracy.SUITE_GENERATION:
+            scores = (
+                f"rougeL {_acc_num(probe.get('rouge_l'))} chrf {_acc_num(probe.get('chrf'))} "
+                f"fdt {_acc_num(probe.get('fdt'), '{:g}')} "
+                f"sim {_acc_num(probe.get('similarity'), '{:.4f}')} "
+                f"cover {_acc_num(probe.get('fact_coverage'))}"
             )
-            written += 1
+        else:
+            scores = (
+                f"recall {_acc_num(probe.get('recall'))} "
+                f"em {1 if probe.get('exact_match') else 0} "
+                f"f1 {_acc_num(probe.get('token_f1'))} "
+                f"decoy {_acc_num(probe.get('distractor_rate'))}"
+            )
+        lines += [
+            f"{case['profile']:<12} {probe.get('task', '?'):<16} {where} #{probe.get('sample')}"
+            f"  {probe.get('input_size', 0):,} tok  {scores}",
+            f"    truth  : {_one_line(probe.get('truth'), 110)}",
+            f"    answer : {_one_line(probe.get('prediction'), 110)}",
+        ]
+    lines.append("")
+    return lines
 
 
-def _print_accuracy_result(at_context: list, context: int, settings: dict) -> None:
-    """The console counterpart of the summary.md accuracy sections: the best profile per
-    suite, and the largest fidelity drift, which is the finding the run exists to surface."""
-    baseline_name = (settings.get("accuracy") or {}).get("baseline_profile")
+def _one_line(text, limit: int) -> str:
+    """Collapse an answer to a single readable line -- the report is a text file, and a
+    generated paragraph with newlines in it would break every column after it."""
+    flat = " ".join(str(text or "").split())
+    return flat if len(flat) <= limit else flat[: limit - 3] + "..."
 
-    best = _accuracy_leaderboard(at_context, accuracy.SUITE_RETRIEVAL)
-    if best:
-        summary = _suite_summary(best[0], accuracy.SUITE_RETRIEVAL)
-        print(
-            f"\nBest retrieval at {context:,} tokens: {best[0]['profile']} on "
-            f"{best[0]['model']} -- recall {_acc_pct(summary.get('recall_rate'))}, exact "
-            f"match {_acc_pct(summary.get('exact_match_rate'))}, F1 "
-            f"{_acc_pct(summary.get('token_f1'))} over {summary.get('probe_count')} probes",
-            flush=True,
+
+def _failure_section(cases: list) -> list:
+    failures = [c for c in cases if c["status"] not in _USABLE_STATUSES]
+    if not failures:
+        return []
+    lines = _heading("CASES THAT DID NOT PRODUCE A MEASUREMENT")
+    for case in failures:
+        lines.append(
+            f"{case['model']} / {case['profile']} @ {case['context_tokens']:,} tok -- "
+            f"{case['status']}: {_one_line(case.get('error'), 200)}"
         )
+    lines.append("")
+    return lines
 
-    ranked = _accuracy_leaderboard(at_context, accuracy.SUITE_GENERATION)
-    drifted = [c for c in ranked if c["profile"] != baseline_name]
-    if drifted:
-        worst = _suite_summary(drifted[-1], accuracy.SUITE_GENERATION)
-        semantic = (
-            f"similarity {_acc_num(worst.get('similarity'), '{:.4f}')}, "
-            if worst.get("similarity") is not None else ""
-        )
-        print(
-            f"Largest generation drift at {context:,} tokens: {drifted[-1]['profile']} vs "
-            f"{baseline_name} -- {semantic}ROUGE-L {_acc_num(worst.get('rouge_l'))}, "
-            f"chrF {_acc_num(worst.get('chrf'))}, "
-            f"identical {_acc_pct(worst.get('identical_rate'))}",
-            flush=True,
-        )
-    for note in sorted(settings.get("_similarity_notes") or ()):
-        print(f"Similarity not measured: {note}", flush=True)
 
 
 def _safe_platform_info() -> dict:
@@ -3021,57 +2873,28 @@ def main() -> None:
             for context in settings["context_tokens"]:
                 for profile in settings["profiles"]:
                     case = _run_case(model_name, model_dir, profile, context, settings, static)
-                    print(_format_case(case), flush=True)
                     cases.append(case)
-                    _append_iterations(output_dir, case)
-                    # probes.csv is rewritten inside write_reports, not appended here: the
-                    # generation suite's fidelity columns are filled across cases.
-                    write_reports(output_dir, settings, cases, platform_info, completed=False)
+                    # Before the per-case line, not after: write_report is what fills the
+                    # generation suite's fidelity columns (rouge_l, chrf, fdt, similarity),
+                    # which are cross-case and cannot be scored until the baseline profile's
+                    # answers are in `cases`. Printing first showed every case's ROUGE-L as
+                    # "--" even on a single profile comparing against itself.
+                    write_report(output_dir, settings, cases, platform_info, completed=False)
+                    print(_format_case(case), flush=True)
         completed = True
     finally:
-        # Reached on Ctrl-C and on an unhandled failure too: the iterations already recorded
-        # are worth a report, and the banner says the run ended early.
+        # Reached on Ctrl-C and on an unhandled failure too: the cases already measured are
+        # worth a report, and its header says the run ended early.
         try:
-            write_reports(output_dir, settings, cases, platform_info, completed=completed)
+            lines = write_report(output_dir, settings, cases, platform_info, completed)
         except Exception:  # noqa: BLE001 - must not mask whatever is already unwinding
             traceback.print_exc()
         else:
-            accuracy_mode = settings.get("accuracy") is not None
-            for context in settings["context_tokens"]:
-                at_context = [case for case in cases if case.get("context_tokens") == context]
-                if accuracy_mode:
-                    _print_accuracy_result(at_context, context, settings)
-                    continue
-                ranked = _leaderboard(at_context)
-                if ranked:
-                    print(
-                        f"\nBest TPOT at {context:,} tokens: {ranked[0]['profile']} on "
-                        f"{ranked[0]['model']} -- {_best_summary(ranked[0])}",
-                        flush=True,
-                    )
-                by_ttft = _ttft_leaderboard(at_context)
-                if by_ttft:
-                    fastest = by_ttft[0]
-                    print(
-                        f"Fastest TTFT at {context:,} tokens: {fastest['profile']} "
-                        f"({fastest.get('pipeline_mode') or '--'}) on {fastest['model']} -- "
-                        f"TTFT {_ttft_seconds(fastest)}s, prefill "
-                        f"{_fmt(fastest.get('prefill_throughput'))} tok/s",
-                        flush=True,
-                    )
-                speedup = _mtp_speedup(at_context)
-                if speedup:
-                    print(speedup.replace("**", ""), flush=True)
-                output_check = _mtp_output_check(at_context)
-                if output_check:
-                    print(output_check.replace("**", "").replace("`", ""), flush=True)
-            artifacts = (
-                "probes.csv, summary.csv, summary.md, summary.json"
-                if accuracy_mode
-                else "iterations.csv, summary.csv, summary.md, summary.json"
-            )
+            # The console gets exactly what the file got -- one builder, two sinks, so the
+            # two can never disagree about what was measured.
+            print("\n" + "\n".join(lines), flush=True)
             print(
-                f"Reports written to {output_dir} ({artifacts})"
+                f"Report written to {os.path.join(output_dir, REPORT_NAME)}"
                 + ("" if completed else " -- run ended early, marked incomplete"),
                 flush=True,
             )

@@ -688,7 +688,7 @@ def _run_throughput_iterations(pipe, accepts_tokenized_input, tokenizer, result_
             # VLMPipeline path the pipeline re-tokenizes the prompt string, so the two can
             # differ, and reporting a throughput per *requested* token would divide by a
             # number no forward pass ever saw. Not fatal -- the measurement is real either
-            # way, and iterations.csv's input_size now says which context length it is of.
+            # way, and the report's input_size now says which context length it is of.
             input_size = perf.get("input_size") or prompt_tokens
             if input_size != prompt_tokens and not input_size_reported:
                 input_size_reported = True

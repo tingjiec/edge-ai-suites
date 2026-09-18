@@ -12,7 +12,11 @@
 #   .\components\llm\context_bench\run_benchmark.ps1
 #   .\components\llm\context_bench\run_benchmark.ps1 --list-profiles
 #   .\components\llm\context_bench\run_benchmark.ps1 --profiles stateful --iterations 1
-#   .\components\llm\context_bench\run_benchmark.ps1 --config components/llm/context_bench/config_qwen3.6_35b_a3b.yaml
+#   .\components\llm\context_bench\run_benchmark.ps1 --config components/llm/context_bench/config_qwen3.8_27b.yaml
+#   .\components\llm\context_bench\run_benchmark.ps1 --accuracy
+#
+# One config per model carries both the throughput matrix and the accuracy suites, and every
+# run writes one report.txt which is also printed to the console when the run ends.
 #
 # If PowerShell blocks the script with an UnauthorizedAccess/SecurityError:
 #   Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass

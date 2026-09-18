@@ -545,6 +545,36 @@ class TestTimeWeightedMean(unittest.TestCase):
         self.assertAlmostEqual(coarse.mean(10.0), fine.mean(10.0))
 
 
+class TestTheSpeedSectionRendersEveryMeasuredVariable(unittest.TestCase):
+    """The report is now the tool's only output, so "does this metric reach the user" is a
+    question about rendered text rather than about a CSV header list.
+
+    `pipeline_mode` and the MTP columns are the load-bearing ones: without them a report
+    shows two rows whose TTFT differs by 100s and cannot say which configuration each was.
+    """
+
+    def test_pipeline_mtp_memory_and_timing_all_appear(self):
+        case = {
+            "model": "M", "profile": "mtp_k3", "context_tokens": 8000, "status": "ok",
+            "pipeline_mode": benchmark.PIPELINE_PAGED, "mtp": True,
+            "num_assistant_tokens": 3, "tokens_per_step": 2.44,
+            "mtp_acceptance_rate": 0.74, "other_tokens_avg_latency": 40.7,
+            "first_token_latency": 4000.0, "decode_throughput": 24.6,
+            "e2e_throughput": 300.0, "prefill_throughput": 620.0,
+            "peak_ram_gb": 31.2, "mean_ram_gb": 29.8, "peak_gpu_gb": 20.1,
+            "mean_gpu_gb": 19.4, "peak_gpu_pct_of_budget": 34.1,
+            "mean_gpu_pct_of_budget": 32.9, "expected_kv_gb": 2.1, "cache_size_gb": 4,
+            "ov_config": "ATTENTION_BACKEND=PA", "scheduler_config": "cache_size=4",
+        }
+        text = "\n".join(
+            benchmark._speed_section([case], 8000, {"gpu_memory_budget_gb": 59})
+        )
+
+        for shown in ("paged", "k=3", "40.7", "4.0", "24.60", "31.2/29.8", "20.1/19.4",
+                      "34.1%", "2.10", "SPEED AND RESOURCES"):
+            self.assertIn(shown, text, shown)
+
+
 class TestMeanOccupancyReachesTheReport(unittest.TestCase):
     def test_aggregated_as_the_median_of_the_measured_windows(self):
         rows = [
@@ -568,11 +598,6 @@ class TestMeanOccupancyReachesTheReport(unittest.TestCase):
         self.assertNotIn("mean_ram_gb", aggregate)
         self.assertNotIn("mean_gpu_gb", aggregate)
 
-    def test_both_csvs_carry_the_new_columns(self):
-        for field in ("mean_ram_gb", "mean_gpu_gb"):
-            self.assertIn(field, benchmark.CASE_FIELDS)
-            self.assertIn(field, benchmark.ITERATION_CSV_FIELDS)
-        self.assertIn("mean_gpu_pct_of_budget", benchmark.CASE_FIELDS)
 
 
 class TestPipelineModeIsRecorded(unittest.TestCase):
@@ -645,8 +670,6 @@ class TestPipelineModeIsRecorded(unittest.TestCase):
         self.assertEqual(case["pipeline_mode"], benchmark.PIPELINE_STATEFUL)
         self.assertIsNone(case["cache_size_gb"])
 
-    def test_the_mode_reaches_summary_csv(self):
-        self.assertIn("pipeline_mode", benchmark.CASE_FIELDS)
 
 
 class TestSafePlatformInfo(unittest.TestCase):
@@ -961,10 +984,6 @@ class TestMtpProfileResolution(unittest.TestCase):
         self.assertFalse(baseline["mtp"]["enabled"])
         self.assertEqual(swept["mtp"]["num_assistant_tokens"], 5)
 
-    def test_the_configured_matrix_reaches_summary_csv(self):
-        for field in ("mtp", "num_assistant_tokens", "tokens_per_step",
-                      "mtp_acceptance_rate"):
-            self.assertIn(field, benchmark.CASE_FIELDS)
 
 
 class TestMultiTokenPredictionYield(unittest.TestCase):

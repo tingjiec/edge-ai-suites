@@ -15,9 +15,9 @@ It benchmarks a matrix of named configuration *profiles* — KV cache precision,
 chunk size, scheduler cache size, continuous batching vs the stateful pipeline, multi-token
 prediction and its candidate count — and ranks
 them by measured TPOT, using TTFT as the tie-breaker; the fastest TTFT is also called out on
-its own, because at long context TTFT is what the user waits for. The 9B and 35B configs pin two
-profiles that differ **only** in the pipeline — `stateful` and `paged_min` — so one run answers
-which pipeline reaches the first token sooner; the Qwen3.8 config instead sweeps
+its own, because at long context TTFT is what the user waits for. The 35B config ships a
+`stateful` / `paged_min` pair so one run answers which pipeline reaches the first token
+sooner; the Qwen3.8 config instead sweeps
 [multi-token prediction](#multi-token-prediction-mtp). Add entries to `profiles` to A/B more in one
 run. Measurement follows the methodology of
 [llm_bench](https://github.com/openvinotoolkit/openvino.genai/tree/master/tools/llm_bench):
@@ -26,17 +26,19 @@ one warm-up iteration excluded from every statistic, N measured iterations, and 
 
 It is **not** part of the runtime pipeline. Nothing in the app imports it, and it reads its
 own model-specific configs —
-[`config_qwen3.5_9b.yaml`](../../../components/llm/context_bench/config_qwen3.5_9b.yaml),
-[`config_qwen3.6_35b_a3b.yaml`](../../../components/llm/context_bench/config_qwen3.6_35b_a3b.yaml), and
+[`config_qwen3.6_35b.yaml`](../../../components/llm/context_bench/config_qwen3.6_35b.yaml) and
 [`config_qwen3.8_27b.yaml`](../../../components/llm/context_bench/config_qwen3.8_27b.yaml)
 — never `smart-classroom/config.yaml`. Editing either has no effect on the application.
 
+**One config per model, one report per run.** Each config carries the throughput matrix *and*
+the accuracy suites, and every run writes a single `report.txt` — TTFT, TPOT, throughput,
+RAM/GPU, and (with `--accuracy`) every accuracy metric and every individual probe — which is
+also printed to the console when the run ends.
+
 ```
 components/llm/context_bench/
-  config_qwen3.5_9b.yaml           Qwen3.5-9B 160K: stateful vs paged_min
-  config_qwen3.6_35b_a3b.yaml      Qwen3.6-35B-A3B 160K: stateful vs paged_min
-  config_qwen3.8_27b.yaml          Qwen3.8-27B 8K: no-MTP baseline vs a num_assistant_tokens sweep
-  config_qwen3.8_27b_accuracy.yaml Qwen3.8-27B 32K accuracy, one paged profile (extend to compare)
+  config_qwen3.6_35b.yaml  Qwen3.6-35B-A3B: stateful vs paged_min, + accuracy suites
+  config_qwen3.8_27b.yaml  Qwen3.8-27B: no-MTP baseline vs a k sweep, + accuracy suites
   context_builder.py     synthetic transcript sized to an exact token count (+ probe placement)
   tasks.py               the RULER + generation task registry: what is planted and what is asked
   scoring.py             pure-Python metrics: SQuAD, RULER, ROUGE/chrF, FDT/SDT
@@ -69,7 +71,7 @@ components/llm/context_bench/
 .\components\llm\context_bench\run_benchmark.ps1 --profiles stateful --contexts 8000 --iterations 1
 
 # Select the 35B model matrix
-.\components\llm\context_bench\run_benchmark.ps1 --config components/llm/context_bench/config_qwen3.6_35b_a3b.yaml
+.\components\llm\context_bench\run_benchmark.ps1 --config components/llm/context_bench/config_qwen3.6_35b.yaml
 ```
 
 Historical 160K runs took roughly 245–300 s per Qwen3.5-9B iteration and 400–500 s per
@@ -188,7 +190,7 @@ acceptance. Acceptance alone can mislead, though: read it next to
 `mtp_draft_to_main_ratio`, the draft head's share of each verification pass. A profile can
 hold acceptance steady while that ratio climbs, and once proposing the candidates costs a
 large fraction of the pass that verifies them, a higher `k` stops paying even while
-`tok/step` still rises. `summary.md` prints an **MTP speedup** line per
+`tok/step` still rises. The report prints an **MTP speedup** line per
 context comparing the best MTP profile against the best non-MTP one, so the ranking does not
 have to be read as a subtraction.
 
@@ -225,7 +227,7 @@ what checks it did.
 
 ```powershell
 .\components\llm\context_bench\run_benchmark.ps1 `
-  --config components/llm/context_bench/config_qwen3.8_27b_accuracy.yaml --accuracy
+  --config components/llm/context_bench/config_qwen3.8_27b.yaml --accuracy
 ```
 
 The shipped accuracy config runs **one** paged profile, so what it reports is the model's own
@@ -281,7 +283,7 @@ profile cannot score a hit by memorizing one answer.
 > *divides* by the token count, so a token matters there. A retrieval verdict does not: "did
 > the model find the code planted at depth 0.25 of an 8,000-token context" is the same
 > question at 8,001. Measured with the Qwen3.8 tokenizer, every probe lands within 2 tokens.
-> The count actually used is what `probes.csv` records and what any per-token figure divides
+> The count actually used is what the report records and what any per-token figure divides
 > by, so nothing is reported against a number no forward pass saw.
 >
 > A probe whose prompt cannot be built at all is **skipped with a note** rather than failing
@@ -378,7 +380,7 @@ a long sweep — the full suite across a depth sweep multiplies faster than it l
 
 ### Reading the result
 
-`summary.md` prints, per context:
+`report.txt` adds, per context:
 
 * a **per-task table** — the headline, because it is where a profile holding `niah_single` at
   100% while collapsing on `vt` or `cwe` becomes visible — with `Overall` / `EM` / `F1` /
@@ -390,19 +392,18 @@ a long sweep — the full suite across a depth sweep multiplies faster than it l
   baseline row compares against itself, so it reads 1.00 throughout — that row is the sanity
   check, not a result.
 
-Every probe — its planted ground truth, the model's answer and all of its scores — is a row in
-**`probes.csv`**, the accuracy analog of `iterations.csv`. Both suites share one schema; a row
-leaves blank the metrics its suite does not produce, so sorting every probe by `recall` and
-reading the worst is one spreadsheet operation.
+A **probe detail** section follows, one entry per probe: what was planted, what the model
+answered, and what it scored. It is the only place the answers themselves survive, and
+reading the worst-scoring ones is how a suspicious rate gets explained.
 
-Because accuracy mode replaces the timing iterations with probes, `summary.csv` / `CASE_FIELDS`
-are **unchanged** — accuracy lives in `probes.csv`, the `summary.md` sections, and a nested
-`accuracy` object (keyed by suite) in `summary.json`. A throughput run's headers never move.
+An accuracy run also reports **speed and resources** in the same file — its probes carry the
+same timing records the throughput path produces, so one run gives TTFT, TPOT, throughput,
+memory and accuracy together.
 
 > **The generation suite's fidelity scores are cross-case**, so they are filled at report time
 > rather than when a case finishes: the reference is the baseline profile's output, and that
-> profile may run after the profile being scored. `probes.csv` is rewritten in full on every
-> report pass for the same reason.
+> profile may run after the profile being scored. That is also why `report.txt` is rewritten
+> in full after every case rather than appended to.
 
 ## What gets measured
 
@@ -555,15 +556,22 @@ scheduler value, add `--profiles paged_min`.
 
 ## Output
 
-Each run writes to `<output_dir>/<YYYYMMDD-HHMMSS>/`, so runs never mix:
+Each run writes **one file**, `<output_dir>/<YYYYMMDD-HHMMSS>/report.txt`, so runs never mix.
+The same lines are printed to the console when the run ends — one builder, two sinks, so the
+file and the terminal can never disagree about what was measured. Its sections:
 
-| File | Contents |
+| Section | Contents |
 |---|---|
-| `iterations.csv` | one row per iteration, warm-up included and flagged, with its own peak and mean memory window (throughput runs) |
-| `probes.csv` | one row per scored accuracy probe, both suites in one schema: the suite and task, the planted ground truth and decoys, the model's answer, and every score (RULER recall/EM/F1/decoys, ROUGE/chrF, FDT/SDT, similarity, fact coverage). Only on `--accuracy` runs, and rewritten in full on every report pass because the fidelity columns are cross-case |
-| `summary.csv` | one row per (model, profile, context) with aggregated metrics, including `pipeline_mode`, `cache_size_gb`, `mtp` and `num_assistant_tokens`. Header is identical whether or not `--accuracy` is on |
-| `summary.md` | throughput runs: ranked leaderboard per context with `Pipeline`/`MTP` columns, the fastest-TTFT call-out, the MTP speedup line, and the winner's config. Accuracy runs: the RULER per-task table with the `Delta` column, the depth × profile sweep, and the generation-fidelity table |
-| `summary.json` | the same data structured, including hardware info and (on accuracy runs) each case's nested `accuracy` object, keyed by suite |
+| header | hardware, device, weights, budgets, the context and iteration plan, and (with `--accuracy`) the suites, baseline profile and seed |
+| `SPEED AND RESOURCES` | one row per profile, ranked by TPOT: pipeline, KV precision, MTP yield, TPOT, TTFT, decode / e2e / prefill throughput, RAM and GPU peak/mean, the KV estimate and `cache_size`. Then the best-TPOT and fastest-TTFT call-outs, the MTP speedup line and the greedy-output check |
+| `RETRIEVAL ACCURACY (RULER)` | per-task recall with `Overall` / `EM` / `F1` / `Decoys` and a `Delta vs <baseline>` column, then the depth × profile sweep |
+| `GENERATION FIDELITY` | similarity, ROUGE-1/2/L, chrF, FDT, SDT norm, Identical and Coverage per profile, then the largest drift (or a no-drift line) |
+| `PROBE DETAIL` | every probe: task, depth, sample, prompt size, its scores, the planted truth and the model's answer |
+| `CASES THAT DID NOT PRODUCE A MEASUREMENT` | status and error for anything that failed, so a partial run still says what broke |
+
+It is rewritten in full after **every** case, not once at the end: this tool's job is to push
+the box until it breaks, and it can break hard enough to take the orchestrator with it. A
+stale report that looks current is worse than none.
 
 The TPOT ranking and the fastest-TTFT line can name different profiles — that is the point of
 printing both. At 160K, TTFT is ~96% of the wall clock, so a profile that wins on TPOT while
@@ -651,7 +659,7 @@ python -m unittest discover -s components/tests -p "test_context_bench_*.py"
 | File | Covers |
 |---|---|
 | `test_context_bench_context_builder.py` | exact-token prompt construction |
-| `test_context_bench_kv_estimate.py` | architecture-derived KV size, the per-sequence linear-attention reservation `max_num_seqs` controls, `cache_size: auto`, the MTP draft head's own KV surcharge, and the shipped configs' invariants (the 9B/35B pair differ only in the pipeline; the Qwen3.8 matrix differs only in MTP) |
+| `test_context_bench_kv_estimate.py` | architecture-derived KV size, the per-sequence linear-attention reservation `max_num_seqs` controls, `cache_size: auto`, the MTP draft head's own KV surcharge, and the shipped configs' invariants (loadable, unique profile names, every paged profile valid, and `accuracy.baseline_profile` naming a profile that actually runs) |
 | `test_context_bench_metrics.py` | llm_bench units, TPOT-first ranking, the TTFT ranking, `pipeline_mode` recording, `mtp` profile resolution, the MTP yield/acceptance arithmetic, medians, the time-weighted mean occupancy, `perf_metrics` fallback |
 | `test_context_bench_trial_lifecycle.py` | child exit path, parent recovery, failure classification, MTP rejected before the model loads |
 | `test_context_bench_accuracy.py` | every scorer (SQuAD, RULER item-recall/IoU, ROUGE, chrF, FDT/SDT) including the trap that the lexical metrics must not use the article-stripping SQuAD tokenizer; each RULER task's shape, value determinism and corpus-disjointness, and that `cwe`/`fwe` ground truth survives the filler being sliced to an exact token count; exact-token prompt construction for up to sixteen inserts at their depths; probe-set sizing, per-suite scoring and aggregation over partially-applicable metrics; the cross-case generation-fidelity pairing; the who_what_benchmark adapter against a stubbed package; `accuracy` config validation; and the invariant that accuracy mode leaves `CASE_FIELDS`/`ITERATION_CSV_FIELDS` untouched |

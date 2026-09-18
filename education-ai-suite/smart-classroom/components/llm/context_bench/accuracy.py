@@ -64,7 +64,7 @@ _AGGREGATE_NAMES = {
 }
 _PROBE_FIELD = {aggregate: probe for probe, aggregate in _AGGREGATE_NAMES.items()}
 
-# Every per-probe score column, so probes.csv has one stable schema across both suites and a
+# Every per-probe score column, so the probe-detail report has one shape across both suites and a
 # row simply leaves blank the metrics its suite does not produce.
 PROBE_SCORE_FIELDS = (
     "exact_match", "recall", "token_f1", "distractor_rate",
@@ -121,7 +121,7 @@ def build_probe_specs(accuracy_cfg: dict, context_tokens: int) -> list:
 # Scoring one answer
 # ---------------------------------------------------------------------------
 def score_retrieval(prediction: str, spec: ProbeSpec) -> dict:
-    """The retrieval scores for one answer, as they land in probes.csv.
+    """The retrieval scores for one answer, as they land in the probe detail.
 
     `recall` is the primary number and is RULER's own scorer for the task -- item recall for
     the NIAH and tracing tasks, intersection-over-union for the aggregation ones (which have

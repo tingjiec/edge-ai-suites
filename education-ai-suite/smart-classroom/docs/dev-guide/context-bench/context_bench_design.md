@@ -59,9 +59,8 @@ who_what_benchmark 的方式把真实任务的输出与基线 profile 的输出�
 
 ```text
 components/llm/context_bench/
-├── config_qwen3.5_9b.yaml       9B @160K：stateful 与 paged_min 两个 profile
-├── config_qwen3.6_35b_a3b.yaml  35B @160K：stateful 与 paged_min 两个 profile
-├── config_qwen3.8_27b.yaml      27B @8K：无 MTP 基线 + num_assistant_tokens 扫描
+├── config_qwen3.6_35b.yaml  35B：stateful 与 paged_min 两个 profile + accuracy 两个 suite
+├── config_qwen3.8_27b.yaml  27B：无 MTP 基线 + num_assistant_tokens 扫描 + accuracy 两个 suite
 ├── context_builder.py   按目标 token 数精确构造合成课堂转录
 ├── metrics.py           llm_bench 口径的单次迭代记录与聚合
 ├── trial_runner.py      单个 (model, profile, context) case 的子进程执行器
@@ -169,7 +168,7 @@ genai 会**按可调度序列数**各预留一份完整的 linear-attention 状�
 一对 profile 一次跑完对比。落到代码上的三处约束：
 
 1. `pipeline_mode(scheduler_config)` 是唯一判据——**scheduler 段是否为空**决定 `stateful` /
-   `paged`，该值写入 `summary.csv`、`summary.json` 与 `summary.md` 的 `Pipeline` 列。没有它，
+   `paged`，该值写入 `report.txt` 的 `Pipeline` 列。没有它，
    报告里两行 TTFT 差 100s 却无法说明差在哪。
 2. profile 只接受 `{name, ov, scheduler}`，多余的键直接报错。被专门点名的错误是把 `cache_size`
    写在 profile 顶层（以为它能限制 stateful 的 cache）：静默忽略会让几小时的测量跑在作者没有
@@ -454,7 +453,7 @@ draft head 与主模型并行运行，在**同一段 context 上维护自己的 
   去抵消所有接缝漂移之和，因此可能永远绕着目标值差 1 个 token 而落不上去。吞吐指标要**除以**
   token 数，少一个 token 就不是同一个测量；检索结论不是——"模型能否找到植入在 8000 token 上下文
   深度 0.25 处的码"在 8001 token 时是同一个问题。用 Qwen3.8 的 tokenizer 实测，全部探测偏差
-  ≤ 2 token。实际使用的 token 数会回传并记进 `probes.csv`，所有按 token 计的比率都用它，
+  ≤ 2 token。实际使用的 token 数会回传并记进报告，所有按 token 计的比率都用它，
   不会出现"用一个前向从没见过的数去除"的情况。
 
   这条以前不是这样：原来 `build_probe_prompt` 差 1 个 token 就抛异常，结果一次 8001/8000 的
@@ -469,7 +468,7 @@ draft head 与主模型并行运行，在**同一段 context 上维护自己的 
 - **保真度打分是跨 case 的**，因为参考答案是另一个 profile 的输出，而那个 case 可能后跑。因此
   `_fill_generation_fidelity` 在**报告期**执行（按 `(task, depth, sample)` 配对，prompt 由这些
   坐标种子化，故必然同一个 prompt），并且是幂等的——`write_reports` 每个 case 后都会重跑，所以
-  一个先于基线完成的 case 会在基线落地时立刻补上保真度列。`probes.csv` 也因此改为**整体重写**
+  一个先于基线完成的 case 会在基线落地时立刻补上保真度列。`report.txt` 也因此每个 case 后**整体重写**
   而非逐 case 追加。
 - **三族指标并排放**，因为每一族都对某种情况失明：`similarity`（语义，WWB 的 embedding 余弦）
   对改写打 ~1.0；`rouge1/2/L` 与 `chrf`（词面/字面）会因改写下降；`fdt`/`sdt_norm`
@@ -485,11 +484,12 @@ draft head 与主模型并行运行，在**同一段 context 上维护自己的 
   对的，对 ROUGE 是错的：`on a mat` 与 `on the mat` 会变成同一个串，把一次真实改写报成 1.00。
   故 `scoring.lexical_tokens`（保留冠词）与 `scoring.tokens`（SQuAD）分开，`intersection_over_union`
   同理用前者，否则一个恰好是冠词的目标词会从真值两侧同时消失。
-- **报告另开文件**。`probes.csv` 每探测一行，两个 suite **共用一套 schema**（某一族不产生的列
-  留空），所以"按 recall 排序看最差的几条"是一次表格操作；`summary.md` 每 context 出 RULER 按任务
-  表（带 `Delta vs <baseline>`）、深度 × profile 矩阵、以及生成保真度表；`summary.json` 每 case 挂
-  一个按 suite 分键的嵌套 `accuracy` 对象。**`summary.csv` / `CASE_FIELDS` 不变**——加准确率不动
-  吞吐路径的表头，一条测试断言这一点。
+- **一个报告文件，speed 与 accuracy 同处**。`report.txt` 每 context 依次给出速度与资源表
+  （TPOT/TTFT/吞吐/RAM/GPU/KV 精度）、RULER 按任务表（带 `Delta vs <baseline>`）、深度 ×
+  profile 矩阵、生成保真度表，最后是每探测一行的 PROBE DETAIL（植入真值 + 模型答案 + 全部
+  分数）。准确率探测本身携带与吞吐路径相同的计时记录，所以一次 `--accuracy` 运行同时给出
+  TTFT/TPOT/资源占用和准确率——不需要跑两次，也不需要两份配置。控制台打印的就是同一份
+  lines，文件与终端不可能不一致。
 
 `accuracy` 配置段仅在传 `--accuracy` 时读取，且在任何模型加载前校验（suite/task/option 名称、
 深度 ∈ [0,1]、`baseline_profile` 在本轮 profile 内），与 `_resolve_profiles` 同样是零成本的早失败
@@ -577,11 +577,7 @@ RAM 或 GPU 采样不可用时保持 None，不伪装成 0。即使 generation �
 
 | 文件 | 内容 |
 |---|---|
-| `iterations.csv` | 每迭代一行，warmup 含在内并标记，附该迭代的内存窗口（吞吐路径） |
-| `probes.csv` | 每个准确率探测一行，两 suite 共用 schema：suite/task、植入真值与干扰项、答案，以及全部分数（RULER recall/EM/F1/decoys、ROUGE/chrF、FDT/SDT、similarity、fact coverage）。仅 `--accuracy`，且每次报告整体重写（保真度列是跨 case 的） |
-| `summary.csv` | 每 (model, profile, context) 一行聚合值，含 `pipeline_mode` 与 `cache_size_gb`；表头与是否 `--accuracy` 无关 |
-| `summary.md` | 吞吐：按 context 的排行榜 + TTFT 最快项 + TPOT 冠军配置。准确率：depth × profile 的 recall 矩阵 + `Delta Recall` 列 |
-| `summary.json` | 同数据的结构化版本，含硬件信息，准确率运行下每 case 挂按 suite 分键的嵌套 `accuracy` 对象 |
+| `report.txt` | 唯一输出。表头（硬件/设备/预算/context 与迭代计划/accuracy 的 suite、基线与 seed）、`SPEED AND RESOURCES`（按 TPOT 排序的每 profile 一行 + best TPOT / fastest TTFT / MTP speedup / 贪心输出校验）、`RETRIEVAL ACCURACY (RULER)`、`GENERATION FIDELITY`、`PROBE DETAIL`、以及失败 case 一节。每个 case 后整体重写，并在运行结束时原样打印到控制台 |
 
 TPOT 排行第一名与 TTFT 最快项**可以是不同的 profile**，两者都打印正是为此：160K 下 TTFT 约占墙钟
 96%，一个 TPOT 略优但首 token 慢 100s 的 profile 不是该上线的那个（`_leaderboard` /

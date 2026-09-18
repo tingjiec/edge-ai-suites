@@ -44,7 +44,7 @@ ITERATION_FIELDS = [
     "prefill_throughput",
     "decode_throughput",
     "e2e_throughput",
-    # Multi-token prediction. Present on every record so iterations.csv keeps one
+    # Multi-token prediction. Present on every record so the report keeps one
     # shape; None on a profile that does not run MTP.
     "num_assistant_tokens",
     "mtp_draft_tokens",

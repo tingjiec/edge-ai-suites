@@ -1,84 +1,94 @@
 # Copyright (C) 2026 Intel Corporation
 # SPDX-License-Identifier: Apache-2.0
 #
-# PTL 64 GB / 59 GB shared-GPU configuration for Qwen3.8-27B int4 at 8K.
+# Qwen3.8-27B long-context benchmark: one config for both questions.
 #
-# Unlike config_qwen3.5_9b.yaml and config_qwen3.6_35b_a3b.yaml, the measured variable here
-# is NOT stateful-vs-paged. It is multi-token prediction: this model ships its own MTP draft
-# head (openvino_mtp_model.xml), openvino_genai can run it as self-speculative decoding, and
-# it is by far the largest decode-side lever available on this model. The matrix is therefore
-# one no-MTP paged baseline plus a sweep of `num_assistant_tokens`.
+#   speed + resources   always measured -- TTFT, TPOT, throughput, RAM/GPU peak and mean
+#   accuracy            add --accuracy to also score RULER retrieval and generation fidelity
 #
-# There is no `stateful` profile in this file, and that is a constraint rather than an
-# omission: on a non-NPU device openvino_genai only runs speculative decoding on the paged
-# attention backend, so a stateful profile could not carry MTP and would not be comparable
-# with the rows that do.
+# Both land in ONE report.txt, printed to the console at the end of the run.
 #
-# HISTORY: this file previously declared every case BLOCKED, crashing during model load with
-# `crashed:exitcode=3221225477:0xC0000005 STATUS_ACCESS_VIOLATION` on any device and at any
-# context length, attributed to VLMPipeline having no reader for the `qwen3_5` architecture.
-# That is no longer true. On openvino 2026.5.0 / openvino-genai 2026.5.0.0-3416 with the
-# published OpenVINO/Qwen3.8-27B-int4-ov IR, the model loads in ~50 s and generates normally,
-# with and without MTP.
+#   .\components\llm\context_bench\run_benchmark.ps1 --config components/llm/context_bench/config_qwen3.8_27b.yaml
+#   ... --accuracy                       # + the accuracy suites below
+#   ... --accuracy --list-profiles       # probe count and run matrix, loads nothing
+#   ... --accuracy --profiles paged_min mtp_k3    # narrow a 6-profile sweep
 #
-# Measured on this box with the shipped 8K classroom prompt and 64 output tokens, reusing
-# one loaded pipeline so load/compile noise cannot move the knee:
+# The measured variable here is MULTI-TOKEN PREDICTION: a no-MTP baseline plus a
+# num_assistant_tokens sweep, every profile otherwise identical. MTP is self-speculative
+# decoding -- the model's own draft head proposes k tokens and the main model verifies them
+# in one pass -- so expect TPOT to move and TTFT not to.
 #
-#   profile        TPOT ms   accepted
-#   mtp_k1         197.2     63.2%
-#   mtp_k2         156.8     61.8%   <- recommended balanced profile
-#   mtp_k3         150.9     50.7%   <- minimum-TPOT profile
-#   mtp_k4         152.0     41.3%
-#   mtp_k6         161.3     30.2%
+# With --accuracy this is the run that answers "does raising k cost correctness". It is also
+# the expensive one: 6 profiles x 32 probes. Use --profiles to cut it down while iterating.
 #
-# k=6 does not have a hidden acceptance knob: this GenAI MTP path requires a static candidate
-# count and a zero confidence threshold. Lower k raises acceptance, but it can lower decode
-# throughput because the main model verifies fewer candidates per pass. On the 1K/64-token
-# classroom workload, choose k=2 for the higher-acceptance profile and k=3 for minimum TPOT.
-# MTP shortens decode and does not touch prefill.
+# Needs the nightly OpenVINO stack -- see requirements-qwen3.8.txt.
 
 model:
   provider: openvino
   device: GPU
   weight_format: int8
   models_base_path: "models"
-  # The published IR is named `Qwen3.8-27B_int4`, which is not the
-  # `<name>_<weight_format>` layout `models_base_path` derives. Named explicitly rather than
-  # renamed on disk, so re-downloading the model does not silently break this config.
   model_dirs:
     Qwen3.8-27B: models/openvino/Qwen3.8-27B-int8-ov
 
 benchmark:
   models: [Qwen3.8-27B]
   context_tokens: [8000]
+  # Throughput decode length. Accuracy probes use the per-suite budgets under `accuracy`.
   output_tokens: 64
-  # A k-sweep compares six profiles against each other, so a single sample per profile is not
-  # enough: the run-to-run spread that motivated iterations in the first place is the same
-  # size as the differences between adjacent k values. One warm-up absorbs kernel compilation,
-  # three measured iterations give a median with visible min/max.
   warmup: 1
   iterations: 3
-  timeout_sec: 1800
+  timeout_sec: 5400
   max_system_memory_pct: 100
   gpu_memory_budget_gb: 59
   cache_dir: null
   output_dir: monitoring/executionlogs/context_bench/qwen3.8_27b
 
-# All six profiles carry an IDENTICAL `ov` and `scheduler` block. The only variable in this
-# file is the `mtp` section, so every TPOT difference between rows is attributable to
-# multi-token prediction and nothing else.
-#
-# `ATTENTION_BACKEND: PA` is mandatory for the MTP rows, not tuning: genai refuses
-# speculative decoding on the SDPA backend for anything but a Gemma4 MTP pair. It is set on
-# the baseline too so the baseline is the same pipeline as what it is being compared against.
-#
-# `max_num_batched_tokens: 32768` also bounds one MTP step, which submits
-# `num_assistant_tokens + 1` tokens -- far below this, but the tool checks it, so lowering
-# this value below k+1 is rejected before loading rather than confusing the scheduler.
+# Only read when --accuracy is passed. Delete the section to make that flag an error.
+accuracy:
+  suites: [retrieval, generation]
+  # The no-MTP row every MTP profile is reported against.
+  baseline_profile: paged_min
+  seed: 20260917
+  # who_what_benchmark's embedding model, for the `Similarity` column only. WWB is OPTIONAL --
+  # without it that one column reports `--` and everything else is computed natively:
+  #   pip install "whowhatbench @ git+https://github.com/openvinotoolkit/openvino.genai.git#subdirectory=tools/who_what_benchmark"
+  # Set to null to switch the semantic column off deliberately.
+  embedding_model: sentence-transformers/all-mpnet-base-v2
+
+  retrieval:
+    # RULER's three behaviours, which fail independently: retrieval (niah_*), multi-hop
+    # tracing (vt), aggregation (cwe/fwe). `qa` asks in natural language.
+    tasks: [niah_single, niah_multikey, niah_multivalue, niah_multiquery, vt, cwe, fwe, qa]
+    # Fraction of the transcript the fact is planted at; 0.0 is the very top and hardest.
+    # Applies to niah_single / niah_multikey / qa only -- the rest spread by construction.
+    depths: [0.0, 0.5, 1.0]
+    # 2 is an indication, not a rate (0%, 50% or 100%). Raise once a profile looks suspect.
+    samples: 2
+    output_tokens: 64
+    options:
+      niah_multikey: {num_distractors: 3}
+      niah_multivalue: {num_values: 4}
+      niah_multiquery: {num_queries: 4}
+      vt: {chain_length: 3, num_chains: 3}
+      cwe: {num_target_words: 10}
+      fwe: {top_k: 3}
+
+  generation:
+    # The real classroom task, scored against the baseline profile's answer to the same
+    # prompt. `fact_sheet` also carries its own ground truth (the Coverage column).
+    tasks: [summary, fact_sheet]
+    depths: [0.5]
+    samples: 2
+    output_tokens: 256
+    options:
+      fact_sheet: {num_facts: 6}
+
+# MTP only runs on the paged backend, so every profile keeps the same scheduler and PA
+# backend and differs only in `num_assistant_tokens`. `cache_size: 4` is a measured floor:
+# speculative decoding builds a second continuous-batching pipeline for the draft model and
+# genai sizes both from this one number, so 3 had every MTP profile dropped before prefill.
 profiles:
-  # The row every speedup below is measured against: same pipeline, same pool, draft head
-  # not loaded. Its `tok/step` should read exactly 1.00 -- if it does not, MTP is leaking
-  # into the baseline and none of the comparisons mean anything.
   - name: paged_min
     ov: &ov_qwen38
       ATTENTION_BACKEND: PA
@@ -86,60 +96,31 @@ profiles:
       KV_CACHE_PRECISION: f16
     scheduler: &scheduler_qwen38
       max_num_batched_tokens: 32768
-      # NOT a concurrency setting on this model: Qwen3.8-27B is hybrid (16 full_attention +
-      # 48 linear_attention layers, per config.json's layer_types), and the paged backend
-      # reserves one whole linear-attention state per schedulable sequence out of the same
-      # `cache_size` pool the KV blocks come from.
       max_num_seqs: 1
-      # Mandatory, not tuning: iterations reuse one prompt, so a warm prefix cache would
-      # report a TTFT no first request ever sees.
       enable_prefix_caching: false
-      # Fixed, for a deterministic one-variable A/B: baseline and every MTP row draw from the
-      # same pre-allocated pool, where `auto` would resolve to different sizes for the no-MTP
-      # and MTP rows and move two things at once. 4 GB is the author's measured floor that admits
-      # the target + draft pipelines together; the 8K f16 KV is only ~0.6 GB, so this is generous
-      # headroom, and a fixed cache_size below the estimated persistent KV is rejected before the
-      # 14 GB load rather than crashing mid-run.
-      #
-      # NOTE: a fixed pool does NOT cure the TTFT drift seen across reused-prompt iterations on
-      # this box (iter1 ~10 s -> iter2/3 ~13 s while TPOT holds flat ~85 ms). That drift persisted
-      # with cache_size=4, so it is not KV-pool re-growth: it tracks prefill, a sustained compute
-      # burst that throttles on a shared-memory iGPU, while decode -- short bursts -- does not.
-      # It is a hardware characteristic, read the median with the min/max spread the report keeps.
       cache_size: 4
 
-  # The sweep. k is the number of candidates the draft head offers per verification pass;
-  # higher k means fewer main-model passes but a lower share of candidates accepted, and the
-  # product of those two is what this sweep exists to locate. 1, 2, 3, 4, 6 brackets the knee
-  # measured at short context (k=3) with a point on either side of it.
   - name: mtp_k1
     ov: *ov_qwen38
     scheduler: *scheduler_qwen38
-    mtp:
-      num_assistant_tokens: 1
+    mtp: {num_assistant_tokens: 1}
 
   - name: mtp_k2
-    # Recommended balanced profile: ~62% acceptance with TPOT close to k=3.
     ov: *ov_qwen38
     scheduler: *scheduler_qwen38
-    mtp:
-      num_assistant_tokens: 2
+    mtp: {num_assistant_tokens: 2}
 
   - name: mtp_k3
-    # Minimum-TPOT profile. Use mtp_k2 when draft acceptance is the primary objective.
     ov: *ov_qwen38
     scheduler: *scheduler_qwen38
-    mtp:
-      num_assistant_tokens: 3
+    mtp: {num_assistant_tokens: 3}
 
   - name: mtp_k4
     ov: *ov_qwen38
     scheduler: *scheduler_qwen38
-    mtp:
-      num_assistant_tokens: 4
+    mtp: {num_assistant_tokens: 4}
 
   - name: mtp_k6
     ov: *ov_qwen38
     scheduler: *scheduler_qwen38
-    mtp:
-      num_assistant_tokens: 6
+    mtp: {num_assistant_tokens: 6}
