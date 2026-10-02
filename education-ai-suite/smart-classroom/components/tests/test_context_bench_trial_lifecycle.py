@@ -23,6 +23,8 @@ the child's exit instead of calling it a crash.
 """
 
 import inspect
+import json
+import sys
 import tempfile
 import unittest
 from pathlib import Path
@@ -133,6 +135,117 @@ class TestChildReportsBeforeTeardown(unittest.TestCase):
         code = _executable_source(trial_runner._run_throughput_iterations)
 
         self.assertLess(code.index("build_benchmark_prompt"), code.index("for index in range("))
+
+
+class TestDflashPipelineConstruction(unittest.TestCase):
+    def test_throughput_warms_up_the_full_decode_workload(self):
+        source = _executable_source(trial_runner._run_throughput_iterations)
+        self.assertIn(
+            "warmup_config = generation_config(output_tokens, mtp)", source
+        )
+
+    def test_iteration_gap_idles_outside_the_timer_and_memory_window(self):
+        # The idle must precede `iteration_start` (the parent opens its memory window there)
+        # and the timer, and must not delay the warm-up.
+        for runner in (trial_runner._run_throughput_iterations, trial_runner._run_accuracy_probes):
+            with self.subTest(runner=runner.__name__):
+                source = _executable_source(runner)
+                sleep_at = source.index("time.sleep(iteration_gap_sec)")
+                start_at = source.index('"event": "iteration_start", "iteration": index, "warmup": False'
+                                        if runner is trial_runner._run_accuracy_probes
+                                        else '"event": "iteration_start"')
+                self.assertLess(sleep_at, start_at)
+                self.assertLess(sleep_at, source.index("t1 = time.perf_counter()"))
+        throughput = _executable_source(trial_runner._run_throughput_iterations)
+        self.assertIn("if not is_warmup and iteration_gap_sec > 0:", throughput)
+
+    def test_external_draft_model_path_and_device_are_forwarded(self):
+        scheduler = SimpleNamespace(enable_prefix_caching=True)
+        fake_genai = SimpleNamespace(
+            SchedulerConfig=mock.Mock(return_value=scheduler),
+            draft_model=mock.Mock(return_value="draft"),
+            VLMPipeline=mock.Mock(return_value="pipe"),
+        )
+        speculative = {
+            "enabled": True,
+            "strategy": "dflash",
+            "model": "models/dflash",
+            "device": "GPU",
+            "num_assistant_tokens": 7,
+        }
+
+        with tempfile.TemporaryDirectory() as model_dir:
+            Path(model_dir, "openvino_language_model.xml").touch()
+            with mock.patch.dict(sys.modules, {"openvino_genai": fake_genai}), mock.patch.object(
+                trial_runner, "_ensure_dflash_target_metadata"
+            ) as ensure_metadata:
+                pipe, accepts_tokens = trial_runner._load_pipeline(
+                    model_dir, "GPU", {}, {"enable_prefix_caching": False}, speculative
+                )
+
+        ensure_metadata.assert_called_once_with(model_dir, "models/dflash")
+        fake_genai.draft_model.assert_called_once_with("models/dflash", "GPU")
+        fake_genai.VLMPipeline.assert_called_once_with(
+            model_dir,
+            device="GPU",
+            scheduler_config=scheduler,
+            draft_model="draft",
+        )
+        self.assertEqual(pipe, "pipe")
+        self.assertFalse(accepts_tokens)
+
+    def test_missing_target_metadata_is_built_from_final_layer_residuals(self):
+        class FakeOutput:
+            def get_partial_shape(self):
+                return SimpleNamespace(
+                    rank=SimpleNamespace(is_static=True, get_length=lambda: 3)
+                )
+
+        class FakeOp:
+            def __init__(self, name):
+                self.name = name
+
+            def get_friendly_name(self):
+                return self.name
+
+            def output(self, index):
+                self.assert_output_index = index
+                return FakeOutput()
+
+        ops = [
+            FakeOp("__module.model.model.language_model.layers.1/aten::add/Add_1"),
+            FakeOp("__module.model.model.language_model.layers.6/aten::add/Add_1"),
+        ]
+        annotation = json.loads(
+            trial_runner._dflash_hidden_state_annotation(
+                SimpleNamespace(get_ordered_ops=lambda: ops), [1, 6]
+            )
+        )
+
+        self.assertEqual(annotation["layers"]["1"]["producer"], ops[0].name)
+        self.assertEqual(annotation["layers"]["6"]["output_index"], 0)
+
+    def test_model_rt_info_writer_adds_a_readable_string_value(self):
+        with tempfile.TemporaryDirectory() as model_dir:
+            xml_path = Path(model_dir, "openvino_model.xml")
+            xml_path.write_text(
+                '<net name="test" version="11">\n\t<layers />\n\t<edges />\n'
+                '\t<rt_info>\n\t</rt_info>\n</net>\n',
+                encoding="utf-8",
+            )
+            value = '{"layers":{"1":{"producer":"a/b","output_index":0}}}'
+
+            trial_runner._write_model_rt_info(
+                str(xml_path), trial_runner.DFLASH_TARGET_RT_INFO_KEY, value
+            )
+
+            import xml.etree.ElementTree as ET
+
+            entry = ET.parse(xml_path).getroot().find(
+                f"rt_info/{trial_runner.DFLASH_TARGET_RT_INFO_KEY}"
+            )
+            self.assertIsNotNone(entry)
+            self.assertEqual(entry.attrib["value"], value)
 
 
 class _DeadProcess:
@@ -653,6 +766,68 @@ class TestMtpYieldIsReadFromTheRuntime(unittest.TestCase):
         result = SimpleNamespace(perf_metrics=SimpleNamespace())
 
         self.assertNotIn("verification_steps", trial_runner.read_perf_metrics(result))
+
+    def test_dflash_candidates_come_from_the_processed_token_counter(self):
+        # Measured on Qwen3.6-35B-A3B dFlash k=7: the runtime leaves the draft count at 0,
+        # the acceptance rate NaN and the rejected count 0, but reports 91 processed
+        # candidates (13 passes x 7) of which 31 were accepted.
+        result = SimpleNamespace(
+            perf_metrics=SimpleNamespace(),
+            extended_perf_metrics=SimpleNamespace(
+                get_draft_acceptance_rate=lambda: float("nan"),
+                get_num_draft_tokens=lambda: 0,
+                get_num_accepted_tokens=lambda: 31,
+                get_num_rejected_tokens=lambda: 0,
+                get_num_draft_processed_tokens=lambda: 91,
+            ),
+        )
+
+        perf = trial_runner.read_perf_metrics(result)
+
+        self.assertNotIn("mtp_acceptance_rate", perf)
+        self.assertEqual(perf["mtp_draft_tokens"], 91)
+        self.assertEqual(perf["mtp_accepted_tokens"], 31)
+        self.assertEqual(perf["mtp_rejected_tokens"], 60)
+
+
+class TestDflashValidation(unittest.TestCase):
+    """dFlash rules GenAI enforces only after the 19 GB target has loaded."""
+
+    def _draft_dir(self, root: str, block_size: int = 16) -> str:
+        draft = Path(root, "draft")
+        draft.mkdir()
+        Path(draft, "openvino_model.xml").touch()
+        Path(draft, "config.json").write_text(
+            json.dumps({"dflash_config": {"block_size": block_size}}), encoding="utf-8"
+        )
+        return str(draft)
+
+    def _validate(self, draft: str, tokens: int, scheduler=None):
+        trial_runner.validate_mtp(
+            ".", "GPU",
+            {"enabled": True, "strategy": "dflash", "model": draft,
+             "num_assistant_tokens": tokens, "device": "GPU"},
+            scheduler or {"max_num_seqs": 1, "enable_prefix_caching": False},
+        )
+
+    def test_the_full_block_minus_the_seed_token_is_accepted(self):
+        with tempfile.TemporaryDirectory() as root:
+            self._validate(self._draft_dir(root), 15)
+
+    def test_k_beyond_the_trained_block_is_rejected(self):
+        with tempfile.TemporaryDirectory() as root:
+            with self.assertRaisesRegex(ValueError, "block_size=16 includes the seed"):
+                self._validate(self._draft_dir(root), 16)
+
+    def test_prefix_caching_is_rejected(self):
+        with tempfile.TemporaryDirectory() as root:
+            with self.assertRaisesRegex(ValueError, "enable_prefix_caching"):
+                self._validate(self._draft_dir(root), 7, {"enable_prefix_caching": True})
+
+    def test_a_directory_without_the_draft_ir_is_rejected(self):
+        with tempfile.TemporaryDirectory() as root:
+            with self.assertRaisesRegex(ValueError, "no openvino_model.xml"):
+                self._validate(root, 7)
 
 
 if __name__ == "__main__":

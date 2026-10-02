@@ -30,6 +30,13 @@ candidates and the main model verifies them in one pass. It is a decode-side
 lever only -- measured on Qwen3.8-27B it cuts TPOT by 1.6-1.9x and leaves TTFT
 untouched -- and it only runs on the paged backend. See ``validate_mtp``.
 
+A profile may instead enable dFlash: an external block-diffusion draft model that
+reads the target's intermediate hidden states and proposes up to ``block_size - 1``
+candidates in one parallel pass. Drafting is cheap, but the target still verifies
+``k + 1`` tokens per pass, and on the Qwen3.6 MoE that verification costs far more
+than a single-token decode step -- so the net gain is bounded by that cost, not by
+acceptance alone.
+
 OpenVINO / transformers are imported lazily inside run_case() so this module can
 be imported on a machine without the OpenVINO stack.
 """
@@ -37,9 +44,12 @@ be imported on a machine without the OpenVINO stack.
 from __future__ import annotations
 
 import hashlib
+import html
+import json
 import math
 import os
 import sys
+import tempfile
 import time
 import traceback
 
@@ -117,6 +127,11 @@ STAGE_DECODED = "decoded"  # at least one generate() returned
 MTP_MODEL_FILES = ("openvino_mtp_model.xml", "openvino_mtp_model.bin")
 MTP_MODEL_FILE = MTP_MODEL_FILES[0]
 
+DFLASH_TARGET_RT_INFO_KEY = "hidden_states_decoder_layers"
+
+# metrics.pass_profile's outputs, in order, as read_perf_metrics stores them.
+PASS_PROFILE_FIELDS = ("first_decode_ms", "steady_pass_ms", "steady_tpot")
+
 # Properties openvino_genai consumes itself rather than forwarding to the plugin. The GPU
 # plugin does not advertise them, so without this list `_device_diagnostics` reports every
 # MTP profile as passing an unsupported property -- advice that would break the profile if
@@ -150,18 +165,144 @@ def has_mtp_head(model_dir: str) -> bool:
     return all(os.path.isfile(os.path.join(model_dir, filename)) for filename in MTP_MODEL_FILES)
 
 
+def _dflash_config(draft_model_dir: str) -> dict:
+    """The draft's `dflash_config` block from its config.json, or {} if it has none."""
+    try:
+        with open(os.path.join(draft_model_dir, "config.json"), encoding="utf-8") as config_file:
+            section = json.load(config_file).get("dflash_config")
+    except (OSError, AttributeError, json.JSONDecodeError):
+        return {}
+    return section if isinstance(section, dict) else {}
+
+
+def _dflash_target_layer_ids(draft_model_dir: str) -> list[int]:
+    layer_ids = _dflash_config(draft_model_dir).get("target_layer_ids")
+    if (
+        not isinstance(layer_ids, list)
+        or not layer_ids
+        or any(not isinstance(layer_id, int) or isinstance(layer_id, bool) or layer_id < 0
+               for layer_id in layer_ids)
+        or len(set(layer_ids)) != len(layer_ids)
+    ):
+        raise ValueError(
+            f"dflash draft model {draft_model_dir} must declare dflash_config.target_layer_ids "
+            "in config.json as a list of unique non-negative integers"
+        )
+    return layer_ids
+
+
+def _dflash_block_size(draft_model_dir: str) -> int | None:
+    """The draft's trained block size (seed token included), or None if it is not declared."""
+    block_size = _dflash_config(draft_model_dir).get("block_size")
+    if isinstance(block_size, int) and not isinstance(block_size, bool) and block_size > 1:
+        return block_size
+    return None
+
+
+def _dflash_hidden_state_annotation(model, layer_ids: list[int]) -> str:
+    """Build GenAI's target-layer locator metadata for an older Qwen3.6 export."""
+    layers = {}
+    ordered_ops = model.get_ordered_ops()
+    for layer_id in layer_ids:
+        suffix = f"layers.{layer_id}/aten::add/Add_1"
+        matches = [op for op in ordered_ops if op.get_friendly_name().endswith(suffix)]
+        if len(matches) != 1:
+            raise ValueError(
+                f"dflash target layer {layer_id} needs one final residual node ending in "
+                f"{suffix!r}; found {len(matches)}"
+            )
+        output = matches[0].output(0)
+        shape = output.get_partial_shape()
+        if not shape.rank.is_static or shape.rank.get_length() != 3:
+            raise ValueError(
+                f"dflash target layer {layer_id} residual must be rank 3, got {shape}"
+            )
+        layers[str(layer_id)] = {
+            "producer": matches[0].get_friendly_name(),
+            "output_index": 0,
+        }
+    return json.dumps({"layers": layers}, separators=(",", ":"))
+
+
+def _write_model_rt_info(xml_path: str, key: str, value: str) -> None:
+    """Atomically add one string-valued model-level RT-info entry to an OpenVINO IR."""
+    with open(xml_path, encoding="utf-8", newline="") as model_file:
+        text = model_file.read()
+    newline = "\r\n" if "\r\n" in text else "\n"
+    marker = f"{newline}\t<rt_info>{newline}"
+    position = text.rfind(marker)
+    if position < 0:
+        raise ValueError(f"cannot find model-level rt_info in {xml_path}")
+    insertion = (
+        f'\t\t<{key} value="{html.escape(value, quote=True)}" />{newline}'
+    )
+    updated = text[:position + len(marker)] + insertion + text[position + len(marker):]
+
+    temporary_path = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            mode="w", encoding="utf-8", newline="", delete=False,
+            dir=os.path.dirname(xml_path), prefix=".context_bench_", suffix=".xml",
+        ) as temporary_file:
+            temporary_path = temporary_file.name
+            temporary_file.write(updated)
+        os.replace(temporary_path, xml_path)
+    finally:
+        if temporary_path and os.path.exists(temporary_path):
+            os.unlink(temporary_path)
+
+
+def _ensure_dflash_target_metadata(model_dir: str, draft_model_dir: str) -> None:
+    """Backfill dFlash target locators omitted by older Optimum VLM exports."""
+    import openvino as ov
+
+    xml_path = os.path.join(model_dir, "openvino_language_model.xml")
+    if not os.path.isfile(xml_path):
+        xml_path = os.path.join(model_dir, "openvino_model.xml")
+    model = ov.Core().read_model(xml_path)
+    if model.has_rt_info(DFLASH_TARGET_RT_INFO_KEY):
+        return
+
+    layer_ids = _dflash_target_layer_ids(draft_model_dir)
+    annotation = _dflash_hidden_state_annotation(model, layer_ids)
+    _write_model_rt_info(xml_path, DFLASH_TARGET_RT_INFO_KEY, annotation)
+
+
 def validate_mtp(model_dir: str, device: str, mtp: dict | None,
                  scheduler_config: dict | None, ov_config: dict | None = None) -> None:
-    """Reject an MTP profile this model/device/pipeline combination cannot run.
+    """Reject a speculative (MTP or dFlash) profile this model/device/pipeline cannot run.
 
     Every rule here is enforced by openvino_genai as well -- the point is *where*. The
-    runtime's checks fire inside `mtp_strategy.cpp` after the pipeline has loaded, which
-    on a 14 GB int4 export costs a minute per case to learn that the profile was never
-    runnable. These are pure filesystem and dict checks, so they cost nothing.
+    runtime's checks fire inside `mtp_strategy.cpp` / `dflash_strategy.cpp` after the
+    pipeline has loaded, which on a 14-19 GB int4 export costs a minute per case to learn
+    that the profile was never runnable. These are pure filesystem and dict checks, so
+    they cost nothing.
     """
     if not (mtp or {}).get("enabled"):
         return
-    if not has_mtp_head(model_dir):
+    strategy = mtp.get("strategy", "mtp")
+    draft_model_dir = mtp.get("model") or model_dir
+    if strategy == "dflash":
+        if not os.path.isfile(os.path.join(draft_model_dir, "openvino_model.xml")):
+            raise ValueError(
+                f"dflash draft model {draft_model_dir} has no openvino_model.xml; point "
+                "dflash.model at the exported OpenVINO draft directory"
+            )
+        # The draft is trained to fill a block of `block_size` positions, one of which is
+        # the seed token, so it can propose at most block_size - 1 candidates per pass.
+        block_size = _dflash_block_size(draft_model_dir)
+        tokens = mtp.get("num_assistant_tokens")
+        if block_size and isinstance(tokens, int) and tokens > block_size - 1:
+            raise ValueError(
+                f"dflash num_assistant_tokens={tokens} exceeds what this draft proposes per "
+                f"pass: its block_size={block_size} includes the seed token, so k <= "
+                f"{block_size - 1}"
+            )
+        if (scheduler_config or {}).get("enable_prefix_caching"):
+            raise ValueError(
+                "dflash does not support scheduler enable_prefix_caching; set it to false"
+            )
+    if strategy == "mtp" and not has_mtp_head(model_dir):
         missing = [
             filename for filename in MTP_MODEL_FILES
             if not os.path.isfile(os.path.join(model_dir, filename))
@@ -173,25 +314,23 @@ def validate_mtp(model_dir: str, device: str, mtp: dict | None,
     normalized_device = device.upper()
     if not normalized_device.startswith(("CPU", "GPU")):
         raise ValueError(
-            f"mtp is enabled on {device}, but the Qwen3.8 experimental MTP path "
+            f"{strategy} is enabled on {device}, but the paged speculative-decoding path "
             "supports CPU and GPU only"
         )
     draft_device = mtp.get("device")
     if draft_device and draft_device.upper() != device.upper():
         raise ValueError(
-            "mtp draft_model must use the same device as the target pipeline; "
-            "the Qwen3.8 MTP workflow does not support cross-device speculation"
+            f"{strategy} draft_model must use the same device as the target pipeline"
         )
     # PA is not a tuning preference here: GenAI refuses speculative decoding on the SDPA
     # backend for anything but a Gemma4 MTP pair, and a SchedulerConfig is what selects PA.
     if not scheduler_config:
         raise ValueError(
-            "mtp is enabled without a `scheduler` section, which leaves the profile on "
+            f"{strategy} is enabled without a `scheduler` section, which leaves the profile on "
             "the stateful (SDPA) pipeline. OpenVINO GenAI only runs this speculative "
-            "decoding path on paged attention -- give the profile a `scheduler` "
-            'section and set ATTENTION_BACKEND: PA under `ov`'
+            "decoding path on paged attention -- give the profile a `scheduler` section"
         )
-    if (ov_config or {}).get("ATTENTION_BACKEND") != "PA":
+    if strategy == "mtp" and (ov_config or {}).get("ATTENTION_BACKEND") != "PA":
         raise ValueError(
             "mtp is enabled without ATTENTION_BACKEND=PA; the Qwen3.8 MTP workflow "
             "requires paged attention"
@@ -289,12 +428,13 @@ def _load_pipeline(model_dir: str, device: str, ov_config: dict,
     SchedulerConfig-only property) and the stateful pipeline are separate profiles rather
     than one configuration. See benchmark.pipeline_mode.
 
-    With `mtp` enabled the *same* directory is handed back as the draft model. That is not
-    a shortcut: multi-token prediction is self-speculative decoding, and GenAI recognizes
-    `openvino_mtp_model.xml` in that export. Keep this call aligned with the official
-    Qwen3.8 MTP notebook; passing the internal `mtp_mode=True` kwarg crashes this runtime.
+    With MTP enabled the same directory is used for the model's own draft head. With dFlash,
+    the independently exported draft model directory from the profile is used instead.
     """
     import openvino_genai as ov_genai
+
+    if (mtp or {}).get("enabled") and mtp.get("strategy") == "dflash":
+        _ensure_dflash_target_metadata(model_dir, mtp["model"])
 
     pipeline_args = dict(ov_config)
     if scheduler_config:
@@ -314,7 +454,7 @@ def _load_pipeline(model_dir: str, device: str, ov_config: dict,
 
     if (mtp or {}).get("enabled"):
         pipeline_args["draft_model"] = ov_genai.draft_model(
-            model_dir, device
+            mtp.get("model") or model_dir, mtp.get("device") or device
         )
 
     if os.path.exists(os.path.join(model_dir, "openvino_language_model.xml")):
@@ -340,13 +480,14 @@ def prepare_pipeline_input(pipe, prompt: str, accepts_tokenized_input: bool):
 
 
 def generation_config(output_tokens: int, mtp: dict | None = None):
-    """Build the deterministic request config used by the Qwen3.8 MTP notebook.
+    """Build a fresh greedy request for baseline, MTP, or dFlash generation.
 
     A fresh config is intentional: the model's generation_config.json enables sampling,
-    while MTP requires greedy decoding. Reusing the pipeline-owned config risks retaining
-    model defaults or fields changed by an earlier request. `apply_chat_template` is the
-    one benchmark-specific difference from the notebook because our prompt is already
-    rendered to an exact token count before it reaches VLMPipeline.
+    while speculative decoding requires greedy decoding. Reusing the pipeline-owned config
+    risks retaining model defaults or fields changed by an earlier request.
+    `apply_chat_template` is disabled because our prompt is already rendered before it
+    reaches VLMPipeline. EOS is respected: generating past it would change the workload
+    and distort draft acceptance.
     """
     import openvino_genai as ov_genai
 
@@ -444,14 +585,29 @@ def read_perf_metrics(result) -> dict:
         acceptance = extended.get_draft_acceptance_rate()
         if isinstance(acceptance, (int, float)) and math.isfinite(acceptance):
             out["mtp_acceptance_rate"] = float(acceptance)
-        draft_tokens = extended.get_num_draft_tokens()
-        accepted_tokens = extended.get_num_accepted_tokens()
-        if isinstance(draft_tokens, int) and draft_tokens >= 0:
-            out["mtp_draft_tokens"] = draft_tokens
-        if isinstance(accepted_tokens, int) and accepted_tokens >= 0:
-            out["mtp_accepted_tokens"] = accepted_tokens
     except Exception:  # noqa: BLE001
         pass
+    for key, getter in (
+        ("mtp_draft_tokens", "get_num_draft_tokens"),
+        ("mtp_accepted_tokens", "get_num_accepted_tokens"),
+    ):
+        try:
+            count = getattr(result.extended_perf_metrics, getter)()
+            if isinstance(count, int) and count >= 0:
+                out[key] = count
+        except Exception:  # noqa: BLE001
+            pass
+    # The dFlash CB path leaves get_num_draft_tokens() at 0 (and the acceptance rate NaN)
+    # but counts every proposed candidate in get_num_draft_processed_tokens(): measured at
+    # k=7, 91 processed = 13 verification passes x 7 candidates, of which 31 were accepted.
+    # Without this fallback the real 31/91 would be discarded for a step-derived estimate.
+    if not out.get("mtp_draft_tokens"):
+        try:
+            processed = result.extended_perf_metrics.get_num_draft_processed_tokens()
+            if isinstance(processed, int) and processed > 0:
+                out["mtp_draft_tokens"] = processed
+        except Exception:  # noqa: BLE001
+            pass
     # Guarded on their own, not folded into the block above: these getters are newer than
     # get_draft_acceptance_rate(), so a runtime that lacks them must not also lose the
     # acceptance figures. `get_num_rejected_tokens` completes the accepted/draft picture, and
@@ -464,6 +620,11 @@ def read_perf_metrics(result) -> dict:
             out["mtp_rejected_tokens"] = rejected_tokens
     except Exception:  # noqa: BLE001
         pass
+    # dFlash also reports 0 rejected; rejected = drafted - accepted is an identity, so a
+    # disagreeing runtime counter is replaced rather than written to the CSV as measured.
+    drafted, accepted = out.get("mtp_draft_tokens"), out.get("mtp_accepted_tokens")
+    if isinstance(drafted, int) and isinstance(accepted, int) and 0 <= accepted <= drafted:
+        out["mtp_rejected_tokens"] = drafted - accepted
     try:
         ratio = result.extended_perf_metrics.get_draft_to_main_inference_duration_ratio()
         if isinstance(ratio, (int, float)) and math.isfinite(ratio) and ratio >= 0:
@@ -474,6 +635,17 @@ def read_perf_metrics(result) -> dict:
         steps = len(perf.raw_metrics.m_new_token_times)
         if steps > 0:
             out["verification_steps"] = steps
+    except Exception:  # noqa: BLE001
+        pass
+    # Per-pass inference durations (us) and the tokens each pass committed; see
+    # metrics.pass_profile for why the first decode pass is reported on its own.
+    try:
+        raw = perf.raw_metrics
+        profile = metrics.pass_profile(
+            [duration / 1000.0 for duration in raw.token_infer_durations],
+            list(raw.m_batch_sizes),
+        )
+        out.update(zip(PASS_PROFILE_FIELDS, profile))
     except Exception:  # noqa: BLE001
         pass
     return out
@@ -528,6 +700,8 @@ def run_case(
     scheduler_config: dict | None = None,
     mtp: dict | None = None,
     probes: list | None = None,
+    iteration_gap_sec: float = 0.0,
+    throughput_task: dict | None = None,
 ) -> None:
     """Load once, then either time ``warmup + iterations`` generations or run the accuracy
     probes, and report each one.
@@ -601,12 +775,13 @@ def run_case(
     if probes is None:
         _run_throughput_iterations(
             pipe, accepts_tokenized_input, tokenizer, result_queue, done,
-            context_tokens, output_tokens, warmup, iterations, mtp,
+            context_tokens, output_tokens, warmup, iterations, mtp, iteration_gap_sec,
+            throughput_task,
         )
     else:
         _run_accuracy_probes(
             pipe, accepts_tokenized_input, tokenizer, result_queue, done,
-            context_tokens, output_tokens, warmup, mtp, probes,
+            context_tokens, output_tokens, warmup, mtp, probes, iteration_gap_sec,
         )
 
     # No `del pipe` / gc.collect() here on purpose -- see _post_and_exit().
@@ -614,7 +789,9 @@ def run_case(
 
 
 def _run_throughput_iterations(pipe, accepts_tokenized_input, tokenizer, result_queue, done,
-                               context_tokens, output_tokens, warmup, iterations, mtp) -> None:
+                               context_tokens, output_tokens, warmup, iterations, mtp,
+                               iteration_gap_sec: float = 0.0,
+                               throughput_task: dict | None = None) -> None:
     """The default path: one prompt, ``warmup + iterations`` timed generations, `iteration`
     events. Lifted unchanged from `run_case` -- it is the measurement contract the reports and
     tests already pin, so nothing here should drift when the accuracy path changes."""
@@ -623,7 +800,7 @@ def _run_throughput_iterations(pipe, accepts_tokenized_input, tokenizer, result_
     try:
         # Built once and reused across iterations, as llm_bench does. Requires prefix
         # caching to stay off, or iteration 1 inherits the warm-up's cached prefix.
-        prompt, hf_tokens = build_benchmark_prompt(tokenizer, context_tokens)
+        prompt, hf_tokens = build_benchmark_prompt(tokenizer, context_tokens, throughput_task)
         pipeline_input, prompt_tokens = prepare_pipeline_input(
             pipe, prompt, accepts_tokenized_input
         )
@@ -640,7 +817,7 @@ def _run_throughput_iterations(pipe, accepts_tokenized_input, tokenizer, result_
         # grammar-constrained decoding was observed to collapse into "!!!!" on some models,
         # which would score a false failure for a context the box handled.
         gen_config = generation_config(output_tokens, mtp)
-        warmup_config = generation_config(min(4, output_tokens), mtp)
+        warmup_config = generation_config(output_tokens, mtp)
         assistant_tokens = (
             mtp["num_assistant_tokens"] if (mtp or {}).get("enabled") else None
         )
@@ -651,6 +828,10 @@ def _run_throughput_iterations(pipe, accepts_tokenized_input, tokenizer, result_
 
         for index in range(warmup + iterations):
             is_warmup = index < warmup
+            # Before `iteration_start`, so neither the timer nor the parent's memory window
+            # includes the idle. See benchmark.iteration_gap_sec.
+            if not is_warmup and iteration_gap_sec > 0:
+                time.sleep(iteration_gap_sec)
             result_queue.put({"event": "iteration_start", "iteration": index, "warmup": is_warmup})
 
             ttft_ms = None
@@ -717,10 +898,12 @@ def _run_throughput_iterations(pipe, accepts_tokenized_input, tokenizer, result_
                 mtp_accepted_tokens=perf.get("mtp_accepted_tokens"),
                 mtp_rejected_tokens=perf.get("mtp_rejected_tokens"),
                 mtp_draft_to_main_ratio=perf.get("mtp_draft_to_main_ratio"),
+                **{field: perf.get(field) for field in PASS_PROFILE_FIELDS},
                 output_sha256=hashlib.sha256(
                     generated_text(result).encode("utf-8")
                 ).hexdigest(),
             )
+            record["speculative_strategy"] = (mtp or {}).get("strategy")
             done["iterations"].append(record)
             result_queue.put({"event": "iteration", **record})
     except Exception as exc:  # noqa: BLE001
@@ -730,7 +913,8 @@ def _run_throughput_iterations(pipe, accepts_tokenized_input, tokenizer, result_
 
 
 def _run_accuracy_probes(pipe, accepts_tokenized_input, tokenizer, result_queue, done,
-                         context_tokens, output_tokens, warmup, mtp, probes) -> None:
+                         context_tokens, output_tokens, warmup, mtp, probes,
+                         iteration_gap_sec: float = 0.0) -> None:
     """The accuracy path: one prompt per probe, greedy generation, `probe` events.
 
     Each probe is a *different* prompt -- its planted facts sit at their own depths, and the
@@ -767,7 +951,7 @@ def _run_accuracy_probes(pipe, accepts_tokenized_input, tokenizer, result_queue,
         return pipeline_input, prompt_tokens
 
     try:
-        warmup_config = generation_config(min(4, output_tokens), mtp)
+        warmup_config = generation_config(output_tokens, mtp)
         assistant_tokens = (
             mtp["num_assistant_tokens"] if (mtp or {}).get("enabled") else None
         )
@@ -800,6 +984,8 @@ def _run_accuracy_probes(pipe, accepts_tokenized_input, tokenizer, result_queue,
             done["prompt_tokens"] = prompt_tokens
             done["stage_reached"] = STAGE_PROMPT_BUILT
             result_queue.put({"event": "prompt", "prompt_tokens": prompt_tokens})
+            if iteration_gap_sec > 0:
+                time.sleep(iteration_gap_sec)
             result_queue.put({"event": "iteration_start", "iteration": index, "warmup": False})
 
             ttft_ms = None
@@ -853,8 +1039,10 @@ def _run_accuracy_probes(pipe, accepts_tokenized_input, tokenizer, result_queue,
                 mtp_accepted_tokens=perf.get("mtp_accepted_tokens"),
                 mtp_rejected_tokens=perf.get("mtp_rejected_tokens"),
                 mtp_draft_to_main_ratio=perf.get("mtp_draft_to_main_ratio"),
+                **{field: perf.get(field) for field in PASS_PROFILE_FIELDS},
                 output_sha256=hashlib.sha256(prediction_text.encode("utf-8")).hexdigest(),
             )
+            record["speculative_strategy"] = (mtp or {}).get("strategy")
             probe = {
                 **record,
                 # The coordinates the parent pairs this answer back to its spec with -- and,

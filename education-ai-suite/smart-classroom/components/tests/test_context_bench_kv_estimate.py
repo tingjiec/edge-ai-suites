@@ -449,6 +449,37 @@ class TestShippedMtpConfig(unittest.TestCase):
             self.assertIn(model, model_dirs)
 
 
+class TestShippedDflashConfig(unittest.TestCase):
+    def test_sweep_has_identical_execution_settings_and_enough_scratch_rows(self):
+        profiles = self._profiles()
+        baseline = profiles[0]
+        self.assertEqual(baseline["name"], "paged_min")
+        self.assertFalse(baseline["mtp"]["enabled"])
+        self.assertEqual([profile["mtp"]["num_assistant_tokens"] for profile in profiles[1:]],
+                         [3, 7, 15])
+        for profile in profiles[1:]:
+            self.assertEqual(profile["ov"], baseline["ov"])
+            self.assertEqual(profile["scheduler"], baseline["scheduler"])
+            self.assertGreaterEqual(profile["scheduler"]["num_linear_attention_blocks"],
+                                    profile["mtp"]["num_assistant_tokens"] + 2)
+
+    def _profiles(self) -> list:
+        path = Path(__file__).parents[1] / "llm" / "context_bench" / "config_qwen3.6_35b.yaml"
+        return benchmark._resolve_profiles(load_config(str(path)).profiles, None, {}, {})
+
+    def test_dflash_has_a_matched_paged_baseline(self):
+        profiles = {profile["name"]: profile for profile in self._profiles()}
+        baseline = profiles["paged_min"]
+        dflash = profiles["dflash_k7"]
+
+        self.assertEqual(dflash["ov"], baseline["ov"])
+        self.assertEqual(dflash["scheduler"], baseline["scheduler"])
+        self.assertEqual(dflash["mtp"]["strategy"], "dflash")
+        self.assertEqual(dflash["mtp"]["num_assistant_tokens"], 7)
+        self.assertFalse(dflash["scheduler"]["enable_prefix_caching"])
+        self.assertGreaterEqual(dflash["scheduler"]["num_linear_attention_blocks"], 9)
+
+
 class TestMtpHeadKvSurcharge(unittest.TestCase):
     """The MTP draft head runs alongside the target and keeps its own KV over the same
     context, so it comes out of the same pool. Ignoring it would size `cache_size: auto`
@@ -516,6 +547,59 @@ class TestIrReadiness(unittest.TestCase):
 
             (root / "openvino_language_model.xml").touch()
             self.assertTrue(_ir_ready(model_dir))
+
+
+def _ir_with_compression(directory: str, name: str, **fields) -> None:
+    """An IR whose only content is the model-level NNCF record the exporter writes."""
+    entries = "".join(f'\t\t\t\t<{key} value="{value}" />\n' for key, value in fields.items())
+    block = f"\t\t\t<weight_compression>\n{entries}\t\t\t</weight_compression>\n" if fields else ""
+    Path(directory, name).write_text(
+        '<net name="m" version="11">\n\t<layers />\n\t<rt_info>\n\t\t<nncf>\n'
+        f"{block}\t\t</nncf>\n\t</rt_info>\n</net>\n",
+        encoding="utf-8",
+    )
+
+
+class TestIrWeightPrecision(unittest.TestCase):
+    """The precision printed per case comes from the IR, not from the folder's label."""
+
+    def test_reads_the_shipped_qwen36_target_record(self):
+        with tempfile.TemporaryDirectory() as model_dir:
+            _ir_with_compression(
+                model_dir, "openvino_language_model.xml", all_layers="False", awq="False",
+                backup_mode="int8_sym", group_size="64", mode="int4_asym", ratio="1.0",
+            )
+            self.assertEqual(benchmark.ir_weight_precision(model_dir),
+                             "int4_asym g64 backup int8_sym")
+
+    def test_reads_an_all_layers_dflash_draft(self):
+        with tempfile.TemporaryDirectory() as draft_dir:
+            _ir_with_compression(
+                draft_dir, "openvino_model.xml", all_layers="True", backup_mode="int8_asym",
+                group_size="128", mode="int4_asym", ratio="1.0",
+            )
+            self.assertEqual(benchmark.ir_weight_precision(draft_dir), "int4_asym g128 all layers")
+
+    def test_per_channel_and_mixed_ratio_are_spelled_out(self):
+        with tempfile.TemporaryDirectory() as model_dir:
+            _ir_with_compression(
+                model_dir, "openvino_model.xml", backup_mode="int8_asym", group_size="-1",
+                mode="int4_sym", ratio="0.8", awq="True",
+            )
+            self.assertEqual(benchmark.ir_weight_precision(model_dir),
+                             "int4_sym per-channel 80% of layers AWQ backup int8_asym")
+
+    def test_an_ir_without_nncf_is_uncompressed_and_a_missing_ir_is_unknown(self):
+        with tempfile.TemporaryDirectory() as model_dir:
+            self.assertIsNone(benchmark.ir_weight_precision(model_dir))
+            _ir_with_compression(model_dir, "openvino_model.xml")
+            self.assertEqual(benchmark.ir_weight_precision(model_dir), "uncompressed")
+
+    def test_only_an_integer_label_that_names_another_mode_is_a_mismatch(self):
+        self.assertTrue(benchmark._precision_matches_label("int4_asym g64", "int4"))
+        self.assertFalse(benchmark._precision_matches_label("int8_asym per-channel", "int4"))
+        self.assertTrue(benchmark._precision_matches_label("uncompressed", "fp16"))
+        self.assertTrue(benchmark._precision_matches_label(None, "int4"))
 
 
 if __name__ == "__main__":

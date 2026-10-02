@@ -11,28 +11,78 @@
 #   .\components\llm\context_bench\run_benchmark.ps1 --config components/llm/context_bench/config_qwen3.6_35b.yaml
 #   ... --accuracy                      # + the accuracy suites below
 #   ... --accuracy --list-profiles      # probe count and run matrix, loads nothing
-#   ... --profiles paged_min            # narrow the matrix
+#   ... --profiles paged_min dflash_k7  # run the matched A/B only
 #
-# The measured variable here is the PIPELINE: `stateful` and `paged_min` differ only in
-# whether a `scheduler` section is present, so the TTFT gap between them is attributable.
+# dFlash (https://huggingface.co/z-lab/Qwen3.6-35B-A3B-DFlash) is compared against
+# `paged_min`, its matched baseline: same target model, OpenVINO properties and scheduler,
+# so speculation is the only variable. The draft export's block_size=16 includes the seed
+# token, so the largest valid proposal is num_assistant_tokens=15, not 16.
+#
+# Why the sweep is k=3/7/15: the draft proposes its whole block in one parallel pass, so a
+# larger k is nearly free to *draft* -- but the target verifies k + 1 tokens per pass, and
+# on this MoE that costs several single-token decode steps (each token routes to its own
+# experts). Steady-state pass cost at 8K on this box: ~52 / 66 / 88 ms for k=3/7/15 against
+# a 23.5 ms baseline step, so k=15 needs > 3.7 tok/pass just to break even. The report's
+# speedup line prints the pass cost, and the steady state next to the end-to-end figure:
+# the first decode pass also carries ~100-160 ms of one-time per-request work.
+#
+# Acceptance is a property of the workload and of this draft, not of these settings. The
+# runtime's own accepted/drafted counts (greedy, deterministic), same pipeline and draft:
+#
+#   workload                                   k=3    k=7    k=15   best tok/pass
+#   8K two-sentence summary (summary_2s)       71%    34%    16%    3.4
+#   8K app summary (classroom_summary, 479t)   59%    32%    15%    3.25
+#   math, no context / after an 8K transcript  87/85% 70/61% 38/34% 6.4 / 5.9
+#
+# Acceptance is (tok/pass - 1) / k, so once tok/pass saturates a larger k can only lower the
+# rate. Ruled out, each by A/B on this box: the hidden-state layer mapping (shifting it one
+# layer earlier lowers acceptance), context length (the same math question keeps its
+# acceptance after an 8K transcript), the draft's 4096 sliding window (honoured -- a 64-token
+# window collapses acceptance), the draft's KV cache and activation precision, an int8
+# target (no gain, 40% slower passes), DYNAMIC_QUANTIZATION_GROUP_SIZE and host-priority
+# knobs (within run-to-run noise); the GPU plugin's MoE/PagedAttention route options are
+# debug-build only and rejected here. Untested offline: an int8/fp16 re-export of the bf16
+# draft checkpoint (the local draft is int4 on all layers).
+#
+# Throughput lever that works: give the draft its own int4 lm_head, so GenAI stops grafting
+# the target's 509 MB int8 head onto it (see dflash_draft_head.py). On classroom_summary:
+# k=3 20.4 -> 18.6 ms/token (1.17x -> 1.28x over paged_min), k=7 20.9 -> 19.6, acceptance
+# unchanged. Build it, then point the dflash profiles' `model` at the output directory:
+#
+#   python -m components.llm.context_bench.dflash_draft_head \
+#       --target models/openvino/Qwen3.6-35B-A3B_int4 \
+#       --draft models/openvino/qwen3.6-35b-a3b-dflash-int4-ov \
+#       --output models/openvino/qwen3.6-35b-a3b-dflash-int4-ov-int4head
 
 model:
   provider: openvino
   device: GPU
-  weight_format: int8
+  weight_format: int4
   models_base_path: "models"
   model_dirs:
-    Qwen3.6-35B-A3B: models/openvino/Qwen3.6-35B-A3B_int8
+    Qwen3.6-35B-A3B: models/openvino/Qwen3.6-35B-A3B_int4
 
 benchmark:
   models: [Qwen3.6-35B-A3B]
   # 8K is the quick default. Raise for a real long-context measurement -- but note accuracy
   # probes cost roughly one prefill each, so 32K multiplies the run by about 4.
   context_tokens: [8000]
-  # Throughput decode length. Accuracy probes use the per-suite budgets under `accuracy`.
+  # Decode ceiling; generation and the full-budget warmup both honor EOS, because
+  # continuing past EOS would distort draft acceptance. Actual output lengths are reported
+  # separately. Accuracy probes use the per-suite budgets under `accuracy`.
   output_tokens: 64
   warmup: 1
   iterations: 3
+  # Untimed idle before each measured generation. This iGPU boosts for the first few
+  # seconds of load and then settles lower, so back-to-back iterations measure throttled
+  # clocks: paged_min decodes at ~28-31 ms/token (~33-35 tok/s, ~4 s TTFT) back-to-back but
+  # at 24.6 ms/token (~40.6 tok/s, 3.0 s TTFT) after 30 s idle. 30 s reports what an
+  # occasional classroom request sees; set 0 (or --iteration-gap 0) for sustained load.
+  iteration_gap_sec: 30
+  # What the speed iterations decode. summary_2s: a two-sentence summary (~45 tokens).
+  # classroom_summary: the app's own summarizer request (system prompt and /no_think from
+  # config.yaml) -- a long Markdown summary; raise output_tokens (e.g. 1024) to let it finish.
+  throughput_task: summary_2s
   timeout_sec: 5400
   max_system_memory_pct: 100
   gpu_memory_budget_gb: 59
@@ -83,22 +133,45 @@ accuracy:
     options:
       fact_sheet: {num_facts: 6}
 
-# Two profiles, identical `ov` except the KV precision each pipeline was measured with, so
-# the pipeline is the variable. `max_num_batched_tokens` must be explicit: SchedulerConfig
-# defaults to 256, which would chunk the prefill into hundreds of passes and measure that
-# instead. `max_num_seqs: 1` likewise -- the paged backend reserves a full linear-attention
-# state per schedulable sequence out of the same pool the KV blocks come from.
+# `max_num_batched_tokens` must be explicit: SchedulerConfig defaults to 256, which would
+# chunk the prefill into dozens (8K) to hundreds (160K) of passes and measure that instead. `max_num_seqs: 1`
+# likewise -- the paged backend reserves a full linear-attention state per schedulable
+# sequence out of the same pool the KV blocks come from, and dFlash on the paged pipeline
+# serves one active request anyway. dFlash also requires greedy decoding (the benchmark
+# always uses it) and `enable_prefix_caching: false`.
 profiles:
-  - name: stateful
-    ov:
-      GPU_ENABLE_LARGE_ALLOCATIONS: "YES"
-      KV_CACHE_PRECISION: u8
-
   - name: paged_min
-    ov:
+    ov: &ov_qwen36_paged
       GPU_ENABLE_LARGE_ALLOCATIONS: "YES"
       KV_CACHE_PRECISION: f16
-    scheduler:
+    scheduler: &scheduler_qwen36
       max_num_batched_tokens: 65536
       max_num_seqs: 1
+      # max_num_seqs committed rows plus 1 + max(k) borrowed rows for dFlash verification:
+      # 1 + (1 + 15) = 17. Kept on the baseline too, so its scheduler matches exactly.
+      num_linear_attention_blocks: 17
       enable_prefix_caching: false
+
+  - name: dflash_k3
+    ov: *ov_qwen36_paged
+    scheduler: *scheduler_qwen36
+    dflash:
+      model: models/openvino/qwen3.6-35b-a3b-dflash-int4-ov
+      device: GPU
+      num_assistant_tokens: 3
+
+  - name: dflash_k7
+    ov: *ov_qwen36_paged
+    scheduler: *scheduler_qwen36
+    dflash:
+      model: models/openvino/qwen3.6-35b-a3b-dflash-int4-ov
+      device: GPU
+      num_assistant_tokens: 7
+
+  - name: dflash_k15
+    ov: *ov_qwen36_paged
+    scheduler: *scheduler_qwen36
+    dflash:
+      model: models/openvino/qwen3.6-35b-a3b-dflash-int4-ov
+      device: GPU
+      num_assistant_tokens: 15

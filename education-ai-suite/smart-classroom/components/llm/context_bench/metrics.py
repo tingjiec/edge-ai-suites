@@ -53,11 +53,18 @@ ITERATION_FIELDS = [
     "verification_steps",
     "tokens_per_step",
     "mtp_acceptance_rate",
+    "mtp_acceptance_estimated",
     # Draft-model inference time as a fraction of the main model's, from
     # SDPerModelsPerfMetrics. The signal a k-sweep actually turns on: acceptance says how
     # many candidates stuck, this says what proposing them cost -- a draft head whose ratio
     # climbs toward 1 is eating the decode saving even while acceptance still looks healthy.
     "mtp_draft_to_main_ratio",
+    # Per-pass decomposition from the runtime's own inference durations (see `pass_profile`):
+    # the first decode pass carries one-time per-request work, which on a short answer is
+    # spread over few passes and hides the steady-state decode rate.
+    "first_decode_ms",
+    "steady_pass_ms",
+    "steady_tpot",
     "output_sha256",
 ]
 
@@ -76,6 +83,9 @@ AGGREGATED_METRICS = [
     "tokens_per_step",
     "mtp_acceptance_rate",
     "mtp_draft_to_main_ratio",
+    "first_decode_ms",
+    "steady_pass_ms",
+    "steady_tpot",
 ]
 
 # Median only, no _min/_max. These are the orchestrator's per-iteration memory windows,
@@ -92,6 +102,31 @@ def _rate(numerator: float, seconds: float) -> float:
     return round(numerator / seconds, 3) if numerator and seconds and seconds > 0 else 0.0
 
 
+def pass_profile(infer_ms: list | None, batch_sizes: list | None) -> tuple:
+    """Split decode into its first pass and its steady state: (first_ms, steady_ms, steady_tpot).
+
+    `infer_ms` is one runtime inference duration per step (the prefill first), `batch_sizes`
+    the tokens each step committed. The first decode pass is reported on its own because it
+    carries one-time per-request work: measured on Qwen3.6-35B-A3B at 8K, a dFlash pass costs
+    ~52 ms (k=3) in steady state but 100-160 ms on the first decode pass, and the baseline's
+    first decode step 66 ms against 24 ms. On a 45-token answer that one pass is ~15% of the
+    decode time, so the end-to-end TPOT understates the steady-state rate a longer answer
+    sees. `steady_tpot` is inference time per committed token over the passes after it.
+
+    All None unless there are at least two steady passes to take a median of.
+    """
+    if not infer_ms or not batch_sizes or len(infer_ms) != len(batch_sizes) or len(infer_ms) < 4:
+        return None, None, None
+    steady, committed = infer_ms[2:], sum(batch_sizes[2:])
+    if committed <= 0:
+        return None, None, None
+    return (
+        round(infer_ms[1], 3),
+        round(statistics.median(steady), 3),
+        round(sum(steady) / committed, 3),
+    )
+
+
 def mtp_yield(
     output_size: int, verification_steps: int | None, num_assistant_tokens: int | None
 ) -> tuple[float | None, float | None]:
@@ -99,28 +134,36 @@ def mtp_yield(
 
     Under multi-token prediction the main model no longer runs once per output token:
     it verifies a batch of drafted candidates and keeps the accepted prefix plus one
-    bonus token. `tokens_per_step` is that yield -- ``output_size / steps`` -- and it
-    is what TPOT is actually divided by. A profile with MTP off yields exactly 1.00,
-    which doubles as a self-check that the draft head is really engaged.
+    bonus token. `tokens_per_step` is that yield over the *decode* passes --
+    ``(output_size - 1) / (steps - 1)`` -- and it is what TPOT is actually divided by.
+    A profile with MTP off yields exactly 1.00, which doubles as a self-check that the
+    draft head is really engaged.
+
+    The first step is excluded because it is the prefill pass: the runtime records it in
+    `m_new_token_times` like any other, but it emits exactly one token and nothing was
+    drafted for it. Counting it understates the yield, and by the most on the short
+    answers this benchmark measures -- dFlash k=7 committed 44 decode tokens in 13
+    verification passes (3.38 tok/step), which ``45 / 14`` would report as 3.21.
 
     `mtp_acceptance_rate` converts the yield into the fraction of the ``k`` drafted
     candidates that survived verification, ``(tokens_per_step - 1) / k``: one token
     per step is the bonus the main model produces on its own and was never drafted,
     so counting it as an acceptance would report a non-zero rate for a run that
     accepted nothing. It is the number that says whether raising ``k`` still buys
-    anything -- measured on Qwen3.8-27B at 8K, 63% at k=1 down to 30% at k=6.
+    anything.
 
-    Both are None when the runtime did not report step counts, rather than 0: "not
-    measured" and "nothing accepted" are different findings.
+    Both are None when the runtime did not report step counts, or reported only the
+    prefill pass, rather than 0: "not measured" and "nothing accepted" are different
+    findings.
     """
-    if not verification_steps or verification_steps <= 0 or not output_size:
+    if not verification_steps or verification_steps <= 1 or not output_size or output_size <= 1:
         return None, None
-    tokens_per_step = output_size / verification_steps
+    tokens_per_step = (output_size - 1) / (verification_steps - 1)
     if not num_assistant_tokens or num_assistant_tokens <= 0:
         return round(tokens_per_step, 3), None
-    # Clamped because the ratio is a measurement, not an identity: a runtime that
-    # counts the prefill pass as a step (or omits one) must not produce a rate
-    # outside [0, 1] and make the column unreadable.
+    # Clamped because the ratio is a measurement, not an identity: a runtime whose step
+    # series is off by one must not produce a rate outside [0, 1] and make the column
+    # unreadable.
     rate = (tokens_per_step - 1.0) / num_assistant_tokens
     return round(tokens_per_step, 3), round(min(1.0, max(0.0, rate)), 4)
 
@@ -143,6 +186,9 @@ def iteration_record(
     mtp_rejected_tokens: int | None = None,
     mtp_draft_to_main_ratio: float | None = None,
     output_sha256: str | None = None,
+    first_decode_ms: float | None = None,
+    steady_pass_ms: float | None = None,
+    steady_tpot: float | None = None,
 ) -> dict:
     """One measured generation, in llm_bench units (ms for latency, s for time).
 
@@ -158,13 +204,20 @@ def iteration_record(
         post_ttft_ms = total_ms - ttft
         tpot = round(post_ttft_ms / (output_size - 1), 3) if post_ttft_ms > 0 else None
 
-    tokens_per_step, _ = mtp_yield(
+    tokens_per_step, derived_acceptance = mtp_yield(
         output_size, verification_steps, num_assistant_tokens
     )
+    if (
+        mtp_acceptance_rate is None
+        and isinstance(mtp_draft_tokens, int) and mtp_draft_tokens > 0
+        and isinstance(mtp_accepted_tokens, int)
+        and 0 <= mtp_accepted_tokens <= mtp_draft_tokens
+    ):
+        mtp_acceptance_rate = mtp_accepted_tokens / mtp_draft_tokens
     acceptance = (
         round(min(1.0, max(0.0, mtp_acceptance_rate)), 4)
         if mtp_acceptance_rate is not None
-        else None
+        else derived_acceptance
     )
 
     return {
@@ -188,7 +241,11 @@ def iteration_record(
         "verification_steps": verification_steps,
         "tokens_per_step": tokens_per_step,
         "mtp_acceptance_rate": acceptance,
+        "mtp_acceptance_estimated": acceptance is not None and mtp_acceptance_rate is None,
         "mtp_draft_to_main_ratio": mtp_draft_to_main_ratio,
+        "first_decode_ms": first_decode_ms,
+        "steady_pass_ms": steady_pass_ms,
+        "steady_tpot": steady_tpot,
         "output_sha256": output_sha256,
     }
 
@@ -211,6 +268,7 @@ def aggregate(records: list) -> dict:
         return {"iterations_measured": 0}
 
     out = {"iterations_measured": len(rows)}
+    out["mtp_acceptance_estimated"] = any(row.get("mtp_acceptance_estimated") for row in rows)
     for metric in AGGREGATED_METRICS:
         values = [r[metric] for r in rows if r.get(metric) is not None]
         if not values:
@@ -224,6 +282,13 @@ def aggregate(records: list) -> dict:
             out[metric] = round(statistics.median(values), 2)
     for field in ("input_size", "output_size"):
         out[field] = rows[-1].get(field)
+    output_sizes = [row["output_size"] for row in rows if row.get("output_size") is not None]
+    if output_sizes:
+        out["output_size_min"] = min(output_sizes)
+        out["output_size_max"] = max(output_sizes)
+    median_tpot = out.get("other_tokens_avg_latency")
+    if median_tpot and median_tpot > 0:
+        out["decode_throughput"] = round(1000.0 / median_tpot, 3)
     output_hashes = {row.get("output_sha256") for row in rows if row.get("output_sha256")}
     out["output_consistent"] = len(output_hashes) <= 1 if output_hashes else None
     out["output_sha256"] = next(iter(output_hashes)) if len(output_hashes) == 1 else None
@@ -250,13 +315,18 @@ def format_iteration(record: dict) -> str:
     ) + format_mtp(record)
 
 
+def strategy_label(record: dict) -> str:
+    """Display name of a record's speculative-decoding strategy."""
+    return "dFlash" if record.get("speculative_strategy") == "dflash" else "MTP"
+
+
 def format_mtp(record: dict) -> str:
-    """The MTP tail of an iteration line; empty string when the profile ran without it."""
+    """The speculative-decoding tail; empty when the profile ran without it."""
     tokens_per_step = record.get("tokens_per_step")
     if tokens_per_step is None:
         return ""
     k = record.get("num_assistant_tokens")
-    text = f" | MTP k={k} {tokens_per_step:.2f} tok/step" if k else (
+    text = f" | {strategy_label(record)} k={k} {tokens_per_step:.2f} tok/step" if k else (
         f" | {tokens_per_step:.2f} tok/step"
     )
     acceptance = record.get("mtp_acceptance_rate")
@@ -265,9 +335,11 @@ def format_mtp(record: dict) -> str:
         drafted = record.get("mtp_draft_tokens")
         counts = (
             f", {accepted}/{drafted} candidates"
-            if isinstance(accepted, int) and isinstance(drafted, int) else ""
+            if isinstance(accepted, int) and isinstance(drafted, int)
+            and drafted > 0 and 0 <= accepted <= drafted else ""
         )
-        text += f" ({acceptance * 100:.0f}% accepted{counts})"
+        qualifier = " estimated" if record.get("mtp_acceptance_estimated") else ""
+        text += f" ({acceptance * 100:.0f}% accepted{qualifier}{counts})"
     # The draft head's cost, next to what it bought: a high acceptance is only a win while
     # proposing the candidates stays cheap relative to the main-model pass verifying them.
     ratio = record.get("mtp_draft_to_main_ratio")

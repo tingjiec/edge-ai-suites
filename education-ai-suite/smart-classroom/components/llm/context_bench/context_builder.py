@@ -117,6 +117,7 @@ def build_text_of_token_length(tokenizer: Tokenizer, target_tokens: int,
 
 
 def render_prompt(tokenizer: Tokenizer, transcript: str, suffix: str = _USER_SUFFIX,
+                  system_prompt: str = SYSTEM_PROMPT, user_prefix: str = _USER_PREFIX,
                   **template_kwargs) -> tuple:
     """Render the benchmark chat prompt around ``transcript`` and measure it.
 
@@ -127,23 +128,34 @@ def render_prompt(tokenizer: Tokenizer, transcript: str, suffix: str = _USER_SUF
     `suffix` is the task text after the transcript. It defaults to the summarization
     ``_USER_SUFFIX`` so the throughput path is byte-for-byte unchanged; the accuracy path
     passes the probe's own question instead (see `build_probe_prompt`).
+    `system_prompt` / `user_prefix` replace the benchmark's own framing when a throughput
+    task reproduces an application prompt instead (see `build_benchmark_prompt`).
     """
     messages = [
-        {"role": "system", "content": SYSTEM_PROMPT},
-        {"role": "user", "content": _USER_PREFIX + transcript + suffix},
+        {"role": "system", "content": system_prompt},
+        {"role": "user", "content": user_prefix + transcript + suffix},
     ]
     prompt = tokenizer.apply_chat_template(messages, tokenize=False, **template_kwargs)
     return prompt, len(tokenizer.encode(prompt))
 
 
-def build_benchmark_prompt(tokenizer: Tokenizer, target_tokens: int) -> tuple:
+def build_benchmark_prompt(tokenizer: Tokenizer, target_tokens: int,
+                           task: dict | None = None) -> tuple:
     """Build a rendered chat prompt whose token length is exactly ``target_tokens``.
 
     Sizes the transcript content so that, once the system prompt and chat-template
     scaffolding are added back, the whole rendered prompt lands on the target.
     Returns ``(prompt_text, prompt_tokens)``.
+
+    `task` overrides the framing around the transcript -- a mapping with any of
+    `system_prompt`, `user_prefix` and `suffix` (see `render_prompt`). None keeps the
+    built-in two-sentence summary, byte for byte.
     """
     template_kwargs = dict(add_generation_prompt=True, enable_thinking=False)
+    template_kwargs.update({
+        key: value for key, value in (task or {}).items()
+        if key in ("system_prompt", "user_prefix", "suffix")
+    })
 
     # An empty transcript prices the template + system prompt + task instructions, which
     # is the room the content cannot have.

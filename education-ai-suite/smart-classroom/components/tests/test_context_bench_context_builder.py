@@ -132,5 +132,67 @@ class TestContextBuilder(unittest.TestCase):
         self.assertEqual(count, 160000)
 
 
+class TestThroughputTaskFraming(unittest.TestCase):
+    """A throughput task swaps the framing around the transcript, not the sizing contract."""
+
+    APP_TASK = {"system_prompt": "Summarize the classroom transcript. ## Teacher Summary",
+                "user_prefix": "/no_think\n", "suffix": ""}
+
+    def test_no_task_is_the_built_in_prompt_byte_for_byte(self):
+        self.assertEqual(build_benchmark_prompt(FakeTokenizer(), 5000),
+                         build_benchmark_prompt(FakeTokenizer(), 5000, None))
+
+    def test_app_task_hits_the_exact_size_with_its_own_framing(self):
+        tok = FakeTokenizer()
+        prompt, count = build_benchmark_prompt(tok, 5000, self.APP_TASK)
+
+        self.assertEqual(count, 5000)
+        self.assertTrue(prompt.startswith("<system> Summarize the classroom transcript."))
+        self.assertIn("<user> /no_think", prompt)
+        self.assertNotIn("CLASSROOM TRANSCRIPT", prompt)
+        self.assertNotIn("two concise sentences", prompt)
+
+
+class TestThroughputTaskPrompt(unittest.TestCase):
+    """`classroom_summary` is rebuilt from the app config the way the summarizer builds it."""
+
+    APP_CONFIG = (
+        "app:\n  language: en\n"
+        "models:\n  summarizer:\n    mode: {mode}\n    system_prompt:\n      en:\n"
+        "        Dialog: dialog prompt\n        Teacher: teacher prompt\n"
+        "        Hybrid: hybrid prompt\n"
+    )
+
+    def _resolve(self, mode="dialog", model="Qwen3.6-35B-A3B"):
+        import tempfile
+        from pathlib import Path
+
+        from components.llm.context_bench import benchmark
+
+        with tempfile.TemporaryDirectory() as root:
+            path = Path(root, "config.yaml")
+            path.write_text(self.APP_CONFIG.format(mode=mode), encoding="utf-8")
+            return benchmark.throughput_task_prompt("classroom_summary", model, str(path))
+
+    def test_the_default_task_needs_no_app_config(self):
+        from components.llm.context_bench import benchmark
+
+        self.assertIsNone(benchmark.throughput_task_prompt("summary_2s", "any", "missing.yaml"))
+        self.assertIsNone(benchmark.throughput_task_prompt(None, "any", "missing.yaml"))
+
+    def test_mode_selects_the_system_prompt_and_qwen3_gets_no_think(self):
+        self.assertEqual(self._resolve()["system_prompt"], "dialog prompt")
+        self.assertEqual(self._resolve("teacher")["system_prompt"], "teacher prompt")
+        self.assertEqual(self._resolve("hybrid")["system_prompt"], "hybrid prompt")
+        self.assertEqual(self._resolve()["user_prefix"], "/no_think\n")
+        self.assertEqual(self._resolve(model="Llama-3")["user_prefix"], "")
+
+    def test_a_missing_app_config_is_a_clear_configuration_error(self):
+        from components.llm.context_bench import benchmark
+
+        with self.assertRaisesRegex(SystemExit, "needs models.summarizer.system_prompt"):
+            benchmark.throughput_task_prompt("classroom_summary", "Qwen3", "no/such/config.yaml")
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -15,9 +15,8 @@ It benchmarks a matrix of named configuration *profiles* — KV cache precision,
 chunk size, scheduler cache size, continuous batching vs the stateful pipeline, multi-token
 prediction and its candidate count — and ranks
 them by measured TPOT, using TTFT as the tie-breaker; the fastest TTFT is also called out on
-its own, because at long context TTFT is what the user waits for. The 35B config ships a
-`stateful` / `paged_min` pair so one run answers which pipeline reaches the first token
-sooner; the Qwen3.8 config instead sweeps
+its own, because at long context TTFT is what the user waits for. The 35B config compares a
+`paged_min` baseline with external dFlash drafts at k=3, 7, and 15; the Qwen3.8 config sweeps
 [multi-token prediction](#multi-token-prediction-mtp). Add entries to `profiles` to A/B more in one
 run. Measurement follows the methodology of
 [llm_bench](https://github.com/openvinotoolkit/openvino.genai/tree/master/tools/llm_bench):
@@ -37,7 +36,7 @@ also printed to the console when the run ends.
 
 ```
 components/llm/context_bench/
-  config_qwen3.6_35b.yaml  Qwen3.6-35B-A3B: stateful vs paged_min, + accuracy suites
+  config_qwen3.6_35b.yaml  Qwen3.6-35B-A3B: paged baseline vs dFlash sweep, + accuracy suites
   config_qwen3.8_27b.yaml  Qwen3.8-27B: no-MTP baseline vs a k sweep, + accuracy suites
   context_builder.py     synthetic transcript sized to an exact token count (+ probe placement)
   tasks.py               the RULER + generation task registry: what is planted and what is asked
@@ -52,7 +51,7 @@ components/llm/context_bench/
 ```
 
 > **Scope — the default run measures capacity and speed, not answer quality.** Prompt content
-> is irrelevant on the throughput path; only token volume and the clock matter. To score
+> is not scored on the throughput path, but it affects draft acceptance and output length. To score
 > whether the model *understood* the long context, use the opt-in
 > [`--accuracy` mode](#long-context-accuracy-ruler--wwb-fidelity), which runs RULER's
 > retrieval probes and a who_what_benchmark-style fidelity comparison. The two paths never mix:
@@ -68,29 +67,165 @@ components/llm/context_bench/
 .\components\llm\context_bench\run_benchmark.ps1 --list-profiles
 
 # One profile, one short context -- the fast way to confirm the plumbing works
-.\components\llm\context_bench\run_benchmark.ps1 --profiles stateful --contexts 8000 --iterations 1
+.\components\llm\context_bench\run_benchmark.ps1 --profiles paged_min --contexts 8000 --iterations 1
 
 # Select the 35B model matrix
 .\components\llm\context_bench\run_benchmark.ps1 --config components/llm/context_bench/config_qwen3.6_35b.yaml
 ```
 
-Historical 160K runs took roughly 245–300 s per Qwen3.5-9B iteration and 400–500 s per
-Qwen3.6-35B-A3B iteration, all of them on paged attention with a fixed pool; the `stateful`
-profile has never been measured on this box, so use those figures only for rough scheduling.
-The 9B and 35B configs ship the same two profiles:
+The Qwen3.6 profiles share f16 KV precision, a 65,536-token scheduler batch ceiling,
+one live sequence, 17 linear-attention rows, and disabled prefix caching. The runtime
+manages `cache_size`. Defaults are one full-budget warmup and three measured iterations;
+`--warmup 0 --iterations 1` is a smoke test, not a steady-state performance comparison.
 
-| Profile | Pipeline | `cache_size` | `max_num_batched_tokens` | KV precision |
-|---|---|---:|---:|---|
-| `stateful` | stateful (SDPA) — no `scheduler` section at all | n/a | n/a | 9B f16, 35B u8 |
-| `paged_min` | continuous batching | 9B 8 GiB, 35B 4 GiB | 32,768 | same as `stateful` |
+`benchmark.iteration_gap_sec` (CLI `--iteration-gap`) idles before each measured
+generation, outside the timer and the memory window. It exists because the iGPU boosts only
+for the first few seconds of load: at 8K, back-to-back `paged_min` generations decode at
+~28-31 ms/token with ~4 s TTFT, while every generation after 30 s idle runs at 24.6 ms/token
+(~40 tok/s) with 3.0 s TTFT. The Qwen3.6 config sets 30 s, which reports what an occasional
+classroom request sees; `0` (the default elsewhere) measures sustained back-to-back load.
+The report header states which one a run used, so do not compare figures across the two.
 
-Both profiles in a config carry an identical `ov` block, so the pipeline is the only variable
-and the two TTFTs are comparable — a test enforces this. Neither name is a performance claim:
-`stateful` is unmeasured here, and `paged_min` re-uses the values with the strongest historical
-support (8 GiB covers the 9B's ~4.93 GiB f16 cache; 32,768 is where the prefill-chunk sweep
-saturated) rather than the wider chunk sizes an earlier config guessed at. Use
-`--warmup 0 --iterations 1` (the shipped setting) for a first capacity and TTFT check, then
-raise `iterations` for a median once both profiles are known to complete.
+## dFlash Speculative Decoding
+
+The [Qwen3.6 dFlash draft](https://huggingface.co/z-lab/Qwen3.6-35B-A3B-DFlash)
+is an external block-diffusion model, not the target's MTP head. The
+[upstream implementation](https://github.com/z-lab/dflash/blob/main/dflash/model.py)
+selects post-decoder hidden states using `hidden_states[layer_id + 1]`, predicts a block,
+and lets the target accept a prefix and produce a correction or bonus token.
+The local export's block size is 16 including the seed: the corresponding maximum
+proposal is `num_assistant_tokens: 15`. Smaller k values can be faster on this GPU.
+
+The benchmark calls `draft_model(dflash.model, device)` and passes it to the paged
+pipeline. `num_assistant_tokens` belongs to `GenerationConfig`, not GPU plugin properties.
+For the installed hybrid-model runtime, one live sequence plus a k-token proposal needs
+at least `1 + (k + 1)` linear-attention rows. The shared value 17 covers the entire sweep.
+Do not use a stateful or differently quantized profile as the dFlash baseline.
+
+```powershell
+# Repeated-prompt speed comparison, including the no-draft baseline
+.\components\llm\context_bench\run_benchmark.ps1 --profiles paged_min dflash_k3 dflash_k7 dflash_k15
+
+# Natural-answer accuracy and timings; reduce probe count while investigating
+.\components\llm\context_bench\run_benchmark.ps1 --profiles paged_min dflash_k3 dflash_k7 --accuracy --accuracy-tasks niah_single fact_sheet --accuracy-depths 0.5 --accuracy-samples 1
+```
+
+Both throughput and accuracy respect EOS. `output_tokens` is a ceiling, not a guaranteed
+answer length. Forcing tokens after EOS changed the measured acceptance and produced
+an artificial slowdown in testing. Warmup uses the full decode budget instead of four
+tokens, which may not exercise a complete speculative window. A two-token smoke test
+does not establish steady-state speculative performance.
+
+Interpret the report as follows:
+
+- Weights is the precision recorded in the loaded IR's NNCF rt_info (for example
+  `int4_asym g64 backup int8_sym`), not the `model.weight_format` label; a label that
+  disagrees with the IR is warned about at startup. The Speculative cell adds the draft's
+  precision (`draft int4_asym g128`), and the case banner prints both records in full.
+- Decode tok/s is `1000 / median TPOT`; TTFT and total generation time are separate.
+- E2E tok/s includes input tokens as well as generated tokens; it is not decode throughput.
+- Output tok shows actual lengths, or their range for mixed accuracy probes.
+- `tok/step` is decode tokens per verification pass, `(output - 1) / (steps - 1)`: the
+  first recorded step is the prefill pass, which emits one token and verifies nothing.
+- dFlash acceptance is the runtime's own `accepted / drafted`. The dFlash path leaves
+  `get_num_draft_tokens()` at 0 and the acceptance rate NaN, so the drafted count is read
+  from `get_num_draft_processed_tokens()` (k per pass). Acceptance marked `estimated` is
+  used only when no counter is available and comes from `(tok/step - 1) / k`.
+- The speedup line also prints what each verification pass cost, as a multiple of a baseline
+  decode step: the speedup is `tok/step / pass cost`. On the Qwen3.6 MoE a pass costs
+  ~2.6x (k=3) to ~4.3x (k=15) a single-token step because every verified token routes to
+  its own experts, so ~3.4 tok/step nets only a modest gain and k=15 is a loss.
+- `draft/main` divides total draft time by total target time *including prefill*, so on a
+  long prompt it understates the draft's share of each decode pass (~0.05x reported versus
+  ~20% of a k=7 pass measured).
+- Speedup and greedy-output checks require matching model, context, device, weight format,
+  OpenVINO properties, and scheduler. Accuracy timing medians pool different tasks;
+  use repeated-prompt runs for throughput comparisons.
+
+On the 2026-10-03 local 8K run (45-token natural answers, three measured iterations),
+baseline decoded at 29.67 tok/s, k=3 at 35.81, k=7 at 32.04, and k=15 at 22.85.
+All natural answers matched exactly. The best decode gain was 1.21x, but total latency
+did not improve because prefill dominated. One retrieval and one fact-sheet probe per
+baseline/k3/k7 profile also matched exactly, with full recall and fact coverage. This is
+a small regression check, not broad model certification or a guarantee for other workloads.
+Embedding similarity was not measured because `whowhatbench` was unavailable.
+
+### Why dFlash acceptance is low, and what does raise throughput
+
+Acceptance is set by the workload and by this draft, not by the benchmark's settings. Same
+pipeline and draft, runtime-reported accepted/drafted counts under greedy decoding:
+
+| Workload | k=3 | k=7 | k=15 | Best tok/pass |
+|---|---:|---:|---:|---:|
+| 8K two-sentence summary (`summary_2s`, the default) | 71% | 34% | 16% | 3.4 |
+| 8K app summary (`classroom_summary`, 479 tokens) | 59% | 32% | 15% | 3.25 |
+| 8K summary, thinking enabled | 72% | 41% | 21% | 4.05 |
+| Math, no context | 87% | 70% | 38% | 6.4 |
+| The same math question after an 8K transcript | 85% | 61% | 34% | 5.9 |
+
+The integration works: on math, k=7 decodes at ~10 ms/token against the ~22.6 ms baseline
+(2.1x). Summaries of this transcript are simply hard for the draft to predict. Because
+acceptance is `(tok/pass - 1) / k`, a saturated tok/pass makes every larger k read as a lower
+rate, so rank profiles by TPOT, not acceptance.
+
+Each of these was A/B-tested on an Arc B390 iGPU and ruled out as a cause:
+- the hidden-state layer mapping (shifting it one layer earlier lowers acceptance);
+- context length (the same math question keeps its acceptance after an 8K transcript);
+- the draft's 4096-token sliding window (GenAI honours it: a 64-token window collapses
+  acceptance);
+- the draft's KV cache precision and activation precision (identical counts);
+- an int8 target (no acceptance gain, 40% slower passes).
+
+On the throughput side, `DYNAMIC_QUANTIZATION_GROUP_SIZE` and the host-priority properties are
+within run-to-run noise, and the GPU plugin's MoE and PagedAttention route options
+(`GPU_MOE_*`, `GPU_PA_MIXED_ROUTE_MODE`) exist only in debug builds; this release rejects them.
+
+The cost side is mostly physical. A steady k=3 pass costs ~52 ms against a 23.5 ms baseline
+step, because verifying 4 tokens on the MoE reads the union of their experts. One part is
+removable: GenAI grafts the target's 509 MB int8 lm_head onto the draft and streams it every
+pass. `dflash_draft_head.py` writes a copy of the draft that carries its own int4 head
+instead, which GenAI then uses without the graft:
+
+```powershell
+python -m components.llm.context_bench.dflash_draft_head `
+    --target models/openvino/Qwen3.6-35B-A3B_int4 `
+    --draft models/openvino/qwen3.6-35b-a3b-dflash-int4-ov `
+    --output models/openvino/qwen3.6-35b-a3b-dflash-int4-ov-int4head
+```
+
+Point the dflash profiles' `model` at the output. Results on `classroom_summary` at 8K:
+
+| Draft | k=3 TPOT | k=7 TPOT | Acceptance |
+|---|---|---|---|
+| Stock | 20.4 ms (1.17x) | 20.9 ms (1.14x) | 59% / 32% |
+| Int4 head | 18.6 ms (1.28x) | 19.6 ms (1.22x) | 59% / 32% |
+
+The baseline is 23.9 ms/token. `--bits 8` writes an exact copy of the grafted head; it gives
+identical results to the stock draft and serves as the control. The derived draft is tied to
+the target export it was built from, so rebuild it after re-exporting the target. The
+remaining untested lever for acceptance is an int8 or fp16 re-export of the bf16 draft
+checkpoint; the local draft is int4 on all layers, and the export needs network access.
+
+### Throughput task and steady-state reporting
+
+`benchmark.throughput_task` (or `--throughput-task`) picks the prompt the speed iterations
+decode:
+- `summary_2s`, the default, is the built-in two-sentence summary, about 45 tokens.
+- `classroom_summary` is the app's own summarizer request. It uses the configured language and
+  mode's system prompt from `config.yaml` and puts `/no_think` before the transcript for Qwen3,
+  exactly as `summarizer_component` does. Raise `output_tokens` (for example to 1024) so the
+  Markdown summary can finish.
+
+Every record also carries `first_decode_ms`, `steady_pass_ms` and `steady_tpot`, taken from
+the runtime's per-pass inference durations. The first decode pass carries one-time
+per-request work: about 160 ms for dFlash and 64 ms for the baseline at 8K. On a 45-token
+answer that pass is a large share of decode, so the speedup line reports the steady-state
+rate next to the end-to-end TPOT.
+
+Older local target exports may lack `hidden_states_decoder_layers` RT info. The compatibility
+helper backfills this annotation in the target XML using final residual-node locators;
+it does not change weight files. This is an artifact modification, not a GPU tuning setting.
+Use compatible target/draft exports and verify accuracy after export or runtime changes.
 
 ### `cache_size` and the stateful pipeline are alternatives, not a combination
 
@@ -111,8 +246,8 @@ Some models ship a small **draft head** alongside the main network — for Qwen3
 all of them in one forward pass, and every candidate that matches is kept. Fewer main-model
 passes for the same output means lower TPOT at identical output.
 
-It is a **decode-side** lever only. Prefill still processes the whole context exactly once, so
-expect TPOT to move and TTFT not to.
+It primarily accelerates decoding. Prefill still processes the whole context, and extra
+speculative setup can affect TTFT; compare the measured values rather than assuming equality.
 
 Turn it on with an `mtp` section on a profile:
 
@@ -146,8 +281,8 @@ the model loads rather than after a minute of loading a 14 GB export:
 verification step. That is checked too.
 
 Each request uses a fresh `openvino_genai.GenerationConfig`, matching the notebook rather than
-mutating the model's sampling-enabled defaults. Warmup keeps the same prompt and MTP settings
-but generates only four tokens; measured iterations use the configured output length. Since the
+mutating the model's sampling-enabled defaults. Warmup keeps the same prompt, speculative settings,
+and decode budget as measured throughput iterations. Both honor EOS. Since the
 benchmark pre-renders the native chat template to hit the exact context size, it disables only
 the pipeline's second template application.
 

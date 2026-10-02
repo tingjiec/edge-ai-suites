@@ -26,6 +26,8 @@ def _settings_args(**overrides):
         "output_tokens": None,
         "warmup": None,
         "iterations": None,
+        "iteration_gap": None,
+        "throughput_task": None,
         "device": None,
         "weight_format": None,
         "output_dir": None,
@@ -149,6 +151,35 @@ class TestSettingsValidation(unittest.TestCase):
             ):
                 self._load(_settings_config(gpu_memory_budget_gb=value))
 
+    def test_iteration_gap_defaults_to_sustained_back_to_back_runs(self):
+        settings = self._load(_settings_config())
+
+        self.assertEqual(settings["iteration_gap_sec"], 0.0)
+        self.assertIn("back-to-back", benchmark._gap_note(settings))
+
+    def test_iteration_gap_comes_from_config_and_cli_overrides_it(self):
+        self.assertEqual(
+            self._load(_settings_config(iteration_gap_sec=30))["iteration_gap_sec"], 30.0
+        )
+        settings = self._load(_settings_config(iteration_gap_sec=30), iteration_gap=0)
+        self.assertEqual(settings["iteration_gap_sec"], 0.0)
+
+    def test_throughput_task_defaults_to_the_built_in_summary_and_rejects_unknown_names(self):
+        self.assertEqual(self._load(_settings_config())["throughput_task"], "summary_2s")
+        self.assertEqual(
+            self._load(_settings_config(), throughput_task="classroom_summary")["throughput_task"],
+            "classroom_summary",
+        )
+        with self.assertRaisesRegex(SystemExit, "throughput_task must be one of"):
+            self._load(_settings_config(throughput_task="poem"))
+
+    def test_iteration_gap_must_be_a_non_negative_number(self):
+        for value in (-1, float("nan"), True, "30"):
+            with self.subTest(value=value), self.assertRaisesRegex(
+                SystemExit, "iteration_gap_sec must be a non-negative number"
+            ):
+                self._load(_settings_config(iteration_gap_sec=value))
+
 
 def _record(iteration, generation_time, ttft_ms, warmup=False, output_size=64,
             input_size=160000, num_assistant_tokens=None, verification_steps=None):
@@ -167,7 +198,31 @@ def _record(iteration, generation_time, ttft_ms, warmup=False, output_size=64,
         mtp_accepted_tokens=59 if mtp_enabled else None,
         mtp_rejected_tokens=41 if mtp_enabled else None,
         mtp_draft_to_main_ratio=0.42 if mtp_enabled else None,
+        first_decode_ms=160.0 if mtp_enabled else None,
+        steady_pass_ms=52.0 if mtp_enabled else None,
+        steady_tpot=16.5 if mtp_enabled else None,
     )
+
+
+class TestPassProfile(unittest.TestCase):
+    """The first decode pass is separated from the steady state it would otherwise skew."""
+
+    def test_measured_dflash_k3_shape(self):
+        # Qwen3.6-35B-A3B dFlash k=3 at 8K: prefill, a 163 ms first pass, then ~52 ms passes.
+        infer = [3002.7, 163.3, 95.0, 51.0, 51.1, 55.4]
+        batch = [1, 4, 4, 4, 3, 4]
+
+        first, steady, tpot = metrics.pass_profile(infer, batch)
+
+        self.assertEqual(first, 163.3)
+        self.assertEqual(steady, 53.25)
+        self.assertEqual(tpot, round((95.0 + 51.0 + 51.1 + 55.4) / 15, 3))
+
+    def test_too_few_passes_or_mismatched_series_report_nothing(self):
+        self.assertEqual(metrics.pass_profile([3000.0, 60.0, 24.0], [1, 1, 1]), (None, None, None))
+        self.assertEqual(metrics.pass_profile([3000.0, 60.0, 24.0, 24.0], [1, 1, 1]),
+                         (None, None, None))
+        self.assertEqual(metrics.pass_profile(None, None), (None, None, None))
 
 
 class TestIterationRecord(unittest.TestCase):
@@ -837,6 +892,16 @@ class TestMtpTuningHint(unittest.TestCase):
 
         self.assertIsNone(benchmark._mtp_tuning_hint(case))
 
+    def test_dflash_hint_does_not_claim_mtp_behavior(self):
+        hint = benchmark._mtp_tuning_hint({
+            "status": "ok", "mtp": True, "speculative_strategy": "dflash",
+            "num_assistant_tokens": 7, "mtp_acceptance_rate": 0.32,
+        })
+
+        self.assertIn("dFlash", hint)
+        self.assertIn("parallel", hint)
+        self.assertNotIn("Qwen3.8", hint)
+
 
 class TestMtpOutputCheck(unittest.TestCase):
     def test_matching_greedy_outputs_pass(self):
@@ -984,6 +1049,36 @@ class TestMtpProfileResolution(unittest.TestCase):
         self.assertFalse(baseline["mtp"]["enabled"])
         self.assertEqual(swept["mtp"]["num_assistant_tokens"], 5)
 
+    def test_dflash_resolves_an_external_draft_model(self):
+        resolved = self._resolve([self._profile(dflash={
+            "model": "models/dflash", "device": "GPU", "num_assistant_tokens": 7,
+        })])[0]
+
+        self.assertTrue(resolved["mtp"]["enabled"])
+        self.assertEqual(resolved["mtp"]["strategy"], "dflash")
+        self.assertEqual(resolved["mtp"]["model"], "models/dflash")
+        self.assertEqual(resolved["mtp"]["num_assistant_tokens"], 7)
+
+    def test_dflash_requires_a_model_path(self):
+        with self.assertRaisesRegex(SystemExit, "dflash.model must be a non-empty path"):
+            self._resolve([self._profile(dflash={"num_assistant_tokens": 7})])
+
+    def test_mtp_and_dflash_are_mutually_exclusive(self):
+        with self.assertRaisesRegex(SystemExit, "cannot enable both mtp and dflash"):
+            self._resolve([self._profile(
+                mtp={"num_assistant_tokens": 2},
+                dflash={"model": "models/dflash", "num_assistant_tokens": 7},
+            )])
+
+    def test_dflash_rejects_too_few_linear_attention_rows(self):
+        with self.assertRaisesRegex(SystemExit, "num_linear_attention_blocks=8"):
+            self._resolve([{
+                "name": "p",
+                "ov": {},
+                "scheduler": {"max_num_seqs": 1, "num_linear_attention_blocks": 8},
+                "dflash": {"model": "models/dflash", "num_assistant_tokens": 7},
+            }])
+
 
 
 class TestMultiTokenPredictionYield(unittest.TestCase):
@@ -1005,14 +1100,130 @@ class TestMultiTokenPredictionYield(unittest.TestCase):
         self.assertEqual(tokens_per_step, 1.0)
         self.assertIsNone(acceptance)
 
+    def test_step_derived_acceptance_is_labeled_as_estimated(self):
+        record = metrics.iteration_record(
+            1, 8000, 64, 5.0, 3000.0, num_assistant_tokens=7, verification_steps=20,
+        )
+        self.assertTrue(record["mtp_acceptance_estimated"])
+        self.assertIn("estimated", metrics.format_iteration(record))
+        self.assertTrue(metrics.aggregate([record])["mtp_acceptance_estimated"])
+
+    def test_actual_candidate_counts_take_precedence_over_yield(self):
+        record = metrics.iteration_record(
+            1, 8000, 64, 5.0, 3000.0, num_assistant_tokens=7, verification_steps=20,
+            mtp_draft_tokens=100, mtp_accepted_tokens=40,
+        )
+        self.assertEqual(record["mtp_acceptance_rate"], 0.4)
+        self.assertFalse(record["mtp_acceptance_estimated"])
+
+    def test_unavailable_draft_count_is_not_a_valid_acceptance_ratio(self):
+        record = metrics.iteration_record(
+            1, 8000, 64, 5.0, 3000.0, num_assistant_tokens=7, verification_steps=30,
+            mtp_draft_tokens=0, mtp_accepted_tokens=34,
+        )
+        self.assertNotIn("34/0", metrics.format_iteration(record))
+        self.assertTrue(record["mtp_acceptance_estimated"])
+
+
+class TestSpeculativeComparisons(unittest.TestCase):
+    def test_even_probe_count_keeps_throughput_consistent_with_tpot(self):
+        rows = [metrics.iteration_record(
+            index, 8000, output_size, 6.0, 3000.0, other_tokens_avg_latency=tpot,
+        ) for index, (output_size, tpot) in enumerate(((6, 80.0), (87, 20.0)))]
+        summary = metrics.aggregate(rows)
+        self.assertEqual(summary["other_tokens_avg_latency"], 50.0)
+        self.assertEqual(summary["decode_throughput"], 20.0)
+        self.assertEqual(benchmark._output_tokens_cell(summary), "6-87")
+
+    def test_baseline_must_match_execution_settings(self):
+        candidate = {
+            "model": "qwen", "context_tokens": 8000, "device": "GPU", "mtp": True,
+            "weight_format": "int4", "pipeline_mode": "paged", "ov_config": "f16",
+            "scheduler_config": "rows=9",
+        }
+        baseline = {**candidate, "mtp": False}
+        for field in ("model", "context_tokens", "device", "weight_format", "pipeline_mode",
+                      "ov_config", "scheduler_config"):
+            with self.subTest(field=field):
+                self.assertIsNone(benchmark._matched_baseline(candidate, [{**baseline, field: "other"}]))
+        self.assertIs(benchmark._matched_baseline(candidate, [baseline]), baseline)
+
+    def test_speedup_line_reports_what_each_verification_pass_cost(self):
+        # dFlash k=7 on Qwen3.6-35B-A3B: 3.385 tok/step, yet only ~1.2x, because each pass
+        # cost ~3x a baseline step. The line must show that cost, not just the yield.
+        shared = {
+            "model": "qwen", "context_tokens": 8000, "device": "GPU", "status": "ok",
+            "weight_format": "int4", "pipeline_mode": "paged", "ov_config": "f16",
+            "scheduler_config": "rows=17", "first_token_latency": 4500.0,
+        }
+        cases = [
+            {**shared, "profile": "paged_min", "mtp": False, "other_tokens_avg_latency": 33.7},
+            {**shared, "profile": "dflash_k7", "mtp": True, "speculative_strategy": "dflash",
+             "num_assistant_tokens": 7, "other_tokens_avg_latency": 28.0,
+             "tokens_per_step": 3.385, "mtp_acceptance_rate": 0.3407},
+        ]
+
+        line = benchmark._mtp_speedup(cases)
+
+        self.assertIn("dFlash speedup: 1.20x", line)
+        self.assertIn("each verification pass (draft + target) took 94.8 ms", line)
+        self.assertIn("2.81x a baseline decode step", line)
+
+    def test_speedup_line_uses_the_steady_state_when_both_sides_have_it(self):
+        # Measured at 8K, k=3: steady passes 52 ms vs 23.5 ms baseline steps, and a 157 ms
+        # first decode pass that a 45-token answer spreads over only 13 passes.
+        shared = {
+            "model": "qwen", "context_tokens": 8000, "device": "GPU", "status": "ok",
+            "weight_format": "int4", "pipeline_mode": "paged", "ov_config": "f16",
+            "scheduler_config": "rows=17", "first_token_latency": 3000.0,
+        }
+        cases = [
+            {**shared, "profile": "paged_min", "mtp": False, "other_tokens_avg_latency": 24.5,
+             "steady_pass_ms": 23.5, "steady_tpot": 23.5, "first_decode_ms": 64.6},
+            {**shared, "profile": "dflash_k3", "mtp": True, "speculative_strategy": "dflash",
+             "num_assistant_tokens": 3, "other_tokens_avg_latency": 19.0, "tokens_per_step": 3.14,
+             "mtp_acceptance_rate": 0.714, "steady_pass_ms": 52.0, "steady_tpot": 16.0,
+             "first_decode_ms": 157.0},
+        ]
+
+        line = benchmark._mtp_speedup(cases)
+
+        self.assertIn("dFlash speedup: 1.29x", line)
+        self.assertIn("each verification pass (draft + target) took 52.0 ms", line)
+        self.assertIn("2.21x a baseline decode step", line)
+        self.assertIn("first decode pass (157 ms vs 65 ms)", line)
+        self.assertIn("16.0 vs 23.5 ms/token of inference, **1.47x**", line)
+
+    def test_output_check_does_not_compare_different_models(self):
+        cases = [
+            {"model": "first", "profile": "baseline", "mtp": False,
+             "status": "ok", "output_sha256": "first"},
+            {"model": "second", "profile": "dflash", "mtp": True,
+             "status": "ok", "output_sha256": "second"},
+        ]
+        self.assertIsNone(benchmark._mtp_output_check(cases))
+
     def test_acceptance_excludes_the_bonus_token_the_main_model_produces(self):
         # Measured on Qwen3.8-27B: 64 tokens in 23 verification passes at k=3.
-        # 64/23 = 2.783 tokens per pass, of which one is the main model's own bonus
-        # token -- so 1.783 of the 3 drafted candidates were accepted, not 2.783/3.
+        # The first of the 23 is the prefill pass, which emits one token and verifies nothing,
+        # so 63 decode tokens in 22 passes = 2.864 per pass. One of those is the main model's
+        # own bonus token -- so 1.864 of the 3 drafted candidates were accepted, not 2.864/3.
         tokens_per_step, acceptance = metrics.mtp_yield(64, 23, 3)
 
-        self.assertAlmostEqual(tokens_per_step, 2.783, places=3)
-        self.assertAlmostEqual(acceptance, 0.5942, places=4)
+        self.assertAlmostEqual(tokens_per_step, 2.864, places=3)
+        self.assertAlmostEqual(acceptance, 0.6212, places=4)
+
+    def test_dflash_yield_matches_the_runtime_candidate_counts(self):
+        # Measured on Qwen3.6-35B-A3B dFlash k=7: 45 tokens over 14 recorded steps, batch
+        # sizes [1, 4, 4, 5, 1, 7, 2, 3, 5, 3, 4, 4, 1, 1], and the runtime's own 31 accepted
+        # of 91 drafted. Excluding the prefill pass is what makes the two agree.
+        tokens_per_step, acceptance = metrics.mtp_yield(45, 14, 7)
+
+        self.assertAlmostEqual(tokens_per_step, 3.385, places=3)
+        self.assertAlmostEqual(acceptance, round(31 / 91, 4), places=4)
+
+    def test_a_prefill_only_run_has_no_decode_yield(self):
+        self.assertEqual(metrics.mtp_yield(1, 1, 7), (None, None))
 
     def test_raising_k_past_the_knee_shows_up_as_falling_acceptance(self):
         # k=1 -> 34 passes, k=6 -> 19 passes, both for 64 tokens. Yield rises while
@@ -1020,8 +1231,8 @@ class TestMultiTokenPredictionYield(unittest.TestCase):
         _, at_k1 = metrics.mtp_yield(64, 34, 1)
         _, at_k6 = metrics.mtp_yield(64, 19, 6)
 
-        self.assertAlmostEqual(at_k1, 0.8824, places=4)
-        self.assertAlmostEqual(at_k6, 0.3947, places=4)
+        self.assertAlmostEqual(at_k1, 0.9091, places=4)
+        self.assertAlmostEqual(at_k6, 0.4167, places=4)
         self.assertGreater(at_k1, at_k6)
 
     def test_a_runtime_that_reports_no_steps_yields_nothing_rather_than_zero(self):
@@ -1061,9 +1272,9 @@ class TestMultiTokenPredictionYield(unittest.TestCase):
 
         aggregated = metrics.aggregate(rows)
 
-        self.assertAlmostEqual(aggregated["tokens_per_step"], 2.783, places=3)
-        self.assertAlmostEqual(aggregated["tokens_per_step_min"], 2.56, places=2)
-        self.assertAlmostEqual(aggregated["tokens_per_step_max"], 3.048, places=3)
+        self.assertAlmostEqual(aggregated["tokens_per_step"], 2.864, places=3)
+        self.assertAlmostEqual(aggregated["tokens_per_step_min"], 2.625, places=3)
+        self.assertAlmostEqual(aggregated["tokens_per_step_max"], 3.15, places=3)
         self.assertIn("mtp_acceptance_rate", aggregated)
 
     def test_iteration_line_names_the_candidate_count_it_was_measured_at(self):
@@ -1077,7 +1288,7 @@ class TestMultiTokenPredictionYield(unittest.TestCase):
         line = metrics.format_iteration(record)
 
         self.assertIn("MTP k=3", line)
-        self.assertIn("2.78 tok/step", line)
+        self.assertIn("2.86 tok/step", line)
         self.assertIn("59% accepted", line)
         self.assertIn("59/100 candidates", line)
 

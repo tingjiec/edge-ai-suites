@@ -160,6 +160,10 @@ _HIGH_MTP_ACCEPTANCE_RATE = 0.7
 # a pathologically agreeable draft head cannot produce an unbounded "try k+1" chain.
 _MTP_TOKEN_SUGGESTION_CEILING = 8
 
+# dFlash's ceiling is the draft's own: the shipped Qwen3.6 export has block_size=16, seed
+# token included, so it cannot propose more than 15 candidates per pass.
+_DFLASH_TOKEN_SUGGESTION_CEILING = 15
+
 # `SchedulerConfig.max_num_seqs` when a profile leaves it out. On a hybrid model this is not
 # just a batch-size default: the paged backend reserves one full linear-attention state per
 # schedulable sequence out of the same `cache_size` pool the KV blocks come from -- see
@@ -178,11 +182,13 @@ _CASE_MEMORY_FIELDS = (
     "peak_gpu_gb", "post_load_peak_gpu_gb",
 )
 
-# Per iteration, from `_MemorySampler.window()`. Peak says whether the box can run the
-# configuration; mean says what it costs for the minutes it runs (see `_MemorySampler`).
-_ITERATION_MEMORY_FIELDS = ("peak_ram_gb", "peak_gpu_gb", *metrics.MEDIAN_ONLY_METRICS)
-
 REPORT_NAME = "report.txt"
+
+# The prompts the throughput iterations can decode; the first is the default. See
+# `throughput_task_prompt`. `_APP_CONFIG_PATH` is the application config, relative to the
+# smart-classroom/ working directory the benchmark runs from.
+THROUGHPUT_TASKS = ("summary_2s", "classroom_summary")
+_APP_CONFIG_PATH = "config.yaml"
 
 
 # ---------------------------------------------------------------------------
@@ -423,6 +429,82 @@ def _weight_disk_gb(model_dir: str) -> float:
                 except OSError:
                     pass
     return round(total / (1024 ** 3), 2)
+
+
+# The IR that carries a directory's language-model weights, in the order optimum-cli names it:
+# VLM exports split the language model out, plain causal-LM exports (and dFlash drafts) do not.
+_LANGUAGE_MODEL_IRS = ("openvino_language_model.xml", "openvino_model.xml")
+
+# The model-level rt_info, NNCF's record included, is the last element of an IR; this much of
+# the file's tail holds it on every export seen here, even the 8 MB Qwen3.6 graph.
+_IR_TAIL_BYTES = 64 * 1024
+
+
+def ir_weight_precision(model_dir: str | None, names: tuple = _LANGUAGE_MODEL_IRS) -> str | None:
+    """The weight quantization an IR actually carries, read from its NNCF rt_info.
+
+    `model.weight_format` is only the label a directory was named with; the IR records what
+    NNCF did -- mode, group size, and the backup mode for layers kept out of the primary one.
+    Those decide both speed and how closely a dFlash draft can track its target, so they are
+    printed per case rather than inferred from a folder name. Only the XML's tail is read,
+    never the weights. "uncompressed" when the IR has no NNCF block (an fp16/bf16 export);
+    None when there is no IR to read.
+    """
+    path = next(
+        (os.path.join(model_dir, name) for name in names
+         if model_dir and os.path.isfile(os.path.join(model_dir, name))),
+        None,
+    )
+    if path is None:
+        return None
+    try:
+        with open(path, "rb") as ir_file:
+            ir_file.seek(0, os.SEEK_END)
+            ir_file.seek(max(0, ir_file.tell() - _IR_TAIL_BYTES))
+            tail = ir_file.read().decode("utf-8", "replace")
+    except OSError:
+        return None
+    block = re.search(r"<weight_compression>(.*?)</weight_compression>", tail, re.S)
+    if block is None:
+        return "uncompressed"
+    fields = dict(re.findall(r'<(\w+) value="([^"]*)"', block.group(1)))
+    mode = fields.get("mode", "?")
+    group = fields.get("group_size")
+    parts = [mode, "per-channel" if group in (None, "-1") else f"g{group}"]
+    try:
+        ratio = float(fields.get("ratio", "1"))
+    except ValueError:
+        ratio = 1.0
+    if ratio < 1.0:
+        parts.append(f"{ratio:.0%} of layers")
+    parts += [name.upper() for name in ("awq", "gptq") if fields.get(name) == "True"]
+    if fields.get("scale_estimation") == "True":
+        parts.append("SE")
+    if fields.get("all_layers") == "True":
+        parts.append("all layers")
+    elif fields.get("backup_mode") and fields["backup_mode"] != mode:
+        parts.append(f"backup {fields['backup_mode']}")
+    return " ".join(parts)
+
+
+def _precision_matches_label(precision: str | None, label: str | None) -> bool:
+    """Whether a detected precision agrees with the config's `weight_format` label.
+
+    Only integer labels are checked: "int4" must name the IR's mode (`int4_asym`). A float
+    label or an unreadable IR is not evidence of a mismatch.
+    """
+    if not precision or not label or not label.lower().startswith("int"):
+        return True
+    return precision.split()[0].lower().startswith(label.lower())
+
+
+def _draft_weight_precision(model_dir: str, mtp: dict) -> str | None:
+    """Precision of the speculative draft: the external dFlash IR, or the export's MTP head."""
+    if not (mtp or {}).get("enabled"):
+        return None
+    if mtp.get("strategy") == "dflash":
+        return ir_weight_precision(mtp.get("model"))
+    return ir_weight_precision(model_dir, (trial_runner.MTP_MODEL_FILE,))
 
 
 def _load_model_config(model_dir: str) -> dict | None:
@@ -699,12 +781,14 @@ def format_config(config: dict) -> str:
 
 
 def format_mtp(mtp: dict, device: str | None = None) -> str:
-    """One-line rendering of a profile's multi-token-prediction setting."""
+    """One-line rendering of a profile's speculative-decoding setting."""
     if not (mtp or {}).get("enabled"):
         return "off"
     draft_device = mtp.get("device") or device
     where = f" on {draft_device}" if draft_device else ""
-    return f"num_assistant_tokens={mtp['num_assistant_tokens']}{where}"
+    strategy = mtp.get("strategy", "mtp")
+    model = f" model={mtp['model']}" if mtp.get("model") else ""
+    return f"{strategy} num_assistant_tokens={mtp['num_assistant_tokens']}{model}{where}"
 
 
 # The two pipelines OpenVINO GenAI can run a case on, and the reason they are two profiles
@@ -717,12 +801,19 @@ def format_mtp(mtp: dict, device: str | None = None) -> str:
 PIPELINE_STATEFUL = "stateful"
 PIPELINE_PAGED = "paged"
 
-_PROFILE_KEYS = ("name", "ov", "scheduler", "mtp")
+_PROFILE_KEYS = ("name", "ov", "scheduler", "mtp", "dflash")
 _MTP_KEYS = ("enabled", "num_assistant_tokens", "device")
+_DFLASH_KEYS = ("enabled", "model", "num_assistant_tokens", "device")
 
 # What a profile's `mtp` section resolves to when it is absent. Normalized rather than left
 # as None so every consumer -- the child, the CSV row, the report -- reads one shape.
-_MTP_OFF = {"enabled": False, "num_assistant_tokens": None, "device": None}
+_MTP_OFF = {
+    "enabled": False,
+    "strategy": None,
+    "model": None,
+    "num_assistant_tokens": None,
+    "device": None,
+}
 
 
 def pipeline_mode(scheduler_config: dict | None) -> str:
@@ -734,7 +825,7 @@ def pipeline_mode(scheduler_config: dict | None) -> str:
     return PIPELINE_PAGED if scheduler_config else PIPELINE_STATEFUL
 
 
-def _resolve_mtp(name: str, section, scheduler: dict, override) -> dict:
+def _resolve_mtp(name: str, section, scheduler: dict, override, kind: str = "mtp") -> dict:
     """Normalize and validate one profile's `mtp` section.
 
     Multi-token prediction is self-speculative decoding: the model's own draft head
@@ -777,25 +868,78 @@ def _resolve_mtp(name: str, section, scheduler: dict, override) -> dict:
 
     if not isinstance(tokens, int) or isinstance(tokens, bool) or tokens < 1:
         raise SystemExit(
-            f"profile {name!r} mtp.num_assistant_tokens must be an integer >= 1 "
-            f"(got {tokens!r}); it is how many candidates the draft head offers per "
+            f"profile {name!r} {kind}.num_assistant_tokens must be an integer >= 1 "
+            f"(got {tokens!r}); it is how many candidates the draft offers per "
             "verification pass, and openvino_genai rejects 0"
         )
     chunk = scheduler.get("max_num_batched_tokens")
     if isinstance(chunk, int) and not isinstance(chunk, bool) and chunk < tokens + 1:
         raise SystemExit(
             f"profile {name!r} has max_num_batched_tokens={chunk}, below the "
-            f"{tokens + 1} tokens one MTP step submits (num_assistant_tokens={tokens} "
+            f"{tokens + 1} tokens one speculative step submits (num_assistant_tokens={tokens} "
             "candidates plus the token being verified)"
         )
     device = section.get("device")
     if device is not None and (not isinstance(device, str) or not device.strip()):
-        raise SystemExit(f"profile {name!r} mtp.device must be a non-empty string")
+        raise SystemExit(f"profile {name!r} {kind}.device must be a non-empty string")
     return {
         "enabled": True,
+        "strategy": "mtp",
+        "model": None,
         "num_assistant_tokens": tokens,
         "device": device.strip() if device else None,
     }
+
+
+def _resolve_dflash(name: str, section, scheduler: dict, override) -> dict:
+    """Normalize an external dFlash draft model into the speculative runtime shape.
+
+    Validation is shared with `_resolve_mtp` (k >= 1, room in `max_num_batched_tokens`);
+    on top of that the hybrid target's linear-attention pool must hold one committed row
+    per sequence plus the 1 + k rows a verification window borrows.
+    """
+    if not isinstance(section, dict):
+        raise SystemExit(
+            f"profile {name!r} dflash must be a mapping of {{{', '.join(_DFLASH_KEYS)}}}"
+        )
+    unknown = [key for key in section if key not in _DFLASH_KEYS]
+    if unknown:
+        raise SystemExit(
+            f"profile {name!r} dflash has unknown key(s): {', '.join(sorted(unknown))}. "
+            f"A dflash section is {{{', '.join(_DFLASH_KEYS)}}}."
+        )
+    if not bool(section.get("enabled", bool(section))):
+        return dict(_MTP_OFF)
+
+    model = section.get("model")
+    if not isinstance(model, str) or not model.strip():
+        raise SystemExit(f"profile {name!r} dflash.model must be a non-empty path")
+    resolved = _resolve_mtp(
+        name,
+        {
+            "enabled": True,
+            "num_assistant_tokens": section.get("num_assistant_tokens"),
+            "device": section.get("device"),
+        },
+        scheduler,
+        override,
+        kind="dflash",
+    )
+    linear_blocks = scheduler.get("num_linear_attention_blocks")
+    sequences = scheduler.get("max_num_seqs", _GENAI_DEFAULT_MAX_NUM_SEQS)
+    required_blocks = sequences + resolved["num_assistant_tokens"] + 1
+    if (
+        isinstance(linear_blocks, int)
+        and not isinstance(linear_blocks, bool)
+        and linear_blocks < required_blocks
+    ):
+        raise SystemExit(
+            f"profile {name!r} has num_linear_attention_blocks={linear_blocks}, below the "
+            f"{required_blocks} rows required by max_num_seqs={sequences} and dflash "
+            f"num_assistant_tokens={resolved['num_assistant_tokens']}"
+        )
+    resolved.update({"strategy": "dflash", "model": model.strip()})
+    return resolved
 
 
 def _resolve_profiles(raw_profiles, names_filter, ov_overrides, sched_overrides,
@@ -851,13 +995,20 @@ def _resolve_profiles(raw_profiles, names_filter, ov_overrides, sched_overrides,
                 "continuous batching",
                 flush=True,
             )
+        if entry.get("mtp") is not None and entry.get("dflash") is not None:
+            raise SystemExit(f"profile {name!r} cannot enable both mtp and dflash")
+        speculative = (
+            _resolve_dflash(name, entry.get("dflash"), resolved_scheduler, mtp_tokens)
+            if entry.get("dflash") is not None
+            else _resolve_mtp(name, entry.get("mtp"), resolved_scheduler, mtp_tokens)
+        )
         resolved.append({
             "name": name,
             "ov": _apply_overrides(sections["ov"], ov_overrides, coerce=False),
             # `scheduler: {}` is meaningful -- it selects the stateful pipeline -- so an
             # empty mapping is preserved rather than treated as "unset".
             "scheduler": resolved_scheduler,
-            "mtp": _resolve_mtp(name, entry.get("mtp"), resolved_scheduler, mtp_tokens),
+            "mtp": speculative,
         })
 
     names = [profile["name"] for profile in resolved]
@@ -893,6 +1044,14 @@ def _parse_args():
     parser.add_argument("--output-tokens", type=int, help="override benchmark.output_tokens")
     parser.add_argument("--warmup", type=int, help="override benchmark.warmup")
     parser.add_argument("--iterations", type=int, help="override benchmark.iterations")
+    parser.add_argument(
+        "--iteration-gap", type=float, metavar="SECONDS",
+        help="override benchmark.iteration_gap_sec (untimed idle before each measured run)",
+    )
+    parser.add_argument(
+        "--throughput-task", choices=THROUGHPUT_TASKS,
+        help="override benchmark.throughput_task (the prompt the speed iterations decode)",
+    )
     parser.add_argument("--device", help="override model.device (e.g. GPU, CPU)")
     parser.add_argument("--weight-format", help="override model.weight_format")
     parser.add_argument("--output-dir", help="override benchmark.output_dir")
@@ -905,9 +1064,9 @@ def _parse_args():
         help="add to or override every profile's SchedulerConfig values; KEY= removes one",
     )
     parser.add_argument(
-        "--mtp-tokens", type=int, metavar="K",
-        help="override num_assistant_tokens on every profile that already enables MTP; "
-             "profiles without an `mtp` section stay the no-MTP baseline",
+        "--mtp-tokens", "--assistant-tokens", dest="mtp_tokens", type=int, metavar="K",
+        help="override num_assistant_tokens on every profile that already enables MTP or "
+             "dFlash; non-speculative baseline profiles stay the baseline",
     )
     parser.add_argument(
         "--accuracy", action="store_true",
@@ -1201,6 +1360,31 @@ def _load_settings(args) -> dict:
         "benchmark.warmup must be a non-negative integer", minimum=0,
     )
 
+    # Untimed idle before each measured generation. A shared-power iGPU boosts for the first
+    # few seconds of load and then settles lower: on Qwen3.6-35B-A3B at 8K, back-to-back
+    # generations decode at ~28-31 ms/token while every generation after 30 s idle runs at
+    # 24.6 ms with a 3.0 s instead of ~4 s TTFT. 0 measures sustained throughput; a gap
+    # measures what an occasional request (the classroom case) sees.
+    iteration_gap_sec = (
+        args.iteration_gap if args.iteration_gap is not None
+        else getattr(bench, "iteration_gap_sec", 0)
+    )
+    if (
+        not isinstance(iteration_gap_sec, (int, float)) or isinstance(iteration_gap_sec, bool)
+        or not math.isfinite(iteration_gap_sec) or iteration_gap_sec < 0
+    ):
+        raise SystemExit("benchmark.iteration_gap_sec must be a non-negative number of seconds")
+
+    throughput_task = (
+        args.throughput_task if getattr(args, "throughput_task", None) is not None
+        else getattr(bench, "throughput_task", THROUGHPUT_TASKS[0])
+    )
+    if throughput_task not in THROUGHPUT_TASKS:
+        raise SystemExit(
+            f"benchmark.throughput_task must be one of {', '.join(THROUGHPUT_TASKS)} "
+            f"(got {throughput_task!r})"
+        )
+
     models = args.models if args.models is not None else bench.models
     if not isinstance(models, list) or not models or any(
         not isinstance(name, str) or not name.strip() for name in models
@@ -1240,6 +1424,8 @@ def _load_settings(args) -> dict:
         "output_tokens": output_tokens,
         "warmup": warmup,
         "iterations": iterations,
+        "iteration_gap_sec": float(iteration_gap_sec),
+        "throughput_task": throughput_task,
         "timeout_sec": timeout_sec,
         "max_system_memory_pct": max_ram_pct,
         "gpu_memory_budget_gb": gpu_memory_budget_gb,
@@ -1339,6 +1525,8 @@ def _run_case_subprocess(
     on_iteration=None,
     probes: list | None = None,
     on_probe=None,
+    iteration_gap_sec: float = 0.0,
+    throughput_task: dict | None = None,
     sample_interval: float = 0.5,
     poll_interval: float = 0.25,
     drain_timeout: float = 5.0,
@@ -1364,7 +1552,8 @@ def _run_case_subprocess(
         target=trial_runner.run_case,
         args=(
             model_dir, device, context_tokens, output_tokens, warmup, iterations,
-            result_queue, ov_config, scheduler_config, mtp, probes,
+            result_queue, ov_config, scheduler_config, mtp, probes, iteration_gap_sec,
+            throughput_task,
         ),
     )
     process.start()
@@ -1622,6 +1811,7 @@ def _run_case(model_name, model_dir, profile, context_tokens, settings, static) 
     # a one-key scheduler, and that really does hand the case to the stateful pipeline. The
     # reported mode has to be the one the child will run.
     mode = pipeline_mode(scheduler_config)
+    draft_precision = _draft_weight_precision(model_dir, mtp)
 
     accuracy_cfg = settings.get("accuracy")
     # Built before the banner so the probe count printed is the number that will actually run.
@@ -1640,7 +1830,10 @@ def _run_case(model_name, model_dir, profile, context_tokens, settings, static) 
     )
     print(f"  ov: {format_config(ov_config)}", flush=True)
     print(f"  pipeline: {mode}", flush=True)
-    print(f"  mtp: {format_mtp(mtp, settings['device'])}", flush=True)
+    print(f"  weights: {static.get('weight_precision') or '--'} ({model_dir})", flush=True)
+    print(f"  speculative: {format_mtp(mtp, settings['device'])}", flush=True)
+    if mtp["enabled"]:
+        print(f"  draft weights: {draft_precision or '--'}", flush=True)
     if mode == PIPELINE_PAGED:
         print(f"  scheduler: {format_config(scheduler_config)}", flush=True)
         if "cache_size" not in scheduler_config:
@@ -1693,6 +1886,10 @@ def _run_case(model_name, model_dir, profile, context_tokens, settings, static) 
             settings["warmup"], settings["iterations"], settings["timeout_sec"],
             ov_config, scheduler_config, mtp, on_iteration=_echo,
             probes=probes, on_probe=_echo_probe,
+            iteration_gap_sec=settings.get("iteration_gap_sec", 0.0),
+            throughput_task=throughput_task_prompt(
+                settings.get("throughput_task"), model_name
+            ),
         )
     except Exception as exc:  # noqa: BLE001 - a case the orchestrator could not carry out
         # Spawning a fresh interpreter that re-imports the OpenVINO stack is itself work the
@@ -1727,6 +1924,10 @@ def _run_case(model_name, model_dir, profile, context_tokens, settings, static) 
         "context_tokens": context_tokens,
         "device": device,
         "weight_format": settings["weight_format"],
+        # Detected from the IR, not the config label: see ir_weight_precision.
+        "weight_precision": static.get("weight_precision"),
+        "draft_weight_precision": draft_precision,
+        "throughput_task": None if accuracy_cfg else settings.get("throughput_task"),
         "pipeline_mode": mode,
         "status": _status(result),
         "error": result.get("error"),
@@ -1736,6 +1937,8 @@ def _run_case(model_name, model_dir, profile, context_tokens, settings, static) 
         # From the profile, not from a measurement: a case that failed before generating
         # still has to say which configuration failed.
         "mtp": mtp["enabled"],
+        "speculative_strategy": mtp["strategy"],
+        "draft_model": mtp["model"],
         "num_assistant_tokens": mtp["num_assistant_tokens"],
         "mtp_device": (mtp["device"] or device) if mtp["enabled"] else None,
         "ov_config": format_config(ov_config),
@@ -1884,7 +2087,7 @@ def _format_case(case: dict) -> str:
         )
     line = (
         f"  => {case['status'].upper()} | TPOT {_fmt(case.get('other_tokens_avg_latency'))} ms/token "
-        f"{_mtp_cell(case, prefix='| MTP ')}"
+        f"{_mtp_cell(case, prefix='| Speculative ')}"
         f"| TTFT {_ttft_seconds(case)}s "
         f"| decode {_fmt(case.get('decode_throughput'), '{:.2f}')} tok/s "
         f"| e2e {_fmt(case.get('e2e_throughput'))} tok/s "
@@ -1912,8 +2115,16 @@ def _ttft_seconds(case: dict) -> str:
     return _fmt(ttft / 1000) if isinstance(ttft, (int, float)) else "--"
 
 
+def _output_tokens_cell(case: dict) -> str:
+    smallest = case.get("output_size_min", case.get("output_size"))
+    largest = case.get("output_size_max", case.get("output_size"))
+    if smallest != largest:
+        return f"{_fmt(smallest, '{:g}')}-{_fmt(largest, '{:g}')}"
+    return _fmt(largest, "{:g}")
+
+
 def _mtp_cell(case: dict, prefix: str = "", empty: str = "") -> str:
-    """The MTP column: what was configured and what it actually yielded.
+    """The speculative-decoding column: what was configured and what it yielded.
 
     `k` alone would not say whether it worked -- a candidate count is a request, and the
     finding is how many of those candidates survived verification. A case with MTP off
@@ -1922,13 +2133,19 @@ def _mtp_cell(case: dict, prefix: str = "", empty: str = "") -> str:
     """
     if not case.get("mtp"):
         return empty
-    parts = [f"k={case.get('num_assistant_tokens')}"]
+    strategy = metrics.strategy_label(case)
+    parts = [strategy, f"k={case.get('num_assistant_tokens')}"]
+    # Mode and group only; the full record is in the case banner. A draft quantized more
+    # coarsely than its target agrees with it less often, so it belongs next to acceptance.
+    if case.get("draft_weight_precision"):
+        parts.append("draft " + " ".join(case["draft_weight_precision"].split()[:2]))
     tokens_per_step = case.get("tokens_per_step")
     if isinstance(tokens_per_step, (int, float)):
         parts.append(f"{tokens_per_step:.2f} tok/step")
     acceptance = case.get("mtp_acceptance_rate")
     if isinstance(acceptance, (int, float)):
-        parts.append(f"{acceptance * 100:.0f}% accepted")
+        qualifier = " estimated" if case.get("mtp_acceptance_estimated") else ""
+        parts.append(f"{acceptance * 100:.0f}% accepted{qualifier}")
     # What proposing those candidates cost, so the cell that says "62% accepted" also says
     # whether the draft head is cheap enough for that acceptance to be a net decode win.
     ratio = case.get("mtp_draft_to_main_ratio")
@@ -1955,20 +2172,35 @@ def _mtp_tuning_hint(case: dict) -> str | None:
         or not isinstance(tokens, int)
     ):
         return None
+    dflash = case.get("speculative_strategy") == "dflash"
     if acceptance < _LOW_MTP_ACCEPTANCE_RATE and tokens > 1:
         next_tokens = max(1, math.ceil(tokens / 2))
+        if dflash:
+            return (
+                f"  hint: dFlash accepted {acceptance * 100:.0f}% of its {tokens} candidates; "
+                f"compare k={next_tokens}. The draft proposes its block in one parallel pass, "
+                "so a larger k costs little to draft, but the target still verifies all k + 1 "
+                "tokens every pass -- rank by TPOT against the matched baseline, not by "
+                "acceptance."
+            )
         return (
             f"  hint: only {acceptance * 100:.0f}% of MTP candidates were accepted; compare "
             f"k={next_tokens} -- fewer candidates per pass usually raises acceptance (for "
             "Qwen3.8-27B at 8K, k=2 is the higher-acceptance balanced profile and k=3 is the "
             "minimum-TPOT profile)."
         )
-    if acceptance >= _HIGH_MTP_ACCEPTANCE_RATE and tokens < _MTP_TOKEN_SUGGESTION_CEILING:
+    ceiling = _DFLASH_TOKEN_SUGGESTION_CEILING if dflash else _MTP_TOKEN_SUGGESTION_CEILING
+    if acceptance >= _HIGH_MTP_ACCEPTANCE_RATE and tokens < ceiling:
         tokens_per_step = case.get("tokens_per_step")
         yield_now = (
             f" for {tokens_per_step:.2f} tok/step"
             if isinstance(tokens_per_step, (int, float)) else ""
         )
+        if dflash:
+            return (
+                f"  hint: dFlash accepted {acceptance * 100:.0f}% of candidates{yield_now}; "
+                f"compare k={tokens + 1} and rank by TPOT against the matched baseline."
+            )
         return (
             f"  hint: {acceptance * 100:.0f}% of MTP candidates were accepted{yield_now}; the "
             f"draft head is agreeing often, so compare k={tokens + 1} -- a larger candidate "
@@ -2302,7 +2534,7 @@ def _retrieval_section(cases: list, context: int, settings: dict) -> list:
         "is better, and it is the precision signal recall cannot give."
         + (f" Delta is the overall recall gap to `{baseline_name}`." if baseline_name else ""),
         "",
-        f"| Profile | Pipeline | MTP | {' | '.join(task_names)} | Overall | EM | F1 | "
+        f"| Profile | Pipeline | Speculative | {' | '.join(task_names)} | Overall | EM | F1 | "
         f"Decoys | Delta vs {baseline_name or '--'} |",
         "|---|---|---|" + "|".join(["---"] * len(task_names)) + "|---|---|---|---|---|",
     ]
@@ -2389,7 +2621,7 @@ def _generation_section(cases: list, context: int, settings: dict) -> list:
         "prompt. This is the measurement retrieval cannot make -- a profile can return every "
         "planted code and still write worse prose.",
         "",
-        f"| Profile | Pipeline | MTP | Similarity | ROUGE-1 | ROUGE-2 | ROUGE-L | chrF "
+        f"| Profile | Pipeline | Speculative | Similarity | ROUGE-1 | ROUGE-2 | ROUGE-L | chrF "
         f"| FDT ({unit}) | SDT norm | Identical | Coverage |",
         "|---|---|---|---|---|---|---|---|---|---|---|---|",
     ]
@@ -2455,43 +2687,88 @@ def _generation_section(cases: list, context: int, settings: dict) -> list:
     return lines
 
 
-def _mtp_speedup(cases: list) -> str | None:
-    """The one sentence an MTP sweep exists to produce, or None when it cannot be formed.
+def _matched_baseline(candidate: dict, cases: list) -> dict | None:
+    """Find a non-speculative case with the same model and execution settings."""
+    fields = (
+        "model", "context_tokens", "device", "weight_format", "weight_precision", "pipeline_mode",
+        "throughput_task",
+        "ov_config", "scheduler_config",
+    )
+    return next((case for case in cases if not case.get("mtp") and all(
+        case.get(field) == candidate.get(field) for field in fields
+    )), None)
 
-    Ranking by TPOT already puts the winner first, but a leaderboard does not say how much
-    of the win is MTP: the reader has to find the no-MTP row themselves and divide. Both
-    sides are the best *usable* case on their side of the split, so the claim is "the best
-    this box did with MTP against the best it did without", not a cherry-picked pair.
 
-    Returns None when the context has only one side -- there is nothing to compare, and a
-    speedup figure computed against a missing baseline would be an invention.
+def _verification_cost(case: dict, baseline: dict) -> str:
+    """How expensive one speculative pass was, in units of one baseline decode step.
+
+    The speedup is ``tokens_per_step / pass_cost``: yield alone cannot predict it. On the
+    Qwen3.6 MoE, verifying k + 1 tokens activates the union of every token's experts, so a
+    pass costs several single-token steps -- which is why 3.4 tok/step can net ~1.2x, and
+    why the sentence that reports the speedup has to say what each pass cost.
+
+    The runtime's steady-state per-pass inference time is used when both sides have it (see
+    metrics.pass_profile); otherwise the pass is approximated as TPOT x tokens per pass,
+    which also folds in the first decode pass's one-time cost.
     """
+    pass_ms, step_ms = case.get("steady_pass_ms"), baseline.get("steady_pass_ms")
+    if not pass_ms or not step_ms:
+        tokens_per_step = case.get("tokens_per_step")
+        tpot, step_ms = case.get("other_tokens_avg_latency"), baseline.get("other_tokens_avg_latency")
+        if not isinstance(tokens_per_step, (int, float)) or not tpot or not step_ms:
+            return ""
+        pass_ms = tpot * tokens_per_step
+    return (
+        f"; each verification pass (draft + target) took {_fmt(pass_ms, '{:.1f}')} ms, "
+        f"{pass_ms / step_ms:.2f}x a baseline decode step"
+    )
+
+
+def _steady_state(case: dict, baseline: dict) -> str:
+    """The decode rate once the first pass is paid, which a longer answer converges to."""
+    tpot, base = case.get("steady_tpot"), baseline.get("steady_tpot")
+    if not tpot or not base:
+        return ""
+    return (
+        f" Steady state, excluding the first decode pass ({_fmt(case.get('first_decode_ms'), '{:.0f}')} "
+        f"ms vs {_fmt(baseline.get('first_decode_ms'), '{:.0f}')} ms): {_fmt(tpot)} vs "
+        f"{_fmt(base)} ms/token of inference, **{base / tpot:.2f}x**."
+    )
+
+
+def _mtp_speedup(cases: list) -> str | None:
+    """Compare the fastest speculative case that has a matched usable baseline."""
     ranked = _leaderboard(cases)
-    with_mtp = next((c for c in ranked if c.get("mtp")), None)
-    without = next((c for c in ranked if not c.get("mtp")), None)
-    if with_mtp is None or without is None:
+    pair = next(((case, baseline) for case in ranked if case.get("mtp")
+                 if (baseline := _matched_baseline(case, ranked)) is not None), None)
+    if pair is None:
         return None
+    with_mtp, without = pair
     baseline_tpot = without["other_tokens_avg_latency"]
     mtp_tpot = with_mtp["other_tokens_avg_latency"]
     if not mtp_tpot or not baseline_tpot:
         return None
+    strategy = metrics.strategy_label(with_mtp)
     return (
-        f"**MTP speedup: {baseline_tpot / mtp_tpot:.2f}x on decode** -- "
+        f"**{strategy} speedup: {baseline_tpot / mtp_tpot:.2f}x on decode** -- "
         f"`{with_mtp['profile']}` (k={with_mtp.get('num_assistant_tokens')}) at "
         f"{_fmt(mtp_tpot)} ms/token against `{without['profile']}` at "
         f"{_fmt(baseline_tpot)} ms/token"
         + (
-            f", accepting {with_mtp['mtp_acceptance_rate'] * 100:.0f}% of drafted candidates "
+            f", {'estimated ' if with_mtp.get('mtp_acceptance_estimated') else ''}"
+            f"acceptance {with_mtp['mtp_acceptance_rate'] * 100:.0f}% of drafted candidates "
             f"for {_fmt(with_mtp.get('tokens_per_step'), '{:.2f}')} tokens per verification pass"
             if isinstance(with_mtp.get("mtp_acceptance_rate"), (int, float)) else ""
         )
-        + ". TTFT is unaffected -- MTP shortens decode, not prefill: "
+        + _verification_cost(with_mtp, without)
+        + ". Measured TTFT: "
         f"{_ttft_seconds(with_mtp)}s vs {_ttft_seconds(without)}s."
+        + _steady_state(with_mtp, without)
     )
 
 
 def _mtp_output_check(cases: list) -> str | None:
-    """Compare deterministic MTP outputs with the no-MTP baseline, as the notebook does."""
+    """Compare greedy outputs only between matched speculative and baseline cases."""
     internally_inconsistent = [
         case["profile"] for case in cases
         if case.get("status") == "ok" and case.get("output_consistent") is False
@@ -2500,30 +2777,24 @@ def _mtp_output_check(cases: list) -> str | None:
         return (
             "**WARNING: repeated greedy outputs differ within profile(s)** "
             + ", ".join(f"`{name}`" for name in internally_inconsistent)
-            + ". The run is nondeterministic, so its MTP comparison is invalid."
+            + ". The run is nondeterministic, so its speculative output comparison is inconclusive."
         )
-    baseline = next(
-        (case for case in cases if case.get("status") == "ok" and not case.get("mtp")
-         and case.get("output_sha256")),
-        None,
-    )
-    mtp_cases = [
-        case for case in cases
-        if case.get("status") == "ok" and case.get("mtp") and case.get("output_sha256")
-    ]
-    if baseline is None or not mtp_cases:
+    usable = [case for case in cases if case.get("status") == "ok" and case.get("output_sha256")]
+    pairs = [(case, baseline) for case in usable if case.get("mtp")
+             if (baseline := _matched_baseline(case, usable)) is not None]
+    if not pairs:
         return None
     mismatches = [
-        case["profile"] for case in mtp_cases
+        case["profile"] for case, baseline in pairs
         if case["output_sha256"] != baseline["output_sha256"]
     ]
     if mismatches:
         return (
-            "**WARNING: greedy MTP output differs from the baseline** for "
+            "**WARNING: greedy speculative output differs from the baseline** for "
             + ", ".join(f"`{name}`" for name in mismatches)
             + ". Do not treat their speedup as valid until the divergence is explained."
         )
-    return "**Greedy output check: all measured MTP profiles match the baseline exactly.**"
+    return "**Greedy output check: all matched speculative profiles match their baseline exactly.**"
 
 
 def write_report(output_dir: str, settings: dict, cases: list, platform_info: dict,
@@ -2553,6 +2824,46 @@ def write_report(output_dir: str, settings: dict, cases: list, platform_info: di
     return lines
 
 
+def throughput_task_prompt(name: str | None, model_name: str,
+                           app_config_path: str | None = None) -> dict | None:
+    """The framing a throughput task puts around the transcript, for build_benchmark_prompt.
+
+    `summary_2s` (None) is the built-in two-sentence summary. `classroom_summary` is the
+    application's own summarizer request, rebuilt the way summarizer_component._get_message
+    builds it: the configured language and mode's system prompt from the app config, and
+    `/no_think` ahead of the transcript for Qwen3 models. Its answer is a long, templated
+    Markdown summary rather than two free sentences -- the output dFlash actually has to
+    draft in production, and the one its speedup should be judged on.
+    """
+    if name in (None, THROUGHPUT_TASKS[0]):
+        return None
+    path = app_config_path or _APP_CONFIG_PATH
+    try:
+        app = load_config(path)
+        summarizer = app.models.summarizer
+        prompts = vars(summarizer.system_prompt)[app.app.language]
+        mode = str(getattr(summarizer, "mode", "dialog")).strip().lower()
+        system_prompt = {"teacher": prompts.Teacher, "hybrid": prompts.Hybrid}.get(
+            mode, prompts.Dialog
+        )
+    except (OSError, AttributeError, KeyError, TypeError) as exc:
+        raise SystemExit(
+            f"throughput_task {name!r} needs models.summarizer.system_prompt in {path}: {exc}"
+        ) from exc
+    return {
+        "name": name,
+        "system_prompt": system_prompt,
+        "user_prefix": "/no_think\n" if "qwen3" in model_name.lower() else "",
+        "suffix": "",
+    }
+
+
+def _gap_note(settings: dict) -> str:
+    """Header suffix naming the idle gap, so a burst and a sustained figure never pass as one."""
+    gap = settings.get("iteration_gap_sec") or 0
+    return f", {gap:g}s idle before each measured run" if gap else ", back-to-back (sustained)"
+
+
 def _report_lines(settings: dict, cases: list, platform_info: dict,
                   completed: bool) -> list:
     """The whole report: header, then per context speed + accuracy, then probes and
@@ -2560,6 +2871,12 @@ def _report_lines(settings: dict, cases: list, platform_info: dict,
     an accuracy run measures both, because its probes carry the same timing records the
     throughput path produces."""
     acc = settings.get("accuracy")
+    workload = (
+        "accuracy probes (per-suite decode ceilings; EOS respected)" if acc else
+        f"{settings['iterations']} iteration(s) of "
+        f"`{settings.get('throughput_task') or THROUGHPUT_TASKS[0]}` "
+        f"@ up to {settings['output_tokens']} output tokens (EOS respected)"
+    ) + _gap_note(settings)
     lines = [
         "=" * 78,
         f" Long-Context Benchmark -- {', '.join(settings['models'])}",
@@ -2572,8 +2889,7 @@ def _report_lines(settings: dict, cases: list, platform_info: dict,
         f"budgets RAM <= {settings['max_system_memory_pct']:g}%, "
         f"GPU <= {settings['gpu_memory_budget_gb']:g} GB",
         f"Contexts  : {', '.join(f'{c:,}' for c in settings['context_tokens'])} tokens | "
-        f"{settings['warmup']} warmup + {settings['iterations']} iteration(s) @ "
-        f"{settings['output_tokens']} output tokens",
+        f"{settings['warmup']} warmup + {workload}",
     ]
     if acc:
         lines.append(
@@ -2609,10 +2925,11 @@ def _speed_section(at_context: list, context: int, settings: dict) -> list:
     """
     lines = _heading(f"{context:,} tokens -- SPEED AND RESOURCES")
     lines += [
-        "| Model | Profile | Pipeline | KV | MTP | Status | TPOT ms/tok | TTFT s "
+        "| Model | Profile | Weights | Pipeline | KV | Speculative | Status | Output tok "
+        "| TPOT ms/tok | TTFT s "
         f"| Decode tok/s | E2E tok/s | Prefill tok/s | RAM peak/mean GB | GPU peak/mean GB "
         f"(% of {settings['gpu_memory_budget_gb']:g}) | KV est GB | cache |",
-        "|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|",
+        "|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|",
     ]
     ranked = _leaderboard(at_context)
     # Identity, not equality: two profiles can produce byte-identical rows, and `in` on
@@ -2631,12 +2948,15 @@ def _speed_section(at_context: list, context: int, settings: dict) -> list:
         if case["status"] not in _USABLE_STATUSES:
             timings = ["--"] * len(timings)
         lines.append(
-            f"| {case['model']} | {case['profile']} | {case.get('pipeline_mode') or '--'} "
+            f"| {case['model']} | {case['profile']} "
+            f"| {case.get('weight_precision') or case.get('weight_format') or '--'} "
+            f"| {case.get('pipeline_mode') or '--'} "
             # KV precision is a column and not a footnote because it is the variable most
             # often changed by accident: two profiles meant to differ only in the pipeline,
             # one edited to f16, and the TTFT gap between them is no longer attributable.
             f"| {case.get('kv_cache_precision') or '--'} "
             f"| {_mtp_cell(case, empty='off').strip() or 'off'} | {case['status']} | "
+            f"{_output_tokens_cell(case)} | "
             + " | ".join(timings)
             + f" | {_fmt(case.get('peak_ram_gb'))}/{_fmt(case.get('mean_ram_gb'))} "
             f"| {_fmt(case.get('peak_gpu_gb'))}/{_fmt(case.get('mean_gpu_gb'))} "
@@ -2647,6 +2967,13 @@ def _speed_section(at_context: list, context: int, settings: dict) -> list:
         )
     lines.append("")
 
+    if settings.get("accuracy"):
+        lines += [
+            "Timing medians pool accuracy probes with different answer lengths. "
+            "Use the default throughput run for a repeated-prompt speed comparison; "
+            "Output tok shows the measured range. Decode tok/s is 1000 / median TPOT.",
+            "",
+        ]
     if ranked:
         best = ranked[0]
         lines += [
@@ -2802,10 +3129,17 @@ def main() -> None:
     if args.list_profiles:
         print(f"Device: {settings['device']} | Weights: {settings['weight_format']}")
         print(f"Models: {', '.join(settings['models'])}")
+        for model_name in settings["models"]:
+            model_dir = _model_ir_dir(
+                settings["models_base_path"], settings["provider"], model_name,
+                settings["weight_format"], settings["model_dirs"],
+            )
+            print(f"  {model_name}: {ir_weight_precision(model_dir) or 'IR not found'} -- {model_dir}")
         print(f"Contexts: {', '.join(f'{c:,}' for c in settings['context_tokens'])}")
         print(
             f"Iterations: {settings['warmup']} warmup + {settings['iterations']} measured, "
             f"{settings['output_tokens']} output tokens, timeout {settings['timeout_sec']:g}s"
+            + _gap_note(settings)
         )
         total = len(settings["models"]) * len(settings["context_tokens"]) * len(settings["profiles"])
         print(f"\n{len(settings['profiles'])} profile(s), {total} case(s):\n")
@@ -2817,7 +3151,12 @@ def main() -> None:
                 "    scheduler: "
                 + (format_config(profile["scheduler"]) if profile["scheduler"] else "(none)")
             )
-            print(f"    mtp:       {format_mtp(profile['mtp'], settings['device'])}")
+            print(f"    speculative: {format_mtp(profile['mtp'], settings['device'])}")
+            if profile["mtp"].get("strategy") == "dflash":
+                print(
+                    "    draft weights: "
+                    f"{ir_weight_precision(profile['mtp']['model']) or 'IR not found'}"
+                )
         if settings.get("accuracy"):
             _print_accuracy_plan(settings)
         return
@@ -2862,12 +3201,19 @@ def main() -> None:
                 "model_config": _load_model_config(model_dir),
                 "fixed_state_bytes": fixed_state_cache_bytes(model_dir),
                 "mtp_layers": mtp_head_layers(model_dir),
+                "weight_precision": ir_weight_precision(model_dir),
             }
             print(
                 f"\n=== {model_name} === weights on disk: {static['weight_disk_gb']:.1f} GB "
-                f"({settings['weight_format']})",
+                f"({static['weight_precision'] or settings['weight_format']}) -- {model_dir}",
                 flush=True,
             )
+            if not _precision_matches_label(static["weight_precision"], settings["weight_format"]):
+                print(
+                    f"  [warn] model.weight_format is {settings['weight_format']!r} but the IR "
+                    f"is {static['weight_precision']}; rows report the IR's precision",
+                    flush=True,
+                )
             _preflight_cache_sizes(settings, static, model_name)
 
             for context in settings["context_tokens"]:
