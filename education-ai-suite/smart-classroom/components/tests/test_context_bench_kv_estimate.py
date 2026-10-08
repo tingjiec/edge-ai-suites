@@ -308,7 +308,9 @@ class TestShippedConfigs(unittest.TestCase):
                 config = self._config(filename)
 
                 self.assertTrue(config.benchmark.models)
-                self.assertTrue(all(c > 0 for c in config.benchmark.context_tokens))
+                # 0 is the no-transcript point; a long-context config still needs a real one.
+                self.assertTrue(all(c >= 0 for c in config.benchmark.context_tokens))
+                self.assertTrue(any(c > 0 for c in config.benchmark.context_tokens))
                 # At least 2 output tokens, or there is no decode phase to average.
                 self.assertGreaterEqual(config.benchmark.output_tokens, 2)
                 names = [p["name"] for p in config.profiles]
@@ -456,7 +458,7 @@ class TestShippedDflashConfig(unittest.TestCase):
         self.assertEqual(baseline["name"], "paged_min")
         self.assertFalse(baseline["mtp"]["enabled"])
         self.assertEqual([profile["mtp"]["num_assistant_tokens"] for profile in profiles[1:]],
-                         [3, 7, 15])
+                         [3, 5, 7, 15])
         for profile in profiles[1:]:
             self.assertEqual(profile["ov"], baseline["ov"])
             self.assertEqual(profile["scheduler"], baseline["scheduler"])

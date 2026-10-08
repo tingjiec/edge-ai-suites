@@ -16,7 +16,8 @@ chunk size, scheduler cache size, continuous batching vs the stateful pipeline, 
 prediction and its candidate count — and ranks
 them by measured TPOT, using TTFT as the tie-breaker; the fastest TTFT is also called out on
 its own, because at long context TTFT is what the user waits for. The 35B config compares a
-`paged_min` baseline with external dFlash drafts at k=3, 7, and 15; the Qwen3.8 config sweeps
+`paged_min` baseline with external dFlash drafts at k=3, 5, 7, and 15 on math, code, and
+summary workloads; the Qwen3.8 config sweeps
 [multi-token prediction](#multi-token-prediction-mtp). Add entries to `profiles` to A/B more in one
 run. Measurement follows the methodology of
 [llm_bench](https://github.com/openvinotoolkit/openvino.genai/tree/master/tools/llm_bench):
@@ -103,8 +104,14 @@ at least `1 + (k + 1)` linear-attention rows. The shared value 17 covers the ent
 Do not use a stateful or differently quantized profile as the dFlash baseline.
 
 ```powershell
-# Repeated-prompt speed comparison, including the no-draft baseline
-.\components\llm\context_bench\run_benchmark.ps1 --profiles paged_min dflash_k3 dflash_k7 dflash_k15
+# Repeated-prompt speed comparison, including the no-draft baseline, on every configured task
+.\components\llm\context_bench\run_benchmark.ps1 --profiles paged_min dflash_k3 dflash_k5 dflash_k7 dflash_k15
+
+# One domain only
+.\components\llm\context_bench\run_benchmark.ps1 --profiles paged_min dflash_k5 dflash_k7 --throughput-task math
+
+# Quick check against the published DFlash numbers (~15 min): no transcript, k=7
+.\components\llm\context_bench\run_benchmark.ps1 --contexts 0 --profiles paged_min dflash_k7 --throughput-task code math chat
 
 # Natural-answer accuracy and timings; reduce probe count while investigating
 .\components\llm\context_bench\run_benchmark.ps1 --profiles paged_min dflash_k3 dflash_k7 --accuracy --accuracy-tasks niah_single fact_sheet --accuracy-depths 0.5 --accuracy-samples 1
@@ -125,16 +132,24 @@ Interpret the report as follows:
 - Decode tok/s is `1000 / median TPOT`; TTFT and total generation time are separate.
 - E2E tok/s includes input tokens as well as generated tokens; it is not decode throughput.
 - Output tok shows actual lengths, or their range for mixed accuracy probes.
-- `tok/step` is decode tokens per verification pass, `(output - 1) / (steps - 1)`: the
-  first recorded step is the prefill pass, which emits one token and verifies nothing.
+- `AL` is the **acceptance length**: decode tokens committed per target verification pass,
+  `(output - 1) / (steps - 1)`, meaning the accepted draft tokens plus the target's own bonus
+  token. The first recorded step is the prefill pass, which emits one token and verifies
+  nothing. AL is the number to read: the decode speedup is `AL / pass cost`, so AL tracks
+  speedup in a way the accepted % cannot.
 - dFlash acceptance is the runtime's own `accepted / drafted`. The dFlash path leaves
   `get_num_draft_tokens()` at 0 and the acceptance rate NaN, so the drafted count is read
   from `get_num_draft_processed_tokens()` (k per pass). Acceptance marked `estimated` is
-  used only when no counter is available and comes from `(tok/step - 1) / k`.
+  used only when no counter is available and comes from `(AL - 1) / k`. The rate falls with
+  k by construction, so it is printed for context only; never rank windows by it.
 - The speedup line also prints what each verification pass cost, as a multiple of a baseline
-  decode step: the speedup is `tok/step / pass cost`. On the Qwen3.6 MoE a pass costs
-  ~2.6x (k=3) to ~4.3x (k=15) a single-token step because every verified token routes to
-  its own experts, so ~3.4 tok/step nets only a modest gain and k=15 is a loss.
+  decode step: the speedup is `AL / pass cost`. On the Qwen3.6 MoE a pass costs
+  ~2.2x (k=3) to ~3.7x (k=15) a single-token step because every verified token routes to
+  its own experts, so a summary's AL of ~3.4 nets only a modest gain and k=15 is a loss.
+- The **SPECULATIVE WINDOW SWEEP** table, one per context, lists every speculative case
+  against its matched baseline: k, AL, accepted %, steady pass ms, pass cost (which is also
+  the break-even AL), and the end-to-end and steady-state decode speedups. It names the best
+  window per task and, when several tasks ran, the domain spread between them.
 - `draft/main` divides total draft time by total target time *including prefill*, so on a
   long prompt it understates the draft's share of each decode pass (~0.05x reported versus
   ~20% of a k=7 pass measured).
@@ -150,12 +165,22 @@ baseline/k3/k7 profile also matched exactly, with full recall and fact coverage.
 a small regression check, not broad model certification or a guarantee for other workloads.
 Embedding similarity was not measured because `whowhatbench` was unavailable.
 
-### Why dFlash acceptance is low, and what does raise throughput
+### Domain, window size, and what raises throughput
+
+Speculative decoding on a MoE target is tricky. The draft proposes its whole block in one
+parallel pass, so a wider window is nearly free to draft. The target, however, verifies all
+k + 1 tokens every pass, and each one reads its own experts. A wider window pays only while
+its AL grows faster than its pass cost. Where that happens depends on the *domain*: code and
+math answers are far more predictable for the draft than open-ended chat or summaries. That is
+why the Qwen3.6 config runs `code`, `math`, `chat`, and `summary_2s` and reports a best window
+per task. Judge the integration on code and math against the published reference (see
+[Comparing with the published DFlash results](#comparing-with-the-published-dflash-results)).
+Judge the classroom gain on `summary_2s` or `classroom_summary`.
 
 Acceptance is set by the workload and by this draft, not by the benchmark's settings. Same
 pipeline and draft, runtime-reported accepted/drafted counts under greedy decoding:
 
-| Workload | k=3 | k=7 | k=15 | Best tok/pass |
+| Workload | k=3 | k=7 | k=15 | Best AL |
 |---|---:|---:|---:|---:|
 | 8K two-sentence summary (`summary_2s`, the default) | 71% | 34% | 16% | 3.4 |
 | 8K app summary (`classroom_summary`, 479 tokens) | 59% | 32% | 15% | 3.25 |
@@ -165,8 +190,70 @@ pipeline and draft, runtime-reported accepted/drafted counts under greedy decodi
 
 The integration works: on math, k=7 decodes at ~10 ms/token against the ~22.6 ms baseline
 (2.1x). Summaries of this transcript are simply hard for the draft to predict. Because
-acceptance is `(tok/pass - 1) / k`, a saturated tok/pass makes every larger k read as a lower
-rate, so rank profiles by TPOT, not acceptance.
+acceptance is `(AL - 1) / k`, a saturated AL makes every larger k read as a lower rate, so
+rank windows by AL against pass cost (the sweep table), not by acceptance.
+
+The console hint follows the same rule. A dFlash window that verifies more than twice its AL
+(for example, k=15 reaching AL 3.4) is pointed at `k = ceil(AL)`. A window whose draft slots
+fill at least 80% of the time is pointed at `2k`. Anything in between needs no further
+measurement.
+
+Measured 2026-10-08 with the shipped config: int4-head draft, 512-token ceiling, 3 iterations
+after 30 s idle, greedy. Each cell is AL and decode speedup over `paged_min`. Baseline decode
+was 43.7-45.2 tok/s without a transcript and 40.8-41.8 tok/s at 8K.
+
+| Task | Context | k=3 | k=5 | k=7 | k=15 | Best window |
+|---|---|---|---|---|---|---|
+| `code` | none | 3.65, 1.85x | 4.96, 2.27x | 5.94, **2.40x** | 7.20, 2.03x | k=7 (105 t/s) |
+| `code` | 8K | 3.70, 1.69x | 5.11, 2.08x | 6.08, **2.22x** | 7.74, 2.07x | k=7 |
+| `math` | none | 3.52, 1.78x | 4.82, 2.14x | 5.68, **2.26x** | 6.91, 1.96x | k=7 (99 t/s) |
+| `math` | 8K | 3.62, 1.66x | 4.87, 1.97x | 5.74, **2.07x** | 7.20, 1.92x | k=7 |
+| `chat` | none | 2.59, 1.34x | 2.85, 1.32x | 3.30, **1.38x** | 3.17, 0.94x | k=7 (61 t/s) |
+| `chat` | 8K | 2.65, 1.23x | 3.01, **1.25x** | 3.02, 1.14x | 3.01, 0.77x | k=5 |
+| `summary_2s` | 8K | 3.14, **1.32x** | 3.14, 1.19x | 3.38, 1.19x | 3.38, 0.90x | k=3 |
+
+Pass costs were 2.0-2.2x (k=3), 2.2-2.4x (k=5), 2.5-2.7x (k=7), and 3.5-3.7x (k=15) a
+baseline step; a pass is cheaper without a transcript. AL divided by pass cost predicts the
+steady speedup to within about 0.01 in every row. k=15 has the highest AL on math and code,
+yet loses to k=7 because its pass costs more. Chat and summaries stop gaining AL beyond
+k=5-7 and k=3, so narrower windows win there. The best k is a property of the domain, not
+of the draft alone.
+
+### Comparing with the published DFlash results
+
+The reference is the Hugging Face blog *Accelerating Qwen3.6 on Intel Core Ultra Series 3 with
+DFlash* (2026-07-30). Its setup matches this config: Qwen3.6-35B-A3B with the z-lab DFlash
+draft, both int4 W4A16, an Arc B390 iGPU (Core Ultra X7 368H, 64 GB), greedy decoding, and
+k=7. The differences are the runtime (OpenVINO 2026.3) and the prompts (whole datasets with no
+long-context prefix). The config's `speculative_reference` section holds its figures, and every
+window sweep prints them beside the measured AL and speedup at the same k:
+
+| Domain | Blog dataset | Blog AL / speedup (t/s) | No transcript, k=7 | 8K transcript, k=7 |
+|---|---|---|---|---|
+| code | HumanEval | 6.4 / 2.2x (89.8) | 5.94 / 2.40x (105.4) | 6.08 / 2.22x |
+| math | GSM8K | 5.0 / 1.6x (68.5) | 5.68 / 2.26x (99.0) | 5.74 / 2.07x |
+| chat | MT-Bench | 4.0 / 1.3x (54.7) | 3.30 / 1.38x (60.6) | 3.02 / 1.14x |
+
+The blog's baseline is 41 t/s; this box measured 43.9 t/s without a transcript. Every domain
+reaches or beats the published speedup at k=7, and the domain ordering is the same: code,
+then math, then chat. The per-domain gaps in AL are prompt effects. This benchmark uses one
+prompt per domain, not a dataset. The `math` prompt is easier to draft than GSM8K. The
+`chat` prompt has one item per MT-Bench category, but MT-Bench answers run longer and include
+second turns. An earlier `chat` prompt with only open-ended items (email, advice, roleplay)
+reached just AL 2.4, which shows how much the mix matters. Treat the reference as a sanity
+band, not a pass/fail target. The blog's dense-model results (Qwen3.6-27B, Qwen3.5-9B) are not
+reproduced here because no DFlash drafts for them are available locally.
+
+**Greedy forks.** Without a transcript, several speculative outputs differ from the baseline's
+greedy output. Each profile repeats its own output exactly, and the fork position moves with k.
+The report's output check prints every fork with the text on either side. Every fork measured
+so far is a near-equivalent token: "our Science Fair" vs "our school science fair", "T-Rex" vs
+"Tyrannosaurus Rex", and "Solve for velocity" vs "Solve for $v$" at token 506 of 512. The
+target scores k + 1 tokens in one verification pass, on a different kernel path than a
+one-token step, so near-ties can flip. Greedy speculative decoding is lossless only up to that
+floating-point difference. A late fork leaves the speedup comparable, an early fork means it
+compares two different answers, and a garbled fork would be a pipeline bug. At 8K, the `code`,
+`math`, and `summary_2s` outputs matched the baseline exactly.
 
 Each of these was A/B-tested on an Arc B390 iGPU and ruled out as a cause:
 - the hidden-state layer mapping (shifting it one layer earlier lowers acceptance);
@@ -209,8 +296,19 @@ checkpoint; the local draft is int4 on all layers, and the export needs network 
 ### Throughput task and steady-state reporting
 
 `benchmark.throughput_task` (or `--throughput-task`) picks the prompt the speed iterations
-decode:
+decode. It takes one name or a list. Each profile then runs once per task, and each task gets
+its own speed table, speedup line, and best window:
 - `summary_2s`, the default, is the built-in two-sentence summary, about 45 tokens.
+- `code` asks for a typed Python module of five lab functions with unittest cases
+  (HumanEval-like).
+- `math` asks for six worked physics, arithmetic, and algebra problems, each ending with
+  `Answer: <number>` (GSM8K-like).
+- `chat` asks four open-ended assistant requests: an email, advice, an explanation for a
+  child, and a roleplay (MT-Bench-like).
+- The three domain tasks run after the transcript at a positive context, changing only the
+  task after it. At `context_tokens: 0` they run alone, as a dataset prompt would; the summary
+  tasks and the accuracy suites skip context 0. Give the domain tasks `output_tokens: 512` or
+  more so the first decode pass does not dominate.
 - `classroom_summary` is the app's own summarizer request. It uses the configured language and
   mode's system prompt from `config.yaml` and puts `/no_think` before the transcript for Qwen3,
   exactly as `summarizer_component` does. Raise `output_tokens` (for example to 1024) so the

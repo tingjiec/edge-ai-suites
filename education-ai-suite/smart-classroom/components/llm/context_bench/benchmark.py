@@ -164,6 +164,24 @@ _MTP_TOKEN_SUGGESTION_CEILING = 8
 # token included, so it cannot propose more than 15 candidates per pass.
 _DFLASH_TOKEN_SUGGESTION_CEILING = 15
 
+# A dFlash window verifying more than this many times the tokens it commits per pass (its
+# acceptance length) is suggested smaller. Measured at 8K: AL 3.4 at both k=7 and k=15 on a
+# summary, so k=15's 16-token verification bought nothing; math reached AL 5.9 at k=7.
+_DFLASH_WINDOW_SLACK = 2.0
+
+# ...and one whose draft slots are filled at least this often, ``(AL - 1) / k``, is suggested
+# wider. Stricter than MTP's 0.7 because each wider dFlash pass costs the MoE more to verify:
+# math k=7 filled 70% (AL 5.9) and k=15 still lost to it, while math k=3 filled 87%.
+_DFLASH_FULL_WINDOW_FILL = 0.8
+
+# Printed under every table with a speculative row: AL is the column to read.
+_ACCEPTANCE_LENGTH_LEGEND = (
+    "AL = acceptance length: tokens committed per target verification pass (accepted draft "
+    "tokens + the target's own bonus token; 1.00 = no speculation). Speedup ~= AL / pass "
+    "cost, so rank speculative windows by AL against what each pass costs -- see the window "
+    "sweep -- not by the accepted %, which falls with k by construction."
+)
+
 # `SchedulerConfig.max_num_seqs` when a profile leaves it out. On a hybrid model this is not
 # just a batch-size default: the paged backend reserves one full linear-attention state per
 # schedulable sequence out of the same `cache_size` pool the KV blocks come from -- see
@@ -187,8 +205,103 @@ REPORT_NAME = "report.txt"
 # The prompts the throughput iterations can decode; the first is the default. See
 # `throughput_task_prompt`. `_APP_CONFIG_PATH` is the application config, relative to the
 # smart-classroom/ working directory the benchmark runs from.
-THROUGHPUT_TASKS = ("summary_2s", "classroom_summary")
+THROUGHPUT_TASKS = ("summary_2s", "classroom_summary", "math", "code", "chat")
 _APP_CONFIG_PATH = "config.yaml"
+
+# Tasks that summarize the transcript, so cannot run without one (`context_tokens: 0`).
+_TRANSCRIPT_TASKS = ("summary_2s", "classroom_summary")
+
+# Speculative speedup depends on the *domain* of what is decoded, not just on k: a draft
+# predicts structured, low-entropy text (code, arithmetic steps) far better than open-ended
+# prose. The DFlash PTL blog measured k=7 on Qwen3.6-35B-A3B at AL 6.4 / 2.2x on HumanEval,
+# 5.0 / 1.6x on GSM8K and 4.0 / 1.3x on MT-Bench; `code`, `math` and `chat` are one
+# representative prompt per those domains. Each runs two ways:
+#
+#   after the transcript  the long-context shape -- the synthetic transcript is the prefix and
+#                         only the task after it changes, so a run reports a speedup per
+#                         domain on the same prompt builder as the summaries;
+#   standalone            `context_tokens: 0` -- the task alone, like a dataset prompt, which
+#                         is the setting the blog's numbers were measured in.
+#
+# `lead` opens the task after a transcript, `standalone_lead` when there is none. All three
+# ask for long answers: raise `output_tokens` to ~512 or the first decode pass's one-time
+# cost dominates (see metrics.pass_profile).
+_TRANSCRIPT_PREFIX = "CLASSROOM TRANSCRIPT\n---\n"
+_TRANSCRIPT_NOTE = " The lesson transcript is context only; "
+_DOMAIN_TASKS = {
+    "math": {
+        "role": "You are a mathematics teaching assistant.",
+        "after_transcript": "solve the practice problems that follow it.",
+        "lead": "The teacher handed out these practice problems after the lesson. ",
+        "standalone_lead": "Here are six practice problems. ",
+        "body": (
+            "Solve each one step by step, showing every calculation, and end each solution "
+            "with a line 'Answer: <number>'.\n"
+            "1. A cart of mass 12 kg moves at 3 m/s. Its speed is doubled. By how many joules "
+            "does its kinetic energy increase?\n"
+            "2. A ball of mass 0.5 kg is dropped from a height of 20 m. Taking g = 9.8 m/s^2 "
+            "and ignoring air resistance, what is its speed in m/s just before it hits the "
+            "ground? Round to one decimal place.\n"
+            "3. A school buys 14 boxes of markers with 24 markers in each box. 3 classes of "
+            "28 students each receive 3 markers per student. How many markers are left?\n"
+            "4. A train travels 180 km at 60 km/h and then 240 km at 80 km/h. What is its "
+            "average speed for the whole journey in km/h?\n"
+            "5. Solve for x: 3(2x - 5) + 4 = 5x + 7.\n"
+            "6. The sum of three consecutive even integers is 138. What is the largest of the "
+            "three?"
+        ),
+    },
+    "code": {
+        "role": "You are a programming teaching assistant.",
+        "after_transcript": "write the code requested after it.",
+        "lead": "",
+        "standalone_lead": "",
+        "body": (
+            "Write a Python module for the class's physics lab with the following "
+            "functions. Use type hints and a short docstring for each, and finish with "
+            "unittest test cases covering every function.\n"
+            "1. kinetic_energy(mass: float, velocity: float) -> float -- 0.5 * m * v**2; raise "
+            "ValueError for a negative mass.\n"
+            "2. potential_energy(mass: float, height: float, g: float = 9.81) -> float.\n"
+            "3. impact_speed(height: float, g: float = 9.81) -> float -- speed of a body "
+            "dropped from rest, ignoring air resistance.\n"
+            "4. braking_distance(speed: float, deceleration: float) -> float -- raise "
+            "ValueError when the deceleration is not positive.\n"
+            "5. summarize_measurements(values: list[float]) -> dict[str, float] -- the count, "
+            "mean, minimum, maximum and population standard deviation of a list of "
+            "measurements; raise ValueError for an empty list."
+        ),
+    },
+    # MT-Bench-style assistant requests, one per MT-Bench category in its order -- writing,
+    # roleplay, reasoning, math, coding, extraction, STEM, humanities -- the domain the blog
+    # found hardest to draft (AL 4.0). MT-Bench's figure averages all eight; a prompt of only
+    # the open-ended ones measured AL 2.4 here. The word cap keeps all eight inside a 512-token
+    # answer, or the first one or two long items would be all that is ever decoded.
+    "chat": {
+        "role": "You are a helpful teaching assistant.",
+        "after_transcript": "respond to the requests that follow it.",
+        "lead": "",
+        "standalone_lead": "",
+        "body": (
+            "Respond to each of the following eight requests in turn, under its number. Keep "
+            "each answer under 60 words.\n"
+            "1. Write a short, friendly note to parents announcing next month's school science "
+            "fair and asking for volunteers.\n"
+            "2. You are a guide at a natural history museum. Welcome a group of visitors to the "
+            "dinosaur hall.\n"
+            "3. Ana finished a race before Ben, and Cleo finished after Ben. Who finished last, "
+            "and why?\n"
+            "4. A recipe needs 3 eggs for every 2 cups of flour. How many eggs are needed for "
+            "7 cups of flour?\n"
+            "5. Write a Python function that returns the second largest distinct number in a "
+            "list.\n"
+            "6. Extract each person's name, age and city as a JSON list from: 'Maria, 34, lives "
+            "in Lisbon; Tom, 28, lives in Leeds; Aiko, 41, lives in Osaka.'\n"
+            "7. Explain why the sky is blue during the day but the sunset looks red.\n"
+            "8. Summarize the main causes of the First World War in two or three sentences."
+        ),
+    },
+}
 
 
 # ---------------------------------------------------------------------------
@@ -1049,8 +1162,9 @@ def _parse_args():
         help="override benchmark.iteration_gap_sec (untimed idle before each measured run)",
     )
     parser.add_argument(
-        "--throughput-task", choices=THROUGHPUT_TASKS,
-        help="override benchmark.throughput_task (the prompt the speed iterations decode)",
+        "--throughput-task", nargs="+", choices=THROUGHPUT_TASKS,
+        help="override benchmark.throughput_task (the prompt(s) the speed iterations decode; "
+             "several names run each profile once per task)",
     )
     parser.add_argument("--device", help="override model.device (e.g. GPU, CPU)")
     parser.add_argument("--weight-format", help="override model.weight_format")
@@ -1330,11 +1444,15 @@ def _load_settings(args) -> dict:
         )
 
     configured_contexts = args.contexts if args.contexts is not None else bench.context_tokens
+    # 0 is allowed and means "no transcript": the domain tasks' standalone prompts, the
+    # dataset-style setting published speculative-decoding numbers are measured in.
     if not isinstance(configured_contexts, list) or not configured_contexts or any(
-        not isinstance(context, int) or isinstance(context, bool) or context <= 0
+        not isinstance(context, int) or isinstance(context, bool) or context < 0
         for context in configured_contexts
     ):
-        raise SystemExit("benchmark.context_tokens must contain only positive integers")
+        raise SystemExit(
+            "benchmark.context_tokens must contain only positive integers, or 0 for no transcript"
+        )
     contexts = sorted(set(configured_contexts))
 
     max_ram_pct = getattr(bench, "max_system_memory_pct", 80)
@@ -1375,15 +1493,23 @@ def _load_settings(args) -> dict:
     ):
         raise SystemExit("benchmark.iteration_gap_sec must be a non-negative number of seconds")
 
-    throughput_task = (
+    # One name or a list: every listed task is a separate case per profile, so a run can put
+    # the domains a speculative draft finds easy (math, code) next to the one the app serves.
+    configured_tasks = (
         args.throughput_task if getattr(args, "throughput_task", None) is not None
         else getattr(bench, "throughput_task", THROUGHPUT_TASKS[0])
     )
-    if throughput_task not in THROUGHPUT_TASKS:
-        raise SystemExit(
-            f"benchmark.throughput_task must be one of {', '.join(THROUGHPUT_TASKS)} "
-            f"(got {throughput_task!r})"
-        )
+    if isinstance(configured_tasks, str):
+        configured_tasks = [configured_tasks]
+    if not isinstance(configured_tasks, list) or not configured_tasks:
+        raise SystemExit("benchmark.throughput_task must name at least one task")
+    for task in configured_tasks:
+        if task not in THROUGHPUT_TASKS:
+            raise SystemExit(
+                f"benchmark.throughput_task must be one of {', '.join(THROUGHPUT_TASKS)} "
+                f"(got {task!r})"
+            )
+    throughput_tasks = list(dict.fromkeys(configured_tasks))
 
     models = args.models if args.models is not None else bench.models
     if not isinstance(models, list) or not models or any(
@@ -1410,7 +1536,7 @@ def _load_settings(args) -> dict:
         args.mtp_tokens,
     )
 
-    return {
+    settings = {
         "provider": model.provider,
         "models_base_path": model.models_base_path,
         # Explicit per-model IR directories, for exports whose folder name does not follow
@@ -1425,7 +1551,10 @@ def _load_settings(args) -> dict:
         "warmup": warmup,
         "iterations": iterations,
         "iteration_gap_sec": float(iteration_gap_sec),
-        "throughput_task": throughput_task,
+        "throughput_tasks": throughput_tasks,
+        # The task of the case being run; main() rebinds it per task. The first by default,
+        # so code that reads one task (and accuracy mode, which runs none) keeps working.
+        "throughput_task": throughput_tasks[0],
         "timeout_sec": timeout_sec,
         "max_system_memory_pct": max_ram_pct,
         "gpu_memory_budget_gb": gpu_memory_budget_gb,
@@ -1434,7 +1563,59 @@ def _load_settings(args) -> dict:
         "profiles": resolved_profiles,
         # None unless --accuracy is passed; selects the Needle-in-a-Haystack path per case.
         "accuracy": _resolve_accuracy(cfg, args, resolved_profiles),
+        "speculative_reference": _resolve_reference(getattr(cfg, "speculative_reference", None)),
     }
+    if not any(_run_tasks(settings, context) for context in contexts):
+        raise SystemExit(
+            "nothing to run: context_tokens 0 (no transcript) runs only the standalone tasks "
+            f"({', '.join(t for t in THROUGHPUT_TASKS if t not in _TRANSCRIPT_TASKS)}), and "
+            "never the accuracy suites"
+        )
+    return settings
+
+
+def _resolve_reference(section) -> dict | None:
+    """Published speculative results to print next to the window sweep, or None.
+
+    Shape: `source` (free text), `num_assistant_tokens` (the k they were measured at) and
+    `tasks: {<throughput task>: {dataset, acceptance_length, speedup[, throughput]}}`. The
+    comparison is only printed; nothing is ranked or failed on it, because a reference was
+    measured on other prompts and possibly another runtime build.
+    """
+    if section is None:
+        return None
+    raw = _namespace_to_dict(section)
+    if not isinstance(raw, dict):
+        raise SystemExit("speculative_reference must be a mapping")
+    k = raw.get("num_assistant_tokens")
+    if not isinstance(k, int) or isinstance(k, bool) or k <= 0:
+        raise SystemExit("speculative_reference.num_assistant_tokens must be a positive integer")
+    reference_tasks = raw.get("tasks")
+    if not isinstance(reference_tasks, dict) or not reference_tasks:
+        raise SystemExit("speculative_reference.tasks must map throughput tasks to results")
+    resolved = {}
+    for task, entry in reference_tasks.items():
+        if task not in THROUGHPUT_TASKS:
+            raise SystemExit(
+                f"speculative_reference.tasks.{task}: not a throughput task "
+                f"({', '.join(THROUGHPUT_TASKS)})"
+            )
+        if not isinstance(entry, dict):
+            raise SystemExit(f"speculative_reference.tasks.{task} must be a mapping")
+        for field in ("acceptance_length", "speedup"):
+            value = entry.get(field)
+            if not isinstance(value, (int, float)) or isinstance(value, bool) or value <= 0:
+                raise SystemExit(
+                    f"speculative_reference.tasks.{task}.{field} must be a positive number"
+                )
+        resolved[task] = {
+            "dataset": str(entry.get("dataset") or task),
+            "acceptance_length": float(entry["acceptance_length"]),
+            "speedup": float(entry["speedup"]),
+            "throughput": entry.get("throughput"),
+        }
+    return {"source": str(raw.get("source") or "reference"), "num_assistant_tokens": k,
+            "tasks": resolved}
 
 
 def _model_ir_dir(base: str, provider: str, model_name: str, weight_format: str,
@@ -1824,7 +2005,10 @@ def _run_case(model_name, model_dir, profile, context_tokens, settings, static) 
     else:
         work = f"{settings['warmup']} warmup + {settings['iterations']} iterations"
     print(
-        f"\n[{model_name} | {profile['name']} | {context_tokens:,} tok] {work}, timeout "
+        f"\n[{model_name} | {profile['name']} | {_context_label(context_tokens)}"
+        + (f" | {settings['throughput_task']}"
+           if not accuracy_cfg and settings.get("throughput_task") else "")
+        + f"] {work}, timeout "
         f"{settings['timeout_sec']:g}s",
         flush=True,
     )
@@ -1916,6 +2100,7 @@ def _run_case(model_name, model_dir, profile, context_tokens, settings, static) 
         # Nothing measured it here, so report nothing rather than a false negative.
         aggregated["output_consistent"] = None
         aggregated["output_sha256"] = None
+        aggregated["output_text"] = None
     mean_gpu = aggregated.get("mean_gpu_gb")
 
     case = {
@@ -2139,9 +2324,11 @@ def _mtp_cell(case: dict, prefix: str = "", empty: str = "") -> str:
     # coarsely than its target agrees with it less often, so it belongs next to acceptance.
     if case.get("draft_weight_precision"):
         parts.append("draft " + " ".join(case["draft_weight_precision"].split()[:2]))
+    # Acceptance length first: it is what TPOT is divided by. The accepted % follows only as
+    # context -- it falls with k by construction, so it cannot rank two windows.
     tokens_per_step = case.get("tokens_per_step")
     if isinstance(tokens_per_step, (int, float)):
-        parts.append(f"{tokens_per_step:.2f} tok/step")
+        parts.append(f"AL {tokens_per_step:.2f}")
     acceptance = case.get("mtp_acceptance_rate")
     if isinstance(acceptance, (int, float)):
         qualifier = " estimated" if case.get("mtp_acceptance_estimated") else ""
@@ -2166,47 +2353,65 @@ def _mtp_tuning_hint(case: dict) -> str | None:
     """
     acceptance = case.get("mtp_acceptance_rate")
     tokens = case.get("num_assistant_tokens")
-    if (
-        not case.get("mtp")
-        or not isinstance(acceptance, (int, float))
-        or not isinstance(tokens, int)
-    ):
+    if not case.get("mtp") or not isinstance(tokens, int):
         return None
-    dflash = case.get("speculative_strategy") == "dflash"
+    if case.get("speculative_strategy") == "dflash":
+        return _dflash_window_hint(case, tokens)
+    if not isinstance(acceptance, (int, float)):
+        return None
     if acceptance < _LOW_MTP_ACCEPTANCE_RATE and tokens > 1:
         next_tokens = max(1, math.ceil(tokens / 2))
-        if dflash:
-            return (
-                f"  hint: dFlash accepted {acceptance * 100:.0f}% of its {tokens} candidates; "
-                f"compare k={next_tokens}. The draft proposes its block in one parallel pass, "
-                "so a larger k costs little to draft, but the target still verifies all k + 1 "
-                "tokens every pass -- rank by TPOT against the matched baseline, not by "
-                "acceptance."
-            )
         return (
             f"  hint: only {acceptance * 100:.0f}% of MTP candidates were accepted; compare "
             f"k={next_tokens} -- fewer candidates per pass usually raises acceptance (for "
             "Qwen3.8-27B at 8K, k=2 is the higher-acceptance balanced profile and k=3 is the "
             "minimum-TPOT profile)."
         )
-    ceiling = _DFLASH_TOKEN_SUGGESTION_CEILING if dflash else _MTP_TOKEN_SUGGESTION_CEILING
-    if acceptance >= _HIGH_MTP_ACCEPTANCE_RATE and tokens < ceiling:
+    if acceptance >= _HIGH_MTP_ACCEPTANCE_RATE and tokens < _MTP_TOKEN_SUGGESTION_CEILING:
         tokens_per_step = case.get("tokens_per_step")
         yield_now = (
             f" for {tokens_per_step:.2f} tok/step"
             if isinstance(tokens_per_step, (int, float)) else ""
         )
-        if dflash:
-            return (
-                f"  hint: dFlash accepted {acceptance * 100:.0f}% of candidates{yield_now}; "
-                f"compare k={tokens + 1} and rank by TPOT against the matched baseline."
-            )
         return (
             f"  hint: {acceptance * 100:.0f}% of MTP candidates were accepted{yield_now}; the "
             f"draft head is agreeing often, so compare k={tokens + 1} -- a larger candidate "
             "batch can commit more tokens per pass even as acceptance eases. Rank by tokens/"
             "step (yield), not acceptance: on this box k=4 (50% accepted, 2.90 tok/step) beat "
             "k=2 (74%, 2.44) on TPOT."
+        )
+    return None
+
+
+def _dflash_window_hint(case: dict, tokens: int) -> str | None:
+    """The next dFlash window to measure, read from acceptance length rather than the rate.
+
+    dFlash drafts its whole block in one parallel pass, so the draft side of k is nearly
+    free and the accepted % is the wrong signal: it is ``(AL - 1) / k`` and falls with k
+    by construction. What k actually buys is AL, and what it costs is the target verifying
+    k + 1 tokens per pass -- on a MoE every one of them reads its own experts. So a window
+    far wider than the AL it reaches pays for verification that commits nothing (measured
+    at 8K: k=15 reached AL 3.4 on a summary, the same as k=7), and a window the draft
+    nearly fills is the one worth widening.
+    """
+    al = case.get("tokens_per_step")
+    if not isinstance(al, (int, float)) or al <= 0:
+        return None
+    if tokens > 1 and tokens + 1 > _DFLASH_WINDOW_SLACK * al:
+        smaller = max(1, min(tokens - 1, math.ceil(al)))
+        return (
+            f"  hint: dFlash k={tokens} reached acceptance length {al:.2f}: the target "
+            f"verifies {tokens + 1} tokens per pass to commit {al:.1f}, and on a MoE each "
+            f"extra verified token reads its own experts. Compare k={smaller}, and pick the "
+            "window from the sweep table (speedup ~= AL / pass cost), not from the accepted %."
+        )
+    if (al - 1) / tokens >= _DFLASH_FULL_WINDOW_FILL and tokens < _DFLASH_TOKEN_SUGGESTION_CEILING:
+        larger = min(_DFLASH_TOKEN_SUGGESTION_CEILING, 2 * tokens)
+        return (
+            f"  hint: dFlash k={tokens} reached acceptance length {al:.2f} of a possible "
+            f"{tokens + 1}; the window is nearly full, so compare k={larger}. The draft "
+            "proposes its block in one parallel pass, so a wider window is cheap to draft -- "
+            "check what it costs to verify in the sweep table."
         )
     return None
 
@@ -2699,6 +2904,19 @@ def _matched_baseline(candidate: dict, cases: list) -> dict | None:
     )), None)
 
 
+def _pass_cost(case: dict, baseline: dict) -> tuple | None:
+    """`(speculative pass ms, baseline step ms)`: steady state when both sides have it, else
+    TPOT x acceptance length against the baseline TPOT. None when neither can be formed."""
+    pass_ms, step_ms = case.get("steady_pass_ms"), baseline.get("steady_pass_ms")
+    if pass_ms and step_ms:
+        return pass_ms, step_ms
+    tokens_per_step = case.get("tokens_per_step")
+    tpot, step_ms = case.get("other_tokens_avg_latency"), baseline.get("other_tokens_avg_latency")
+    if not isinstance(tokens_per_step, (int, float)) or not tpot or not step_ms:
+        return None
+    return tpot * tokens_per_step, step_ms
+
+
 def _verification_cost(case: dict, baseline: dict) -> str:
     """How expensive one speculative pass was, in units of one baseline decode step.
 
@@ -2711,13 +2929,10 @@ def _verification_cost(case: dict, baseline: dict) -> str:
     metrics.pass_profile); otherwise the pass is approximated as TPOT x tokens per pass,
     which also folds in the first decode pass's one-time cost.
     """
-    pass_ms, step_ms = case.get("steady_pass_ms"), baseline.get("steady_pass_ms")
-    if not pass_ms or not step_ms:
-        tokens_per_step = case.get("tokens_per_step")
-        tpot, step_ms = case.get("other_tokens_avg_latency"), baseline.get("other_tokens_avg_latency")
-        if not isinstance(tokens_per_step, (int, float)) or not tpot or not step_ms:
-            return ""
-        pass_ms = tpot * tokens_per_step
+    cost = _pass_cost(case, baseline)
+    if cost is None:
+        return ""
+    pass_ms, step_ms = cost
     return (
         f"; each verification pass (draft + target) took {_fmt(pass_ms, '{:.1f}')} ms, "
         f"{pass_ms / step_ms:.2f}x a baseline decode step"
@@ -2755,9 +2970,12 @@ def _mtp_speedup(cases: list) -> str | None:
         f"{_fmt(mtp_tpot)} ms/token against `{without['profile']}` at "
         f"{_fmt(baseline_tpot)} ms/token"
         + (
-            f", {'estimated ' if with_mtp.get('mtp_acceptance_estimated') else ''}"
-            f"acceptance {with_mtp['mtp_acceptance_rate'] * 100:.0f}% of drafted candidates "
-            f"for {_fmt(with_mtp.get('tokens_per_step'), '{:.2f}')} tokens per verification pass"
+            f", acceptance length {with_mtp['tokens_per_step']:.2f} tokens per verification pass"
+            if isinstance(with_mtp.get("tokens_per_step"), (int, float)) else ""
+        )
+        + (
+            f" ({'estimated ' if with_mtp.get('mtp_acceptance_estimated') else ''}"
+            f"{with_mtp['mtp_acceptance_rate'] * 100:.0f}% of drafted candidates accepted)"
             if isinstance(with_mtp.get("mtp_acceptance_rate"), (int, float)) else ""
         )
         + _verification_cost(with_mtp, without)
@@ -2785,16 +3003,178 @@ def _mtp_output_check(cases: list) -> str | None:
     if not pairs:
         return None
     mismatches = [
-        case["profile"] for case, baseline in pairs
+        (case, baseline) for case, baseline in pairs
         if case["output_sha256"] != baseline["output_sha256"]
     ]
     if mismatches:
         return (
             "**WARNING: greedy speculative output differs from the baseline** for "
-            + ", ".join(f"`{name}`" for name in mismatches)
-            + ". Do not treat their speedup as valid until the divergence is explained."
+            + ", ".join(f"`{case['profile']}`" for case, _ in mismatches)
+            + ". Greedy speculative decoding is lossless only up to floating point: the target "
+            "scores k + 1 tokens in one verification pass, on a different kernel path than a "
+            "one-token step, so a near-tie between two tokens can flip -- which is why the fork "
+            "moves with k. Check that each fork below is such a near-equivalent token: a late "
+            "one leaves the speedup comparable, an early one means it compares two different "
+            "answers, and a garbled one is a pipeline bug."
+            + "".join("\n" + _fork_detail(case, baseline) for case, baseline in mismatches)
         )
     return "**Greedy output check: all matched speculative profiles match their baseline exactly.**"
+
+
+def _fork_detail(case: dict, baseline: dict, width: int = 40) -> str:
+    """Where a speculative output first leaves its baseline's, with the text either side.
+
+    Measured on Qwen3.6-35B-A3B without a transcript: forks at "our Science Fair" vs "our
+    school science fair" (chat, k=3, 6th token) and "Solve for velocity" vs "Solve for $v$"
+    (math, k=7, token 506 of 512) -- near-ties, not corruption. ascii() keeps the line
+    printable on any console code page.
+    """
+    ours, theirs = case.get("output_text"), baseline.get("output_text")
+    if not isinstance(ours, str) or not isinstance(theirs, str):
+        return f"  `{case['profile']}`: output text not recorded, fork position unknown"
+    at = next((i for i, (a, b) in enumerate(zip(ours, theirs)) if a != b),
+              min(len(ours), len(theirs)))
+    return (
+        f"  `{case['profile']}` forks at character {at:,} of {len(theirs):,}: after "
+        f"{ascii(theirs[max(0, at - width):at])}, baseline {ascii(theirs[at:at + width])} "
+        f"vs {ascii(ours[at:at + width])}"
+    )
+
+
+def _ratio(numerator, denominator) -> float | None:
+    if not isinstance(numerator, (int, float)) or not isinstance(denominator, (int, float)):
+        return None
+    return numerator / denominator if numerator > 0 and denominator > 0 else None
+
+
+def _window_sweep_rows(at_context: list) -> list:
+    """One dict per speculative throughput case that has a matched usable baseline.
+
+    Accuracy cases are left out: their timing medians pool probes of different lengths, so
+    a speedup between two of them is not a property of the window.
+    """
+    rows = []
+    for task, group in _task_groups(at_context):
+        if task is None:
+            continue
+        ranked = _leaderboard(group)
+        for case in ranked:
+            baseline = _matched_baseline(case, ranked) if case.get("mtp") else None
+            if baseline is None:
+                continue
+            cost = _pass_cost(case, baseline)
+            rows.append({
+                "task": task,
+                "case": case,
+                "pass_ms": cost[0] if cost else None,
+                "pass_cost": _ratio(*cost) if cost else None,
+                "decode_speedup": _ratio(baseline.get("other_tokens_avg_latency"),
+                                         case.get("other_tokens_avg_latency")),
+                "steady_speedup": _ratio(baseline.get("steady_tpot"), case.get("steady_tpot")),
+            })
+    rows.sort(key=lambda row: (row["task"], row["case"].get("num_assistant_tokens") or 0))
+    return rows
+
+
+def _window_sweep_section(at_context: list, context: int, reference: dict | None = None) -> list:
+    """Pick the speculative window (k) from acceptance length against verification cost.
+
+    A window pays off when its acceptance length (AL, tokens committed per target pass)
+    exceeds what that pass costs in baseline decode steps: speedup ~= AL / pass cost, so
+    the pass cost is also the break-even AL. On the Qwen3.6 MoE both sides grow with k --
+    a wider window commits more only while the draft keeps agreeing, but the target always
+    verifies k + 1 tokens and each reads its own experts -- so the best k is wherever AL
+    stops outrunning the cost, and that point moves with the domain. One table per context,
+    one block per task, best window called out per task.
+    """
+    rows = _window_sweep_rows(at_context)
+    if not rows:
+        return []
+    lines = _heading(
+        f"{_context_label(context)} -- SPECULATIVE WINDOW SWEEP (acceptance length vs pass cost)"
+    )
+    lines += [
+        "| Task | Profile | k | AL tok/pass | Accepted | Pass ms | Pass cost (= break-even AL) "
+        "| Decode speedup | Steady speedup |",
+        "|---|---|---|---|---|---|---|---|---|",
+    ]
+    for row in rows:
+        case = row["case"]
+        acceptance = case.get("mtp_acceptance_rate")
+        lines.append(
+            f"| {row['task']} | {case['profile']} | {case.get('num_assistant_tokens')} "
+            f"| {_fmt(case.get('tokens_per_step'), '{:.2f}')} "
+            f"| {_fmt(acceptance * 100 if isinstance(acceptance, (int, float)) else None, '{:.0f}%')} "
+            f"| {_fmt(row['pass_ms'])} | {_fmt(row['pass_cost'], '{:.2f}x')} "
+            f"| {_fmt(row['decode_speedup'], '{:.2f}x')} | {_fmt(row['steady_speedup'], '{:.2f}x')} |"
+        )
+    lines.append("")
+
+    def _speedup(row):
+        return row["steady_speedup"] or row["decode_speedup"] or 0.0
+
+    best_by_task = {}
+    for row in rows:
+        current = best_by_task.get(row["task"])
+        if current is None or _speedup(row) > _speedup(current):
+            best_by_task[row["task"]] = row
+    for task, row in best_by_task.items():
+        case = row["case"]
+        lines.append(
+            f"Best window for `{task}`: {case['profile']} (k={case.get('num_assistant_tokens')}) "
+            f"-- AL {_fmt(case.get('tokens_per_step'), '{:.2f}')} against a "
+            f"{_fmt(row['pass_cost'], '{:.2f}x')} pass, {_fmt(row['steady_speedup'], '{:.2f}x')} "
+            f"steady state, {_fmt(row['decode_speedup'], '{:.2f}x')} end-to-end decode"
+        )
+    if len(best_by_task) > 1:
+        ordered = sorted(best_by_task.items(), key=lambda item: _speedup(item[1]))
+        (low_task, low), (high_task, high) = ordered[0], ordered[-1]
+        lines.append(
+            f"Domain spread: {_speedup(low):.2f}x (`{low_task}`) to {_speedup(high):.2f}x "
+            f"(`{high_task}`) with the same draft, target and settings -- the workload, not the "
+            "configuration, sets how far speculation can go."
+        )
+    lines.append("")
+    lines += _reference_lines(rows, reference)
+    return lines
+
+
+def _reference_lines(rows: list, reference: dict | None) -> list:
+    """Measured AL and speedup at the reference's k, next to the published figures.
+
+    AL is compared first because it is the draft's own property on a domain; the speedup
+    also folds in this box's pass cost and runtime build. A measured AL close to the
+    reference with a lower speedup points at verification cost; a lower AL points at the
+    prompt (one prompt here against a whole dataset there) or at the draft export.
+    """
+    if not reference:
+        return []
+    k = reference["num_assistant_tokens"]
+    at_k = {row["task"]: row for row in rows if row["case"].get("num_assistant_tokens") == k}
+    tasks = [task for task in reference["tasks"] if task in {row["task"] for row in rows}]
+    if not tasks:
+        return []
+    lines = [
+        f"Reference at k={k}: {reference['source']}",
+        "",
+        "| Task | Reference dataset | AL ref | AL measured | Speedup ref | Speedup measured "
+        "| Steady speedup measured |",
+        "|---|---|---|---|---|---|---|",
+    ]
+    for task in tasks:
+        ref, row = reference["tasks"][task], at_k.get(task)
+        case = row["case"] if row else {}
+        lines.append(
+            f"| {task} | {ref['dataset']} | {ref['acceptance_length']:.2f} "
+            f"| {_fmt(case.get('tokens_per_step'), '{:.2f}')} | {ref['speedup']:.2f}x "
+            f"| {_fmt(row['decode_speedup'] if row else None, '{:.2f}x')} "
+            f"| {_fmt(row['steady_speedup'] if row else None, '{:.2f}x')} |"
+        )
+    missing = [task for task in tasks if task not in at_k]
+    if missing:
+        lines.append(f"No k={k} profile ran for {', '.join(missing)}; add one to compare.")
+    lines.append("")
+    return lines
 
 
 def write_report(output_dir: str, settings: dict, cases: list, platform_info: dict,
@@ -2834,9 +3214,25 @@ def throughput_task_prompt(name: str | None, model_name: str,
     `/no_think` ahead of the transcript for Qwen3 models. Its answer is a long, templated
     Markdown summary rather than two free sentences -- the output dFlash actually has to
     draft in production, and the one its speedup should be judged on.
+
+    `math`, `code` and `chat` keep the same transcript prefix and ask a domain task after it
+    (see `_DOMAIN_TASKS`), so a sweep can tell a weak draft apart from a hard domain. Their
+    `standalone` framing is the task alone, rendered instead when `context_tokens` is 0.
     """
     if name in (None, THROUGHPUT_TASKS[0]):
         return None
+    if name in _DOMAIN_TASKS:
+        spec = _DOMAIN_TASKS[name]
+        return {
+            "name": name,
+            "system_prompt": spec["role"] + _TRANSCRIPT_NOTE + spec["after_transcript"],
+            "user_prefix": _TRANSCRIPT_PREFIX,
+            "suffix": "\n---\nTASK\n" + spec["lead"] + spec["body"],
+            "standalone": {
+                "system_prompt": spec["role"],
+                "user": spec["standalone_lead"] + spec["body"],
+            },
+        }
     path = app_config_path or _APP_CONFIG_PATH
     try:
         app = load_config(path)
@@ -2858,6 +3254,35 @@ def throughput_task_prompt(name: str | None, model_name: str,
     }
 
 
+def _run_tasks(settings: dict, context: int | None = None) -> list:
+    """The throughput tasks each profile runs once per at `context`; one pass in accuracy
+    mode, whose probes carry their own prompts.
+
+    Context 0 is the no-transcript setting: accuracy probes (which hide facts in the
+    transcript) and the summary tasks (which summarize it) have nothing to run on there.
+    """
+    if settings.get("accuracy"):
+        return [] if context == 0 else [settings.get("throughput_task")]
+    tasks = settings.get("throughput_tasks") or [settings.get("throughput_task") or THROUGHPUT_TASKS[0]]
+    if context == 0:
+        return [task for task in tasks if task not in _TRANSCRIPT_TASKS]
+    return tasks
+
+
+def _context_label(context: int) -> str:
+    """`8,000 tokens`, or what 0 means: the task's own prompt, no transcript."""
+    return f"{context:,} tokens" if context else "no transcript (task prompt only)"
+
+
+def _task_groups(cases: list) -> list:
+    """`(throughput_task, cases)` in first-run order. Speed is only comparable within a task:
+    a math answer and a summary are different workloads for the draft and the target alike."""
+    groups = {}
+    for case in cases:
+        groups.setdefault(case.get("throughput_task"), []).append(case)
+    return list(groups.items())
+
+
 def _gap_note(settings: dict) -> str:
     """Header suffix naming the idle gap, so a burst and a sustained figure never pass as one."""
     gap = settings.get("iteration_gap_sec") or 0
@@ -2874,8 +3299,8 @@ def _report_lines(settings: dict, cases: list, platform_info: dict,
     workload = (
         "accuracy probes (per-suite decode ceilings; EOS respected)" if acc else
         f"{settings['iterations']} iteration(s) of "
-        f"`{settings.get('throughput_task') or THROUGHPUT_TASKS[0]}` "
-        f"@ up to {settings['output_tokens']} output tokens (EOS respected)"
+        + ", ".join(f"`{task}`" for task in _run_tasks(settings))
+        + f" @ up to {settings['output_tokens']} output tokens (EOS respected)"
     ) + _gap_note(settings)
     lines = [
         "=" * 78,
@@ -2888,7 +3313,7 @@ def _report_lines(settings: dict, cases: list, platform_info: dict,
         f"Device    : {settings['device']} | weights {settings['weight_format']} | "
         f"budgets RAM <= {settings['max_system_memory_pct']:g}%, "
         f"GPU <= {settings['gpu_memory_budget_gb']:g} GB",
-        f"Contexts  : {', '.join(f'{c:,}' for c in settings['context_tokens'])} tokens | "
+        f"Contexts  : {', '.join(_context_label(c) for c in settings['context_tokens'])} | "
         f"{settings['warmup']} warmup + {workload}",
     ]
     if acc:
@@ -2901,7 +3326,13 @@ def _report_lines(settings: dict, cases: list, platform_info: dict,
     for context in settings["context_tokens"]:
         at_context = [c for c in cases if c["context_tokens"] == context]
         if at_context:
-            lines += _speed_section(at_context, context, settings)
+            groups = _task_groups(at_context)
+            for task, at_task in groups:
+                lines += _speed_section(at_task, context, settings,
+                                        task=task if len(groups) > 1 else None)
+            lines += _window_sweep_section(
+                at_context, context, settings.get("speculative_reference")
+            )
             if acc:
                 lines += _accuracy_section(at_context, context, settings)
 
@@ -2914,16 +3345,21 @@ def _heading(text: str) -> list:
     return ["-" * 78, f" {text}", "-" * 78, ""]
 
 
-def _speed_section(at_context: list, context: int, settings: dict) -> list:
-    """TTFT, TPOT, throughput and RAM/GPU for one context, ranked by TPOT.
+def _speed_section(at_context: list, context: int, settings: dict,
+                   task: str | None = None) -> list:
+    """TTFT, TPOT, throughput and RAM/GPU for one context (and task), ranked by TPOT.
 
     Latencies are milliseconds and throughputs tokens/second, in llm_bench's units; every
     figure is the median of the measured generations with the warm-up excluded. Memory is
     peak / mean and the two are not interchangeable: peak includes model load and decides
     whether the box can run the configuration at all, mean excludes it and is what the
-    configuration costs for the minutes it runs.
+    configuration costs for the minutes it runs. `task` names the throughput task in the
+    heading when a run sweeps several.
     """
-    lines = _heading(f"{context:,} tokens -- SPEED AND RESOURCES")
+    lines = _heading(
+        f"{_context_label(context)} -- " + (f"`{task}` -- " if task else "")
+        + "SPEED AND RESOURCES"
+    )
     lines += [
         "| Model | Profile | Weights | Pipeline | KV | Speculative | Status | Output tok "
         "| TPOT ms/tok | TTFT s "
@@ -2966,6 +3402,8 @@ def _speed_section(at_context: list, context: int, settings: dict) -> list:
             f"| {_fmt(case.get('cache_size_gb'), '{:g}')} |"
         )
     lines.append("")
+    if any(case.get("mtp") for case in at_context):
+        lines += [_ACCEPTANCE_LENGTH_LEGEND, ""]
 
     if settings.get("accuracy"):
         lines += [
@@ -3109,10 +3547,13 @@ def _print_accuracy_plan(settings: dict) -> None:
             f"{section['samples']} sample(s), depths {section['depths']} "
             f"(depth-swept tasks only), {section['output_tokens']} output tokens"
         )
+    # Context 0 (no transcript) has no accuracy cases; see _run_tasks.
+    cases = len(settings["models"]) * len(settings["profiles"]) * sum(
+        len(_run_tasks(settings, context)) for context in settings["context_tokens"]
+    )
     print(
-        f"  {total} probe(s) per case x "
-        f"{len(settings['models']) * len(settings['context_tokens']) * len(settings['profiles'])}"
-        f" case(s); baseline {acc.get('baseline_profile') or '(none)'}"
+        f"  {total} probe(s) per case x {cases} case(s); "
+        f"baseline {acc.get('baseline_profile') or '(none)'}"
     )
     if acc.get("embedding_model"):
         print(
@@ -3135,13 +3576,20 @@ def main() -> None:
                 settings["weight_format"], settings["model_dirs"],
             )
             print(f"  {model_name}: {ir_weight_precision(model_dir) or 'IR not found'} -- {model_dir}")
-        print(f"Contexts: {', '.join(f'{c:,}' for c in settings['context_tokens'])}")
+        print(f"Contexts: {', '.join(_context_label(c) for c in settings['context_tokens'])}")
         print(
             f"Iterations: {settings['warmup']} warmup + {settings['iterations']} measured, "
             f"{settings['output_tokens']} output tokens, timeout {settings['timeout_sec']:g}s"
             + _gap_note(settings)
         )
-        total = len(settings["models"]) * len(settings["context_tokens"]) * len(settings["profiles"])
+        if not settings.get("accuracy"):
+            for context in settings["context_tokens"]:
+                print(f"Throughput tasks at {_context_label(context)}: "
+                      f"{', '.join(_run_tasks(settings, context))}")
+        total = (
+            len(settings["models"]) * len(settings["profiles"])
+            * sum(len(_run_tasks(settings, context)) for context in settings["context_tokens"])
+        )
         print(f"\n{len(settings['profiles'])} profile(s), {total} case(s):\n")
         for profile in settings["profiles"]:
             print(f"  {profile['name']}")
@@ -3217,16 +3665,22 @@ def main() -> None:
             _preflight_cache_sizes(settings, static, model_name)
 
             for context in settings["context_tokens"]:
-                for profile in settings["profiles"]:
-                    case = _run_case(model_name, model_dir, profile, context, settings, static)
-                    cases.append(case)
-                    # Before the per-case line, not after: write_report is what fills the
-                    # generation suite's fidelity columns (rouge_l, chrf, fdt, similarity),
-                    # which are cross-case and cannot be scored until the baseline profile's
-                    # answers are in `cases`. Printing first showed every case's ROUGE-L as
-                    # "--" even on a single profile comparing against itself.
-                    write_report(output_dir, settings, cases, platform_info, completed=False)
-                    print(_format_case(case), flush=True)
+                # Task outside profile, so a task's baseline and its speculative profiles run
+                # back to back, under the same thermal conditions.
+                for task in _run_tasks(settings, context):
+                    task_settings = {**settings, "throughput_task": task}
+                    for profile in settings["profiles"]:
+                        case = _run_case(
+                            model_name, model_dir, profile, context, task_settings, static
+                        )
+                        cases.append(case)
+                        # Before the per-case line, not after: write_report is what fills the
+                        # generation suite's fidelity columns (rouge_l, chrf, fdt, similarity),
+                        # which are cross-case and cannot be scored until the baseline
+                        # profile's answers are in `cases`. Printing first showed every case's
+                        # ROUGE-L as "--" even on a single profile comparing against itself.
+                        write_report(output_dir, settings, cases, platform_info, completed=False)
+                        print(_format_case(case), flush=True)
         completed = True
     finally:
         # Reached on Ctrl-C and on an unhandled failure too: the cases already measured are

@@ -150,7 +150,28 @@ def build_benchmark_prompt(tokenizer: Tokenizer, target_tokens: int,
     `task` overrides the framing around the transcript -- a mapping with any of
     `system_prompt`, `user_prefix` and `suffix` (see `render_prompt`). None keeps the
     built-in two-sentence summary, byte for byte.
+
+    ``target_tokens == 0`` means *no transcript*: the task's `standalone` framing (a
+    `system_prompt` and a `user` message) is rendered as-is, like a dataset prompt, and its
+    own length is returned. Only tasks that carry a `standalone` framing can do this; a
+    summary of nothing is not a task.
     """
+    if target_tokens == 0:
+        standalone = (task or {}).get("standalone")
+        if not standalone:
+            raise ValueError(
+                "context_tokens 0 (no transcript) needs a task with a standalone prompt; "
+                f"{(task or {}).get('name', 'summary_2s')!r} summarizes the transcript"
+            )
+        messages = [
+            {"role": "system", "content": standalone["system_prompt"]},
+            {"role": "user", "content": standalone["user"]},
+        ]
+        prompt = tokenizer.apply_chat_template(
+            messages, tokenize=False, add_generation_prompt=True, enable_thinking=False
+        )
+        return prompt, len(tokenizer.encode(prompt))
+
     template_kwargs = dict(add_generation_prompt=True, enable_thinking=False)
     template_kwargs.update({
         key: value for key, value in (task or {}).items()

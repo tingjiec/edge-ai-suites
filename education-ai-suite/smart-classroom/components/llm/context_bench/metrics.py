@@ -19,9 +19,12 @@ aggregation. See `benchmark._MemorySampler` for why peak and mean are both repor
 
 `tokens_per_step` / `mtp_acceptance_rate` are this tool's multi-token-prediction
 additions and have no llm_bench counterpart. They exist because TPOT alone cannot
-say *why* an MTP profile is faster: on the shipped 8K workload k=3 accepts about
-51% of candidates while k=6 accepts about 30%, and only that comparison explains
-why raising k further has stopped buying anything.
+say *why* an MTP profile is faster. `tokens_per_step` is the speculative-decoding
+literature's *acceptance length* (AL): tokens committed per target verification
+pass, accepted drafts plus the bonus token. It is the one to rank windows on --
+decode speedup is AL over what each pass costs -- while the accepted rate,
+``(AL - 1) / k``, falls with k by construction and cannot say whether a wider
+window still pays.
 """
 
 from __future__ import annotations
@@ -292,6 +295,10 @@ def aggregate(records: list) -> dict:
     output_hashes = {row.get("output_sha256") for row in rows if row.get("output_sha256")}
     out["output_consistent"] = len(output_hashes) <= 1 if output_hashes else None
     out["output_sha256"] = next(iter(output_hashes)) if len(output_hashes) == 1 else None
+    # The one text all iterations agreed on, for locating a fork against the baseline.
+    out["output_text"] = next(
+        (row["output_text"] for row in rows if row.get("output_text") is not None), None
+    ) if out["output_sha256"] else None
     return out
 
 
@@ -325,9 +332,11 @@ def format_mtp(record: dict) -> str:
     tokens_per_step = record.get("tokens_per_step")
     if tokens_per_step is None:
         return ""
+    # Acceptance length (AL) is the headline: it is what TPOT is divided by, and what a
+    # window is chosen on. The accepted % follows as context only.
     k = record.get("num_assistant_tokens")
-    text = f" | {strategy_label(record)} k={k} {tokens_per_step:.2f} tok/step" if k else (
-        f" | {tokens_per_step:.2f} tok/step"
+    text = f" | {strategy_label(record)} k={k} AL {tokens_per_step:.2f} tok/pass" if k else (
+        f" | AL {tokens_per_step:.2f} tok/pass"
     )
     acceptance = record.get("mtp_acceptance_rate")
     if acceptance is not None:

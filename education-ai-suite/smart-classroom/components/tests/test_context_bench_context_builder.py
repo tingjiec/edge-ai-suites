@@ -194,5 +194,47 @@ class TestThroughputTaskPrompt(unittest.TestCase):
             benchmark.throughput_task_prompt("classroom_summary", "Qwen3", "no/such/config.yaml")
 
 
+    def test_domain_tasks_keep_the_transcript_and_need_no_app_config(self):
+        # math/code are where a speculative draft is expected to shine; they must not depend
+        # on the app config, and must keep the long-context transcript as the prefix.
+        from components.llm.context_bench import benchmark
+
+        for name, marker in (("math", "Answer: <number>"), ("code", "def ")):
+            with self.subTest(task=name):
+                task = benchmark.throughput_task_prompt(name, "Qwen3.6", "no/such/config.yaml")
+                self.assertEqual(task["name"], name)
+                self.assertEqual(task["user_prefix"], "CLASSROOM TRANSCRIPT\n---\n")
+                self.assertIn("TASK", task["suffix"])
+                prompt, count = build_benchmark_prompt(FakeTokenizer(), 5000, task)
+                self.assertEqual(count, 5000)
+                self.assertIn("CLASSROOM TRANSCRIPT", prompt)
+                self.assertNotIn("two concise sentences", prompt)
+        self.assertIn("Answer: <number>", benchmark.throughput_task_prompt("math", "q")["suffix"])
+        self.assertIn("unittest", benchmark.throughput_task_prompt("code", "q")["suffix"])
+        self.assertIn("dinosaur hall", benchmark.throughput_task_prompt("chat", "q")["suffix"])
+
+    def test_context_zero_renders_the_standalone_task_without_a_transcript(self):
+        # The setting published speculative numbers are measured in: a dataset-style prompt,
+        # its length its own, no transcript and no "context only" framing.
+        from components.llm.context_bench import benchmark
+
+        for name in ("math", "code", "chat"):
+            with self.subTest(task=name):
+                task = benchmark.throughput_task_prompt(name, "Qwen3.6")
+                prompt, count = build_benchmark_prompt(FakeTokenizer(), 0, task)
+
+                self.assertEqual(count, len(FakeTokenizer().encode(prompt)))
+                self.assertNotIn("CLASSROOM TRANSCRIPT", prompt)
+                self.assertNotIn("context only", prompt)
+                self.assertIn(task["standalone"]["user"], prompt)
+                self.assertNotIn("after the lesson", prompt)
+
+    def test_context_zero_refuses_a_summary_of_nothing(self):
+        with self.assertRaisesRegex(ValueError, "standalone"):
+            build_benchmark_prompt(FakeTokenizer(), 0, None)
+        with self.assertRaisesRegex(ValueError, "standalone"):
+            build_benchmark_prompt(FakeTokenizer(), 0, {"name": "classroom_summary"})
+
+
 if __name__ == "__main__":
     unittest.main()

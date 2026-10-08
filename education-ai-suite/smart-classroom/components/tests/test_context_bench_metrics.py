@@ -173,6 +173,59 @@ class TestSettingsValidation(unittest.TestCase):
         with self.assertRaisesRegex(SystemExit, "throughput_task must be one of"):
             self._load(_settings_config(throughput_task="poem"))
 
+    def test_throughput_task_may_list_several_domains_run_once_per_profile(self):
+        settings = self._load(_settings_config(throughput_task=["math", "code", "math"]))
+
+        self.assertEqual(settings["throughput_tasks"], ["math", "code"])
+        self.assertEqual(settings["throughput_task"], "math")
+        self.assertEqual(benchmark._run_tasks(settings), ["math", "code"])
+        cli = self._load(_settings_config(), throughput_task=["code", "summary_2s"])
+        self.assertEqual(cli["throughput_tasks"], ["code", "summary_2s"])
+        with self.assertRaisesRegex(SystemExit, "throughput_task must be one of"):
+            self._load(_settings_config(throughput_task=["math", "poem"]))
+        with self.assertRaisesRegex(SystemExit, "at least one task"):
+            self._load(_settings_config(throughput_task=[]))
+
+    def test_accuracy_mode_runs_each_profile_once_whatever_the_task_list(self):
+        settings = {"accuracy": {"suites": []}, "throughput_tasks": ["math", "code"],
+                    "throughput_task": "math"}
+
+        self.assertEqual(benchmark._run_tasks(settings), ["math"])
+        self.assertEqual(benchmark._run_tasks(settings, 0), [])
+
+    def test_context_zero_runs_only_the_standalone_tasks(self):
+        settings = self._load(_settings_config(
+            context_tokens=[0, 8000], throughput_task=["code", "summary_2s", "chat"]
+        ))
+
+        self.assertEqual(settings["context_tokens"], [0, 8000])
+        self.assertEqual(benchmark._run_tasks(settings, 0), ["code", "chat"])
+        self.assertEqual(benchmark._run_tasks(settings, 8000), ["code", "summary_2s", "chat"])
+        self.assertIn("no transcript", benchmark._context_label(0))
+        self.assertEqual(benchmark._context_label(8000), "8,000 tokens")
+        with self.assertRaisesRegex(SystemExit, "nothing to run"):
+            self._load(_settings_config(context_tokens=[0], throughput_task="summary_2s"))
+        with self.assertRaisesRegex(SystemExit, "positive integers, or 0"):
+            self._load(_settings_config(context_tokens=[-1]))
+
+    def test_speculative_reference_is_validated_and_optional(self):
+        self.assertIsNone(self._load(_settings_config())["speculative_reference"])
+        reference = benchmark._resolve_reference({
+            "source": "blog", "num_assistant_tokens": 7,
+            "tasks": {"code": {"dataset": "HumanEval", "acceptance_length": 6.4,
+                               "speedup": 2.2, "throughput": 89.8}},
+        })
+        self.assertEqual(reference["tasks"]["code"]["acceptance_length"], 6.4)
+        for broken, message in (
+            ({"num_assistant_tokens": 0, "tasks": {"code": {}}}, "positive integer"),
+            ({"num_assistant_tokens": 7, "tasks": {}}, "must map"),
+            ({"num_assistant_tokens": 7, "tasks": {"poem": {}}}, "not a throughput task"),
+            ({"num_assistant_tokens": 7,
+              "tasks": {"code": {"acceptance_length": 6.4}}}, "speedup must be"),
+        ):
+            with self.subTest(message=message), self.assertRaisesRegex(SystemExit, message):
+                benchmark._resolve_reference(broken)
+
     def test_iteration_gap_must_be_a_non_negative_number(self):
         for value in (-1, float("nan"), True, "30"):
             with self.subTest(value=value), self.assertRaisesRegex(
@@ -895,12 +948,153 @@ class TestMtpTuningHint(unittest.TestCase):
     def test_dflash_hint_does_not_claim_mtp_behavior(self):
         hint = benchmark._mtp_tuning_hint({
             "status": "ok", "mtp": True, "speculative_strategy": "dflash",
-            "num_assistant_tokens": 7, "mtp_acceptance_rate": 0.32,
+            "num_assistant_tokens": 3, "mtp_acceptance_rate": 0.87, "tokens_per_step": 3.61,
         })
 
         self.assertIn("dFlash", hint)
         self.assertIn("parallel", hint)
         self.assertNotIn("Qwen3.8", hint)
+
+    def test_dflash_window_far_wider_than_its_acceptance_length_is_suggested_smaller(self):
+        # Measured at 8K on a summary: k=15 reached AL 3.4, the same as k=7, so the 16-token
+        # verification bought nothing. The suggestion comes from AL, not from the 16% rate.
+        hint = benchmark._mtp_tuning_hint({
+            "status": "ok", "mtp": True, "speculative_strategy": "dflash",
+            "num_assistant_tokens": 15, "mtp_acceptance_rate": 0.16, "tokens_per_step": 3.38,
+        })
+
+        self.assertIn("acceptance length 3.38", hint)
+        self.assertIn("k=4", hint)
+        self.assertIn("verifies 16 tokens", hint)
+
+    def test_dflash_window_the_draft_fills_is_suggested_wider(self):
+        hint = benchmark._mtp_tuning_hint({
+            "status": "ok", "mtp": True, "speculative_strategy": "dflash",
+            "num_assistant_tokens": 3, "mtp_acceptance_rate": 0.87, "tokens_per_step": 3.61,
+        })
+
+        self.assertIn("k=6", hint)
+
+    def test_dflash_window_matched_to_its_acceptance_length_needs_no_hint(self):
+        # Math at k=7: AL 5.9 of a possible 8 -- neither wasted nor full.
+        self.assertIsNone(benchmark._mtp_tuning_hint({
+            "status": "ok", "mtp": True, "speculative_strategy": "dflash",
+            "num_assistant_tokens": 7, "mtp_acceptance_rate": 0.70, "tokens_per_step": 5.9,
+        }))
+
+    def test_dflash_hint_needs_an_acceptance_length(self):
+        self.assertIsNone(benchmark._mtp_tuning_hint({
+            "status": "ok", "mtp": True, "speculative_strategy": "dflash",
+            "num_assistant_tokens": 7, "mtp_acceptance_rate": 0.32,
+        }))
+
+
+class TestWindowSweep(unittest.TestCase):
+    """The k-selection table: acceptance length against pass cost, per task.
+
+    Numbers are the 8K measurements on Qwen3.6-35B-A3B that motivated it: the same draft
+    and settings reach AL 3.1-3.4 on a summary and 5.9 on math, so one task's best window
+    and speedup say nothing about another's.
+    """
+
+    SHARED = {
+        "model": "qwen", "context_tokens": 8000, "device": "GPU", "status": "ok",
+        "weight_format": "int4", "pipeline_mode": "paged", "ov_config": "f16",
+        "scheduler_config": "rows=17", "first_token_latency": 3000.0,
+    }
+
+    def _cases(self):
+        def base(task):
+            return {**self.SHARED, "throughput_task": task, "profile": "paged_min", "mtp": False,
+                    "other_tokens_avg_latency": 24.0, "steady_pass_ms": 23.5, "steady_tpot": 23.5}
+
+        def dflash(task, k, al, acc, pass_ms, tpot, steady):
+            return {**self.SHARED, "throughput_task": task, "profile": f"dflash_k{k}",
+                    "mtp": True, "speculative_strategy": "dflash", "num_assistant_tokens": k,
+                    "tokens_per_step": al, "mtp_acceptance_rate": acc, "steady_pass_ms": pass_ms,
+                    "other_tokens_avg_latency": tpot, "steady_tpot": steady}
+
+        return [
+            base("math"), dflash("math", 7, 5.9, 0.70, 66.0, 12.0, 11.2),
+            dflash("math", 3, 3.6, 0.87, 52.0, 15.5, 14.4),
+            base("summary_2s"), dflash("summary_2s", 3, 3.13, 0.71, 52.0, 19.0, 16.6),
+            dflash("summary_2s", 7, 3.38, 0.34, 66.0, 20.8, 19.5),
+        ]
+
+    def test_rows_are_per_task_ordered_by_k_with_cost_and_speedups(self):
+        rows = benchmark._window_sweep_rows(self._cases())
+
+        self.assertEqual([(r["task"], r["case"]["num_assistant_tokens"]) for r in rows],
+                         [("math", 3), ("math", 7), ("summary_2s", 3), ("summary_2s", 7)])
+        math_k7 = rows[1]
+        self.assertAlmostEqual(math_k7["pass_cost"], 66.0 / 23.5)
+        self.assertAlmostEqual(math_k7["decode_speedup"], 2.0)
+        self.assertAlmostEqual(math_k7["steady_speedup"], 23.5 / 11.2)
+
+    def test_section_names_the_best_window_per_task_and_the_domain_spread(self):
+        text = "\n".join(benchmark._window_sweep_section(self._cases(), 8000))
+
+        self.assertIn("SPECULATIVE WINDOW SWEEP", text)
+        self.assertIn("| math | dflash_k7 | 7 | 5.90 | 70% | 66.0 | 2.81x | 2.00x | 2.10x |", text)
+        self.assertIn("Best window for `math`: dflash_k7 (k=7)", text)
+        self.assertIn("Best window for `summary_2s`: dflash_k3 (k=3)", text)
+        self.assertIn("Domain spread: 1.42x (`summary_2s`) to 2.10x (`math`)", text)
+
+    def test_a_task_is_never_compared_against_another_tasks_baseline(self):
+        cases = [c for c in self._cases() if not (c["throughput_task"] == "math" and not c["mtp"])]
+
+        rows = benchmark._window_sweep_rows(cases)
+
+        self.assertEqual({r["task"] for r in rows}, {"summary_2s"})
+
+    def test_accuracy_cases_and_runs_without_speculation_render_nothing(self):
+        cases = [{**c, "throughput_task": None} for c in self._cases()]
+
+        self.assertEqual(benchmark._window_sweep_section(cases, 8000), [])
+        self.assertEqual(benchmark._window_sweep_section(
+            [c for c in self._cases() if not c["mtp"]], 8000), [])
+
+    def test_reference_is_compared_at_its_own_k_and_only_for_tasks_that_ran(self):
+        reference = {
+            "source": "DFlash PTL blog", "num_assistant_tokens": 7,
+            "tasks": {
+                "math": {"dataset": "GSM8K", "acceptance_length": 5.0, "speedup": 1.6},
+                "chat": {"dataset": "MT-Bench", "acceptance_length": 4.0, "speedup": 1.3},
+            },
+        }
+
+        text = "\n".join(benchmark._window_sweep_section(self._cases(), 8000, reference))
+
+        self.assertIn("Reference at k=7: DFlash PTL blog", text)
+        self.assertIn("| math | GSM8K | 5.00 | 5.90 | 1.60x | 2.00x | 2.10x |", text)
+        self.assertNotIn("MT-Bench", text)
+
+    def test_reference_without_a_matching_k_says_so(self):
+        reference = {
+            "source": "blog", "num_assistant_tokens": 5,
+            "tasks": {"math": {"dataset": "GSM8K", "acceptance_length": 5.0, "speedup": 1.6}},
+        }
+
+        text = "\n".join(benchmark._window_sweep_section(self._cases(), 8000, reference))
+
+        self.assertIn("| math | GSM8K | 5.00 | -- | 1.60x | -- | -- |", text)
+        self.assertIn("No k=5 profile ran for math", text)
+
+    def test_report_gives_each_task_its_own_speed_table(self):
+        settings = {
+            "models": ["qwen"], "device": "GPU", "weight_format": "int4",
+            "max_system_memory_pct": 100, "gpu_memory_budget_gb": 59,
+            "context_tokens": [8000], "warmup": 1, "iterations": 3, "output_tokens": 512,
+            "throughput_tasks": ["math", "summary_2s"], "throughput_task": "math",
+        }
+
+        text = "\n".join(benchmark._report_lines(settings, self._cases(), {}, True))
+
+        self.assertIn("of `math`, `summary_2s` @ up to 512", text)
+        self.assertIn("8,000 tokens -- `math` -- SPEED AND RESOURCES", text)
+        self.assertIn("8,000 tokens -- `summary_2s` -- SPEED AND RESOURCES", text)
+        self.assertIn("AL = acceptance length", text)
+        self.assertIn("acceptance length 5.90 tokens per verification pass", text)
 
 
 class TestMtpOutputCheck(unittest.TestCase):
@@ -926,6 +1120,31 @@ class TestMtpOutputCheck(unittest.TestCase):
 
         self.assertIn("WARNING", warning)
         self.assertIn("mtp_k2", warning)
+        self.assertIn("fork position unknown", warning)
+
+    def test_divergent_output_reports_where_it_forks(self):
+        # The fork measured on chat without a transcript: a near-tie, not corruption.
+        cases = [
+            {"profile": "paged_min", "status": "ok", "mtp": False, "output_sha256": "a",
+             "output_text": "1. Dear Parents, our Science Fair is next month!"},
+            {"profile": "dflash_k3", "status": "ok", "mtp": True, "output_sha256": "b",
+             "output_text": "1. Dear Parents, our school science fair is next month!"},
+        ]
+
+        warning = benchmark._mtp_output_check(cases)
+
+        self.assertIn("lossless only up to floating point", warning)
+        self.assertIn("`dflash_k3` forks at character 21 of 48", warning)
+        self.assertIn("after '1. Dear Parents, our '", warning)
+        self.assertIn("baseline 'Science Fair", warning)
+        self.assertIn("vs 'school science", warning)
+
+    def test_aggregate_keeps_the_agreed_output_text_only(self):
+        rows = [{"warmup": False, "output_sha256": "h", "output_text": "same"}] * 2
+        self.assertEqual(metrics.aggregate(rows)["output_text"], "same")
+        rows = [{"warmup": False, "output_sha256": "h1", "output_text": "one"},
+                {"warmup": False, "output_sha256": "h2", "output_text": "two"}]
+        self.assertIsNone(metrics.aggregate(rows)["output_text"])
 
     def test_nondeterministic_profile_is_rejected_before_cross_profile_comparison(self):
         cases = [
@@ -1288,7 +1507,7 @@ class TestSpeculativeComparisons(unittest.TestCase):
         line = metrics.format_iteration(record)
 
         self.assertIn("MTP k=3", line)
-        self.assertIn("2.86 tok/step", line)
+        self.assertIn("AL 2.86 tok/pass", line)
         self.assertIn("59% accepted", line)
         self.assertIn("59/100 candidates", line)
 

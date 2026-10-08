@@ -805,7 +805,10 @@ def _run_throughput_iterations(pipe, accepts_tokenized_input, tokenizer, result_
             pipe, prompt, accepts_tokenized_input
         )
         done["prompt_tokens"] = prompt_tokens
-        if hf_tokens != context_tokens or prompt_tokens != context_tokens:
+        # Context 0 is a standalone prompt whose length is its own, so only the two
+        # tokenizers have to agree; otherwise both must land on the requested size.
+        expected = context_tokens or hf_tokens
+        if hf_tokens != expected or prompt_tokens != expected:
             raise ValueError(
                 "Prompt token count mismatch: "
                 f"requested={context_tokens}, huggingface={hf_tokens}, openvino={prompt_tokens}"
@@ -864,6 +867,7 @@ def _run_throughput_iterations(pipe, accepts_tokenized_input, tokenizer, result_
             )
             if not output_size:
                 raise RuntimeError("no_output: generate() produced no tokens")
+            output_text = generated_text(result)
 
             # Prefer what the runtime says it prefilled over what was asked for: on the
             # VLMPipeline path the pipeline re-tokenizes the prompt string, so the two can
@@ -899,11 +903,12 @@ def _run_throughput_iterations(pipe, accepts_tokenized_input, tokenizer, result_
                 mtp_rejected_tokens=perf.get("mtp_rejected_tokens"),
                 mtp_draft_to_main_ratio=perf.get("mtp_draft_to_main_ratio"),
                 **{field: perf.get(field) for field in PASS_PROFILE_FIELDS},
-                output_sha256=hashlib.sha256(
-                    generated_text(result).encode("utf-8")
-                ).hexdigest(),
+                output_sha256=hashlib.sha256(output_text.encode("utf-8")).hexdigest(),
             )
             record["speculative_strategy"] = (mtp or {}).get("strategy")
+            # The text itself, not just its hash, so a speculative output that differs from
+            # the baseline's can be reported with *where* it forks (benchmark._fork_detail).
+            record["output_text"] = output_text
             done["iterations"].append(record)
             result_queue.put({"event": "iteration", **record})
     except Exception as exc:  # noqa: BLE001

@@ -12,42 +12,79 @@
 #   ... --accuracy                      # + the accuracy suites below
 #   ... --accuracy --list-profiles      # probe count and run matrix, loads nothing
 #   ... --profiles paged_min dflash_k7  # run the matched A/B only
+#   ... --throughput-task math          # one domain only
 #
 # dFlash (https://huggingface.co/z-lab/Qwen3.6-35B-A3B-DFlash) is compared against
 # `paged_min`, its matched baseline: same target model, OpenVINO properties and scheduler,
 # so speculation is the only variable. The draft export's block_size=16 includes the seed
 # token, so the largest valid proposal is num_assistant_tokens=15, not 16.
 #
-# Why the sweep is k=3/7/15: the draft proposes its whole block in one parallel pass, so a
-# larger k is nearly free to *draft* -- but the target verifies k + 1 tokens per pass, and
-# on this MoE that costs several single-token decode steps (each token routes to its own
-# experts). Steady-state pass cost at 8K on this box: ~52 / 66 / 88 ms for k=3/7/15 against
-# a 23.5 ms baseline step, so k=15 needs > 3.7 tok/pass just to break even. The report's
-# speedup line prints the pass cost, and the steady state next to the end-to-end figure:
-# the first decode pass also carries ~100-160 ms of one-time per-request work.
+# Read ACCEPTANCE LENGTH (AL), not the accepted %. AL is the tokens committed per target
+# verification pass (accepted drafts + the target's bonus token) and the speedup is
+# AL / pass cost, where pass cost is one k-window verification in baseline decode steps.
+# The accepted % is (AL - 1) / k: it falls with k by construction and cannot rank windows.
+# The report prints AL in every speculative row and a SPECULATIVE WINDOW SWEEP table per
+# context: AL, pass cost (= the break-even AL) and speedup for every k, best k per task.
 #
-# Acceptance is a property of the workload and of this draft, not of these settings. The
-# runtime's own accepted/drafted counts (greedy, deterministic), same pipeline and draft:
+# Speculation on a MoE is tricky: the draft proposes its whole block in one parallel pass,
+# so a larger k is nearly free to *draft*, but the target verifies k + 1 tokens per pass and
+# each routes to its own experts. Steady-state pass cost at 8K on this box: ~52 / 66 / 88 ms
+# for k=3/7/15 against a 23.5 ms baseline step (2.2x / 2.8x / 3.7x), so k=15 needs AL > 3.7
+# just to break even. Hence the sweep k=3/5/7/15: the best window is where AL stops
+# outrunning the pass cost, and that point moves with the domain.
 #
-#   workload                                   k=3    k=7    k=15   best tok/pass
+# DOMAIN sets the ceiling. The runtime's accepted/drafted counts, greedy, same pipeline/draft:
+#
+#   workload                                   k=3    k=7    k=15   best AL
 #   8K two-sentence summary (summary_2s)       71%    34%    16%    3.4
 #   8K app summary (classroom_summary, 479t)   59%    32%    15%    3.25
 #   math, no context / after an 8K transcript  87/85% 70/61% 38/34% 6.4 / 5.9
 #
-# Acceptance is (tok/pass - 1) / k, so once tok/pass saturates a larger k can only lower the
-# rate. Ruled out, each by A/B on this box: the hidden-state layer mapping (shifting it one
-# layer earlier lowers acceptance), context length (the same math question keeps its
-# acceptance after an 8K transcript), the draft's 4096 sliding window (honoured -- a 64-token
-# window collapses acceptance), the draft's KV cache and activation precision, an int8
-# target (no gain, 40% slower passes), DYNAMIC_QUANTIZATION_GROUP_SIZE and host-priority
-# knobs (within run-to-run noise); the GPU plugin's MoE/PagedAttention route options are
-# debug-build only and rejected here. Untested offline: an int8/fp16 re-export of the bf16
-# draft checkpoint (the local draft is int4 on all layers).
+# Summaries of a transcript are hard for the draft to predict (AL ~3.4 over a 2.2x pass:
+# ~1.3x at best); code and math are where dFlash is expected to reach ~2x. The published
+# reference (`speculative_reference` below; the DFlash PTL blog, k=7, same model, same
+# Arc B390) is HumanEval AL 6.4 / 2.2x, GSM8K 5.0 / 1.6x, MT-Bench 4.0 / 1.3x over a
+# 41 t/s baseline. So the speed iterations cover those domains plus the app's own:
 #
-# Throughput lever that works: give the draft its own int4 lm_head, so GenAI stops grafting
-# the target's 509 MB int8 head onto it (see dflash_draft_head.py). On classroom_summary:
-# k=3 20.4 -> 18.6 ms/token (1.17x -> 1.28x over paged_min), k=7 20.9 -> 19.6, acceptance
-# unchanged. Build it, then point the dflash profiles' `model` at the output directory:
+#   code / math / chat   one representative prompt per blog domain (HumanEval / GSM8K /
+#                        MT-Bench), run twice: at context 0 -- the task prompt alone, the
+#                        setting the blog measured -- and after the 8K transcript
+#   summary_2s           the classroom summary, 8K only (it summarizes the transcript)
+#
+# Each (context, task) gets its own speed table, a best window in the sweep, and the blog's
+# figure at k=7 next to the measured one. `classroom_summary` is the app's real request;
+# add it to judge the production speedup.
+#
+# This config, measured 2026-10-08 (int4-head draft, greedy), decode speedup over paged_min
+# with acceptance length in brackets; "none" is context 0, the blog-comparable point:
+#
+#   task        context  k=3            k=5            k=7            k=15           blog k=7
+#   code        none     1.85x (3.65)   2.27x (4.96)   2.40x (5.94)   2.03x (7.20)   2.2x (6.4)
+#   code        8K       1.69x (3.70)   2.08x (5.11)   2.22x (6.08)   2.07x (7.74)
+#   math        none     1.78x (3.52)   2.14x (4.82)   2.26x (5.68)   1.96x (6.91)   1.6x (5.0)
+#   math        8K       1.66x (3.62)   1.97x (4.87)   2.07x (5.74)   1.92x (7.20)
+#   chat        none     1.34x (2.59)   1.32x (2.85)   1.38x (3.30)   0.94x (3.17)   1.3x (4.0)
+#   chat        8K       1.23x (2.65)   1.25x (3.01)   1.14x (3.02)   0.77x (3.01)
+#   summary_2s  8K       1.32x (3.14)   1.19x (3.14)   1.19x (3.38)   0.90x (3.38)
+#
+# Without a transcript some speculative outputs fork from the baseline's greedy text at a
+# near-tie ("T-Rex" vs "Tyrannosaurus Rex"): verification scores k + 1 tokens on another
+# kernel path. The report prints every fork so it can be checked; see the guide.
+#
+# Ruled out, each by A/B on this box: the hidden-state layer mapping (shifting it one layer
+# earlier lowers acceptance), context length (the same math question keeps its acceptance
+# after an 8K transcript), the draft's 4096 sliding window (honoured -- a 64-token window
+# collapses acceptance), the draft's KV cache and activation precision, an int8 target (no
+# gain, 40% slower passes), DYNAMIC_QUANTIZATION_GROUP_SIZE and host-priority knobs (within
+# run-to-run noise); the GPU plugin's MoE/PagedAttention route options are debug-build only
+# and rejected here. Untested offline: an int8/fp16 re-export of the bf16 draft checkpoint
+# (the local draft is int4 on all layers).
+#
+# The dflash profiles use a draft with its own int4 lm_head, so GenAI stops grafting the
+# target's 509 MB int8 head onto it (see dflash_draft_head.py): on classroom_summary k=3
+# 20.4 -> 18.6 ms/token, acceptance unchanged. Build it once (and again whenever the target
+# is re-exported); to use the stock draft instead, point `&dflash_draft` at
+# models/openvino/qwen3.6-35b-a3b-dflash-int4-ov:
 #
 #   python -m components.llm.context_bench.dflash_draft_head \
 #       --target models/openvino/Qwen3.6-35B-A3B_int4 \
@@ -66,11 +103,15 @@ benchmark:
   models: [Qwen3.6-35B-A3B]
   # 8K is the quick default. Raise for a real long-context measurement -- but note accuracy
   # probes cost roughly one prefill each, so 32K multiplies the run by about 4.
-  context_tokens: [8000]
+  # 0 = no transcript: code/math/chat run as standalone prompts (the blog's setting); the
+  # summaries and the accuracy suites skip it. Drop it (or --contexts 8000) to halve the run.
+  context_tokens: [0, 8000]
   # Decode ceiling; generation and the full-budget warmup both honor EOS, because
   # continuing past EOS would distort draft acceptance. Actual output lengths are reported
-  # separately. Accuracy probes use the per-suite budgets under `accuracy`.
-  output_tokens: 64
+  # separately. Accuracy probes use the per-suite budgets under `accuracy`. 512 lets the
+  # math/code answers run long enough that the first decode pass's one-time cost (~160 ms
+  # for dFlash) stops hiding the steady-state rate; summary_2s still stops at ~45 (EOS).
+  output_tokens: 512
   warmup: 1
   iterations: 3
   # Untimed idle before each measured generation. This iGPU boosts for the first few
@@ -79,15 +120,35 @@ benchmark:
   # at 24.6 ms/token (~40.6 tok/s, 3.0 s TTFT) after 30 s idle. 30 s reports what an
   # occasional classroom request sees; set 0 (or --iteration-gap 0) for sustained load.
   iteration_gap_sec: 30
-  # What the speed iterations decode. summary_2s: a two-sentence summary (~45 tokens).
-  # classroom_summary: the app's own summarizer request (system prompt and /no_think from
-  # config.yaml) -- a long Markdown summary; raise output_tokens (e.g. 1024) to let it finish.
-  throughput_task: summary_2s
+  # What the speed iterations decode -- one name or a list; every profile runs once per
+  # task, and each task gets its own speed table and best speculative window.
+  #   code              a Python module with tests (HumanEval-like)
+  #   math              six worked physics/arithmetic/algebra problems (GSM8K-like)
+  #   chat              four open-ended assistant requests: writing, advice, an explanation,
+  #                     a roleplay (MT-Bench-like)
+  #   summary_2s        a two-sentence summary of the transcript (~45 tokens)
+  #   classroom_summary the app's own summarizer request (system prompt and /no_think from
+  #                     config.yaml) -- a long Markdown summary; raise output_tokens to ~1024
+  # The first three follow the transcript at context > 0 and stand alone at context 0.
+  throughput_task: [code, math, chat, summary_2s]
   timeout_sec: 5400
   max_system_memory_pct: 100
   gpu_memory_budget_gb: 59
   cache_dir: null
   output_dir: monitoring/executionlogs/context_bench/qwen3.6_35b
+
+# Published dFlash results, printed beside the window sweep at the same k. Information only:
+# they were measured on whole datasets (here: one prompt per domain) with an earlier runtime.
+speculative_reference:
+  source: >-
+    HF blog "Accelerating Qwen3.6 on Intel Core Ultra Series 3 with DFlash" (2026-07-30):
+    Qwen3.6-35B-A3B + z-lab DFlash draft, both int4 W4A16, OpenVINO 2026.3, Core Ultra X7 368H
+    Arc B390 iGPU, greedy, baseline 41 t/s
+  num_assistant_tokens: 7
+  tasks:
+    code: {dataset: HumanEval, acceptance_length: 6.4, speedup: 2.2, throughput: 89.8}
+    math: {dataset: GSM8K, acceptance_length: 5.0, speedup: 1.6, throughput: 68.5}
+    chat: {dataset: MT-Bench, acceptance_length: 4.0, speedup: 1.3, throughput: 54.7}
 
 # Only read when --accuracy is passed. Delete the section to make that flag an error.
 accuracy:
@@ -156,15 +217,23 @@ profiles:
     ov: *ov_qwen36_paged
     scheduler: *scheduler_qwen36
     dflash:
-      model: models/openvino/qwen3.6-35b-a3b-dflash-int4-ov
+      model: &dflash_draft models/openvino/qwen3.6-35b-a3b-dflash-int4-ov-int4head
       device: GPU
       num_assistant_tokens: 3
+
+  - name: dflash_k5
+    ov: *ov_qwen36_paged
+    scheduler: *scheduler_qwen36
+    dflash:
+      model: *dflash_draft
+      device: GPU
+      num_assistant_tokens: 5
 
   - name: dflash_k7
     ov: *ov_qwen36_paged
     scheduler: *scheduler_qwen36
     dflash:
-      model: models/openvino/qwen3.6-35b-a3b-dflash-int4-ov
+      model: *dflash_draft
       device: GPU
       num_assistant_tokens: 7
 
@@ -172,6 +241,6 @@ profiles:
     ov: *ov_qwen36_paged
     scheduler: *scheduler_qwen36
     dflash:
-      model: models/openvino/qwen3.6-35b-a3b-dflash-int4-ov
+      model: *dflash_draft
       device: GPU
       num_assistant_tokens: 15

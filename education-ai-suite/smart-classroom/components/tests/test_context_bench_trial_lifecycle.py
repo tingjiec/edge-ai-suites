@@ -122,7 +122,7 @@ class TestChildReportsBeforeTeardown(unittest.TestCase):
         # the accuracy dispatch; the ordering invariant it must keep moved with it.
         code = _executable_source(trial_runner._run_throughput_iterations)
 
-        mismatch = code.index("if hf_tokens != context_tokens or prompt_tokens != context_tokens:")
+        mismatch = code.index("if hf_tokens != expected or prompt_tokens != expected:")
         milestone = code.index('done["stage_reached"] = STAGE_PROMPT_BUILT')
         event = code.index('result_queue.put({"event": "prompt"')
 
