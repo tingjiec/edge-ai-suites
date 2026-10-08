@@ -501,7 +501,7 @@ const FIELDS = [
     label: 'VLM model',
     type: 'string',
     maxLength: 200,
-    suggestions: ['Qwen/Qwen3-VL-8B-Instruct', 'Qwen/Qwen3.5-9B', 'Qwen/Qwen3.6-35B-A3B'],
+    suggestions: ['Qwen/Qwen3-VL-8B-Instruct', 'Qwen/Qwen3.5-9B', 'Qwen/Qwen3.6-35B-A3B', 'Qwen/Qwen3.8-27B'],
     help: 'These options are downloaded as pre-converted OpenVINO IR; anything else is converted on first run.',
   },
   {

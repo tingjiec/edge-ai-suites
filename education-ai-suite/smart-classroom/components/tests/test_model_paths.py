@@ -68,3 +68,10 @@ def test_vlm_text_gen_resolves_its_dir_through_this_module():
     assert handler._model_dir() == model_paths.openvino_model_dir(
         "Qwen/Qwen3-VL-8B-Instruct", "int4"
     )
+
+
+def test_an_absolute_ir_directory_is_used_as_is(tmp_path):
+    """A custom export elsewhere on disk needs no copy under models/openvino."""
+    assert model_paths.openvino_model_dir(str(tmp_path), "int4") == tmp_path
+    missing = tmp_path / "not-there"
+    assert model_paths.openvino_model_dir(str(missing), "int4").name == "int4"

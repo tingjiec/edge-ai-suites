@@ -1,8 +1,9 @@
 import queue
+import threading
 import openvino_genai as ov_genai
 
 class YieldingTextStreamer(ov_genai.StreamerBase):
-    def __init__(self, tokenizer, skip_special_tokens=True):
+    def __init__(self, tokenizer, skip_special_tokens=True, cancel_event=None):
         super().__init__()
         self.tokenizer = tokenizer
         self.skip_special_tokens = skip_special_tokens
@@ -11,9 +12,17 @@ class YieldingTextStreamer(ov_genai.StreamerBase):
         self.generation_start_time = None
         self._token_cache = []
         self._print_len = 0
+        # Set by a consumer that went away (client disconnect, abandoned
+        # iterator) so the native generation stops instead of running on.
+        self._cancel = cancel_event if cancel_event is not None else threading.Event()
+
+    def cancel(self):
+        self._cancel.set()
 
     def get_stop_flag(self):
         """Check whether generation should be stopped."""
+        if self._cancel.is_set():
+            return ov_genai.StreamingStatus.CANCEL
         return ov_genai.StreamingStatus.RUNNING
 
     def write(self, token) -> ov_genai.StreamingStatus:
@@ -29,7 +38,7 @@ class YieldingTextStreamer(ov_genai.StreamerBase):
         text = self.tokenizer.decode(self._token_cache, skip_special_tokens=self.skip_special_tokens)
         new_text = text[self._print_len:]
         if not new_text:
-            return ov_genai.StreamingStatus.RUNNING
+            return self.get_stop_flag()
 
         if self._is_safe_to_emit(new_text):
             self._queue.put(new_text)

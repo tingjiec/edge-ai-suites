@@ -35,24 +35,33 @@ def render_chat_prompt(
     model_name,
     enable_thinking: Optional[bool] = None,
     has_images: bool = False,
+    tools: Optional[list] = None,
+    template_kwargs: Optional[dict] = None,
 ) -> str:
     """Render ``messages`` into a prompt string ready for ``generate``.
 
     ``enable_thinking`` is tri-state: ``None`` leaves the model default alone,
     ``False`` suppresses reasoning, ``True`` requests it. Models whose template
     predates the flag (Qwen2.x, Qwen3-VL-*-Instruct) simply ignore it -- extra
-    kwargs reach the Jinja renderer as variables and go unused.
+    kwargs reach the Jinja renderer as variables and go unused. The same holds
+    for ``template_kwargs`` (e.g. ``preserve_thinking``, ``reasoning_effort``).
+
+    ``tools`` (OpenAI ``tools`` entries) are rendered by the model's own
+    template, so each family gets the tool-call format it was trained on.
 
     Works with both a transformers tokenizer and the OpenVINO one, which take
     the same information through incompatible signatures.
     """
     messages = _prepare(messages, model_name, enable_thinking, has_images)
-    extra = {} if enable_thinking is None else {"enable_thinking": enable_thinking}
+    extra = dict(template_kwargs or {})
+    if enable_thinking is not None:
+        extra["enable_thinking"] = enable_thinking
 
     if isinstance(tokenizer, ov_genai.Tokenizer):
-        return _render_ov(tokenizer, messages, extra)
+        return _render_ov(tokenizer, messages, extra, tools)
     return tokenizer.apply_chat_template(
-        messages, tokenize=False, add_generation_prompt=True, **extra
+        messages, tools=tools or None, tokenize=False, add_generation_prompt=True,
+        **extra
     )
 
 
@@ -90,7 +99,7 @@ def _find_user(messages: list, last: bool = False) -> Optional[int]:
     return indices[-1] if last else indices[0]
 
 
-def _render_ov(tokenizer, messages: list, extra: dict) -> str:
+def _render_ov(tokenizer, messages: list, extra: dict, tools=None) -> str:
     """Render via the OpenVINO tokenizer.
 
     Its signature is positional -- ``(history, add_generation_prompt,
@@ -98,8 +107,12 @@ def _render_ov(tokenizer, messages: list, extra: dict) -> str:
     on recent runtimes, so fall back to the three-argument form.
     """
     try:
-        return tokenizer.apply_chat_template(messages, True, "", None, extra or None)
+        return tokenizer.apply_chat_template(
+            messages, True, "", tools or None, extra or None
+        )
     except TypeError:
+        if tools:
+            raise ValueError("This runtime's tokenizer cannot render tools.")
         if extra:
             logger.warning(
                 "OpenVINO tokenizer does not accept extra_context; %s will be "

@@ -50,6 +50,7 @@ The main features are as follows:
 
 ./get-started
 ./advance-setup-guide
+./model-serving
 ./how-it-works
 ./application-flow
 ./content-search-flow

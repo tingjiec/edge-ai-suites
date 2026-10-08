@@ -11,7 +11,14 @@ OPENVINO_MODELS_DIR = SC_ROOT / "models" / "openvino"
 
 
 def openvino_model_dir(model_name: str, weight_format: str) -> Path:
-    """Return the shared IR directory ``models/openvino/<name>/<weight_format>``."""
+    """Return the shared IR directory ``models/openvino/<name>/<weight_format>``.
+
+    An absolute path to an existing directory (a custom or fine-tuned export)
+    is used as is.
+    """
+    local = Path(model_name)
+    if local.is_absolute() and local.is_dir():
+        return local
     return OPENVINO_MODELS_DIR / model_name.split("/")[-1] / weight_format.lower()
 
 

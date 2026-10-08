@@ -75,12 +75,28 @@ models:
 
   text_gen:
     provider: vlm
+    # Qwen/Qwen3-VL-8B-Instruct (default) | Qwen/Qwen3.6-35B-A3B | Qwen/Qwen3.8-27B (needs OpenVINO >= 2026.4)
+    # IR is read from models/openvino/<name>/<weight_format>, downloaded/exported on first use.
     vlm_name: Qwen/Qwen3-VL-8B-Instruct
     device: GPU # GPU or CPU
     weight_format: int4 # int4,int 8-- shared with content_search.vlm.weight_format
     max_new_tokens: 5120
     concurrency: 1    # CapabilityRunner max_concurrency (single warm pipe)
     queue_max: 8      # CapabilityRunner queue depth before 503 backpressure
+    enable_thinking: false  # default for /v1/chat/completions requests that omit it; null = model default
+
+    serving:          # where the model runs; :8000 and all clients stay the same in every mode
+      mode: inprocess # inprocess (inside this app) | managed (separate supervised process) | external (connect only)
+      host: 127.0.0.1
+      port: 8010      # managed: port the model server is started on; external: port to connect to
+      # endpoint: http://127.0.0.1:8010  # external only: full base URL, overrides host/port
+      stall_timeout_s: 300  # no token for this long => the model server is recycled
+      max_restarts: 5       # managed: restart budget per 10 minutes
+
+    speculative:      # speculative decoding (DFlash drafter); see docs/user-guide/model-serving.md
+      mode: "off"     # "off" | "auto" (use if the runtime/drafter support it) | "on" (fail if not)
+      draft_model: z-lab/Qwen3.6-35B-A3B-DFlash  # IR in models/openvino/<name>/<weight_format>, or a directory
+      num_assistant_tokens: 5  # tokens drafted per verification step (5 measured best on PTL)
 
     chunking:
       enabled: true                  # false = summarize the whole transcript in one pass

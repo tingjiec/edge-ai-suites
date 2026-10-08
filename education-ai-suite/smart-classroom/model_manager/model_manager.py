@@ -89,6 +89,8 @@ class ModelManager:
         }
         if t and t.loaded:
             text_gen_health["memory"] = t.memory_stats()
+        if t:
+            text_gen_health.update(t.describe())
 
         return {"ocr": ocr_health, "asr": asr_health, "text_gen": text_gen_health}
 

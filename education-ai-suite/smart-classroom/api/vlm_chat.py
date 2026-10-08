@@ -1,178 +1,111 @@
 # Copyright (C) 2026 Intel Corporation
 # SPDX-License-Identifier: Apache-2.0
 
+"""``/v1/chat/completions`` and ``/v1/models`` on the main app (:8000).
+
+With ``models.text_gen.serving.mode: inprocess`` (the default) requests run on
+the warm in-process VLM. With ``managed`` / ``external`` they are proxied
+byte-for-byte (SSE included) to the separate model server, so every existing
+client keeps using :8000 unchanged.
+"""
 
 from __future__ import annotations
 
-import json
 import logging
-import sys
-import time
-import uuid
-from pathlib import Path
-from types import SimpleNamespace
-from typing import Iterator, List, Optional
+from typing import Optional
 
+import httpx
 from fastapi import APIRouter, Request
 from fastapi.concurrency import run_in_threadpool
 from fastapi.responses import JSONResponse, StreamingResponse
+from starlette.background import BackgroundTask
 
 from model_manager import ModelManager
+from model_serving import openai_chat
+from model_serving.settings import ServingSettings, serving_settings
 
 logger = logging.getLogger(__name__)
 
 router = APIRouter()
 
-# smart-classroom root: api/vlm_chat.py -> parents[1]
-_SC_ROOT = Path(__file__).resolve().parents[1]
-_CONTENT_SEARCH_DIR = _SC_ROOT / "content_search"
+_FORWARDED_HEADERS = ("content-type", "retry-after", "cache-control")
+_client: Optional[httpx.AsyncClient] = None
 
 
-def _import_vlm_serving() -> SimpleNamespace:
-
-    if str(_CONTENT_SEARCH_DIR) not in sys.path:
-        sys.path.append(str(_CONTENT_SEARCH_DIR))
-    from components.vlm.vlm_openvino_serving.utils.data_models import (  # noqa: E402
-        ChatCompletionChoice,
-        ChatCompletionDelta,
-        ChatCompletionResponse,
-        ChatRequest,
-        MessageContentImageUrl,
-        MessageContentText,
-    )
-    from components.vlm.vlm_openvino_serving.utils.utils import load_images  # noqa: E402
-
-    return SimpleNamespace(
-        ChatRequest=ChatRequest,
-        ChatCompletionResponse=ChatCompletionResponse,
-        ChatCompletionChoice=ChatCompletionChoice,
-        ChatCompletionDelta=ChatCompletionDelta,
-        MessageContentText=MessageContentText,
-        MessageContentImageUrl=MessageContentImageUrl,
-        load_images=load_images,
-    )
-
-
-def _extract_prompt_and_images(messages, mods: SimpleNamespace):
-    last_user_message = next(
-        (m for m in reversed(messages) if m.role == "user"), None
-    )
-    image_urls: List[str] = []
-    prompt: Optional[str] = None
-    if last_user_message is not None:
-        if isinstance(last_user_message.content, str):
-            prompt = last_user_message.content
-        else:
-            for content in last_user_message.content:
-                if isinstance(content, mods.MessageContentImageUrl):
-                    url = content.image_url.get("url")
-                    if url:
-                        image_urls.append(url)
-                elif isinstance(content, mods.MessageContentText):
-                    prompt = content.text
-                elif isinstance(content, str):
-                    prompt = content
-    return prompt, image_urls
-
-
-def _model_name(requested: Optional[str]) -> str:
+def _model_name() -> str:
     try:
         from utils.config_loader import config
 
         name = getattr(getattr(config.models, "text_gen", None), "vlm_name", None)
         if name:
             return str(name)
-    except Exception:  
+    except Exception:
         pass
-    return requested or "text_gen"
+    return "text_gen"
 
 
-def _sse_stream(token_iter: Iterator[str], model_name: str) -> Iterator[str]:
-    created = int(time.time())
-    completion_id = f"chatcmpl-{uuid.uuid4().hex}"
+def _http(settings: ServingSettings) -> httpx.AsyncClient:
+    global _client
+    if _client is None:
+        _client = httpx.AsyncClient(
+            trust_env=False,  # loopback must bypass corporate proxies
+            # Read timeout spans the gap between streamed bytes, which covers a
+            # long prefill; it is what turns a dead server into a fast 503.
+            timeout=httpx.Timeout(connect=5.0, read=settings.stall_timeout_s,
+                                  write=60.0, pool=None),
+        )
+    return _client
 
-    def _chunk(delta: dict, finish_reason: Optional[str] = None) -> str:
-        payload = {
-            "id": completion_id,
-            "object": "chat.completion.chunk",
-            "created": created,
-            "model": model_name,
-            "choices": [
-                {"index": 0, "delta": delta, "finish_reason": finish_reason}
-            ],
-        }
-        return f"data: {json.dumps(payload, ensure_ascii=False)}\n\n"
 
-    # First chunk announces the assistant role (OpenAI convention).
-    yield _chunk({"role": "assistant"})
-    for token in token_iter:
-        if token:
-            yield _chunk({"content": token})
-    yield _chunk({}, finish_reason="stop")
-    yield "data: [DONE]\n\n"
+async def _proxy(request: Request, settings: ServingSettings, path: str):
+    # Starts the managed server on first use if no feature warmed it up.
+    await run_in_threadpool(ModelManager.instance().text_gen().load)
+    headers = {"content-type": request.headers.get("content-type", "application/json")}
+    if settings.api_key:
+        headers["authorization"] = f"Bearer {settings.api_key}"
+    client = _http(settings)
+    upstream_request = client.build_request(
+        request.method, settings.endpoint + path,
+        content=await request.body() if request.method == "POST" else None,
+        headers=headers,
+    )
+    try:
+        upstream = await client.send(upstream_request, stream=True)
+    except httpx.HTTPError as exc:
+        logger.warning("Model service at %s unreachable: %s", settings.endpoint, exc)
+        return openai_chat.error_response(
+            f"model service unavailable: {exc.__class__.__name__}", 503,
+            "unavailable", headers={"Retry-After": "5"},
+        )
+    return StreamingResponse(
+        upstream.aiter_raw(),
+        status_code=upstream.status_code,
+        headers={k: upstream.headers[k] for k in _FORWARDED_HEADERS if k in upstream.headers},
+        background=BackgroundTask(upstream.aclose),
+    )
 
 
 @router.post("/v1/chat/completions")
 async def chat_completions(request: Request):
-    """OpenAI-compatible chat completion backed by the warm in-process VLM."""
-    mods = _import_vlm_serving()
-
+    """OpenAI-compatible chat completion (text, images, tools, streaming)."""
+    settings = serving_settings()
+    if settings.remote:
+        return await _proxy(request, settings, "/v1/chat/completions")
     try:
         body = await request.json()
-        chat_req = mods.ChatRequest(**body)
-    except Exception as exc:  # noqa: BLE001 - malformed body / schema violation
-        return JSONResponse(
-            status_code=400, content={"error": f"Invalid request: {exc}"}
-        )
-
-    prompt, image_urls = _extract_prompt_and_images(chat_req.messages, mods)
-    if not prompt or not prompt.strip():
-        return JSONResponse(status_code=400, content={"error": "Prompt is required"})
-
-    image_tensors = None
-    if image_urls:
-        try:
-            _, image_tensors = await mods.load_images(image_urls)
-        except ValueError as exc:
-            return JSONResponse(status_code=400, content={"error": str(exc)})
-
-    model_name = _model_name(chat_req.model)
-    handler = ModelManager.instance().text_gen()
-
-    if chat_req.stream:
-        token_iter = handler.generate(
-            prompt,
-            images=image_tensors,
-            stream=True,
-            max_new_tokens=chat_req.max_completion_tokens,
-            temperature=chat_req.temperature,
-            enable_thinking=chat_req.enable_thinking,
-        )
-        return StreamingResponse(
-            _sse_stream(token_iter, model_name),
-            media_type="text/event-stream",
-        )
-
-    output = await run_in_threadpool(
-        handler.generate,
-        prompt,
-        images=image_tensors,
-        stream=False,
-        max_new_tokens=chat_req.max_completion_tokens,
-        temperature=chat_req.temperature,
-        enable_thinking=chat_req.enable_thinking,
+    except Exception as exc:  # noqa: BLE001 - malformed JSON body
+        return openai_chat.error_response(f"Invalid request: {exc}")
+    return await openai_chat.chat_completion(
+        body,
+        ModelManager.instance().text_gen(),
+        model_name=_model_name(),
+        default_thinking=settings.default_thinking,
     )
-    response = mods.ChatCompletionResponse(
-        id=str(uuid.uuid4()),
-        object="chat.completion",
-        created=int(time.time()),
-        model=model_name,
-        choices=[
-            mods.ChatCompletionChoice(
-                index=0,
-                message=mods.ChatCompletionDelta(role="assistant", content=str(output)),
-                finish_reason="stop",
-            )
-        ],
-    )
-    return JSONResponse(content=response.model_dump())
+
+
+@router.get("/v1/models")
+async def list_models(request: Request):
+    settings = serving_settings()
+    if settings.remote:
+        return await _proxy(request, settings, "/v1/models")
+    return JSONResponse(openai_chat.models_payload(_model_name()))

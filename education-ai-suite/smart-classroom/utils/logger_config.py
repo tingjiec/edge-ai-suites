@@ -2,7 +2,7 @@ import logging
 
 # Endpoints the UI polls on a short interval. Their access-log lines would
 # otherwise flood the console with one entry per second, per endpoint.
-POLLED_PATHS = ("/metrics", "/health")
+POLLED_PATHS = ("/metrics", "/health", "/live", "/ready")
 
 
 class SuppressPolledAccessLogs(logging.Filter):

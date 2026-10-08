@@ -27,6 +27,9 @@ _PRECONVERTED_OV_MODELS = {
     ("Qwen/Qwen3.5-9B", "int4"): "OpenVINO/Qwen3.5-9B-int4-ov",
     ("Qwen/Qwen3.5-9B", "int8"): "OpenVINO/Qwen3.5-9B-int8-ov",
     ("Qwen/Qwen3.6-35B-A3B", "int4"): "OpenVINO/Qwen3.6-35B-A3B-int4-ov",
+    # Qwen3.6-35B-A3B int8 has no published IR yet: it is exported locally.
+    ("Qwen/Qwen3.8-27B", "int4"): "OpenVINO/Qwen3.8-27B-int4-ov",
+    ("Qwen/Qwen3.8-27B", "int8"): "OpenVINO/Qwen3.8-27B-int8-ov",
 }
 
 
@@ -83,8 +86,13 @@ def _export_overlay_dir() -> Path:
 
 
 def _needs_transformers_overlay(model_id: str) -> bool:
-    name = str(model_id).lower()
-    return any(marker in name for marker in _EXPORT_TRANSFORMERS_MODEL_MARKERS)
+    try:
+        from utils.model_family import is_qwen3_5_family
+    except ImportError:  # standalone vlm-openvino-serving without the app on sys.path
+        name = str(model_id).lower()
+        return any(marker in name for marker in _EXPORT_TRANSFORMERS_MODEL_MARKERS)
+    # Qwen3.8 and later share the Qwen3_5 architecture classes.
+    return is_qwen3_5_family(model_id)
 
 
 def _ensure_transformers_overlay() -> Path:
@@ -138,9 +146,16 @@ def convert_model(
         preconverted_repo = _PRECONVERTED_OV_MODELS.get((model_id, weight_format))
         if is_model_ready(Path(cache_dir), require_detokenizer=require_detokenizer):
             logger.info(f"Optimized {model_id} exist in {cache_dir}. Skip process...")
-        elif model_type == "vlm" and preconverted_repo is not None:
-            _download_preconverted_ov_model(preconverted_repo, cache_dir)
-        else:
+            return
+        if model_type == "vlm" and preconverted_repo is not None:
+            try:
+                _download_preconverted_ov_model(preconverted_repo, cache_dir)
+            except Exception as exc:  # noqa: BLE001 - e.g. repo not published yet
+                logger.warning(
+                    f"Pre-converted IR '{preconverted_repo}' unavailable ({exc}); "
+                    f"exporting {model_id} locally instead."
+                )
+        if not is_model_ready(Path(cache_dir), require_detokenizer=require_detokenizer):
             logger.info(f"Converting {model_id} model to OpenVINO format in subprocess...")
             # Run a standalone script rather than multiprocessing.Process: on
             # Windows the spawn start method re-executes the parent's __main__

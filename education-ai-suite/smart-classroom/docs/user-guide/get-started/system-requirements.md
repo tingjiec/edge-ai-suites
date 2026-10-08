@@ -30,6 +30,7 @@ This page provides detailed hardware, software, platform requirements, and suppo
 - **Qwen Models (OpenVINO™)**
   - `Qwen3-VL-8B-Instruct` (default, shared vision-language model)
   - `Qwen3.5-9B`
+  - `Qwen3.6-35B-A3B` and `Qwen3.8-27B` (64 GB RAM recommended; see [Model Serving](../model-serving.md))
 - Summarization supports up to 5,120 tokens on GPU
 - Run summarization on **GPU** (Intel® iGPU / Arc GPU) for faster performance.
 

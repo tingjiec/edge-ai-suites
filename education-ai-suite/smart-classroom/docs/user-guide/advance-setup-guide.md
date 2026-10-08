@@ -100,11 +100,15 @@ summarizer:
 
 text_gen:                     # Shared by summary, mindmap, segmentation and Q&A
   provider: vlm
-  vlm_name: Qwen/Qwen3-VL-8B-Instruct
+  vlm_name: Qwen/Qwen3-VL-8B-Instruct  # or Qwen/Qwen3.6-35B-A3B, Qwen/Qwen3.8-27B
   device: GPU                 # Options: GPU or CPU
   weight_format: int4         # Supported: fp16, int4, int8
   max_new_tokens: 5120        # Maximum tokens to generate
 ```
+
+To run the model in a separate, supervised process, serve it on its own, call it
+with tools from an agent, or enable DFlash speculative decoding, see
+[VLM/LLM Model Serving](./model-serving.md).
 
 ### C. Chinese Audio Transcription
 

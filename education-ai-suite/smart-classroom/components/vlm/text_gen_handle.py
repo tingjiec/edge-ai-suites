@@ -29,7 +29,10 @@ def _process_memory_mb() -> Optional[float]:
 
 class TextGenHandler:
 
-    def __init__(self) -> None:
+    def __init__(self, mode: Optional[str] = None) -> None:
+        # None: models.text_gen.serving.mode. The model server passes
+        # "inprocess" so it never tries to reach itself.
+        self._mode = mode
         self._runner = None
         self._vlm = None
         self._provider: Optional[str] = "vlm"
@@ -49,9 +52,13 @@ class TextGenHandler:
         temperature: Optional[float] = None,
         enable_thinking: Optional[bool] = None,
         json_schema: Optional[str] = None,
+        **options,
     ) -> Union[Iterator[str], str]:
         """Generate from ``messages`` (a chat history) or ``prompt`` (one user
-        turn). Templating happens inside the VLM, so callers pass raw text."""
+        turn). Templating happens inside the VLM, so callers pass raw text.
+
+        ``options`` (tools, prefill, stats, cancel_event, ...) are passed through
+        for the OpenAI-compatible API; see ``VLMTextGen.generate``."""
         return self._get_runner().submit(
             prompt,
             messages=messages,
@@ -61,6 +68,7 @@ class TextGenHandler:
             temperature=temperature,
             enable_thinking=enable_thinking,
             json_schema=json_schema,
+            **options,
         )
 
     def load(self) -> None:
@@ -68,11 +76,39 @@ class TextGenHandler:
 
     @property
     def state(self) -> CapabilityState:
+        # A remote engine is only as ready as the model server behind it.
+        if self._state == CapabilityState.READY and not getattr(self._vlm, "ready", True):
+            return CapabilityState.LOADING
         return self._state
 
     @property
     def loaded(self) -> bool:
-        return self._state == CapabilityState.READY
+        return self.state == CapabilityState.READY
+
+    @property
+    def model_name(self) -> Optional[str]:
+        return getattr(self._vlm, "model_name", None)
+
+    @property
+    def tool_call_format(self) -> str:
+        return getattr(self._vlm, "tool_call_format", "json")
+
+    def describe(self) -> dict:
+        """Extra /health detail: where the model runs and what is loaded."""
+        try:
+            info = {"serving": self._serving().mode}
+        except ValueError as exc:  # bad serving.mode: report it, keep /health up
+            info = {"serving": None, "error": str(exc)}
+        vlm = self._vlm
+        if vlm is not None:
+            info["model"] = getattr(vlm, "model_name", None)
+            info["weight_format"] = getattr(vlm, "weight_format", None)
+            info["speculative"] = getattr(vlm, "speculative_status", None)
+            if getattr(vlm, "endpoint", None):
+                info["endpoint"] = vlm.endpoint
+            if getattr(vlm, "error", None):
+                info["error"] = vlm.error
+        return {k: v for k, v in info.items() if v is not None}
 
     @property
     def provider(self) -> Optional[str]:
@@ -144,17 +180,35 @@ class TextGenHandler:
             text_gen = getattr(config.models, "text_gen", None)
             if text_gen is None:
                 return _TEXT_GEN_MAX_CONCURRENCY, _TEXT_GEN_QUEUE_MAX
-            return (
-                int(getattr(text_gen, "concurrency", _TEXT_GEN_MAX_CONCURRENCY)),
-                int(getattr(text_gen, "queue_max", _TEXT_GEN_QUEUE_MAX)),
-            )
+            concurrency = int(getattr(text_gen, "concurrency", _TEXT_GEN_MAX_CONCURRENCY))
+            queue_max = int(getattr(text_gen, "queue_max", _TEXT_GEN_QUEUE_MAX))
+            if self._serving().remote:
+                # The model server holds the one authoritative queue; a second
+                # bounded one here would only reject work it could still take.
+                concurrency = queue_max
+            return concurrency, queue_max
         except Exception:
             return _TEXT_GEN_MAX_CONCURRENCY, _TEXT_GEN_QUEUE_MAX
 
-    def _build_vlm(self):
-        from components.vlm.text_gen_vlm import VLMTextGen
+    def _serving(self):
+        from dataclasses import replace
 
-        vlm = VLMTextGen()
+        from model_serving.settings import serving_settings
+
+        settings = serving_settings()
+        return replace(settings, mode=self._mode) if self._mode else settings
+
+    def _build_vlm(self):
+        settings = self._serving()
+        if settings.remote:
+            from model_serving.client import build_remote_text_gen
+            from utils.config_loader import config
+
+            vlm = build_remote_text_gen(settings, getattr(config.models, "text_gen", None))
+        else:
+            from components.vlm.text_gen_vlm import VLMTextGen
+
+            vlm = VLMTextGen()
         self._vlm = vlm
         self._device = vlm.device
         return vlm

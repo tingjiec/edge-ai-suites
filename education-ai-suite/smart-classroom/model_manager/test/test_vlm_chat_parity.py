@@ -116,6 +116,63 @@ def test_chat_completions_streaming_sse_shape():
     assert "".join(content).strip()
 
 
+# ---------------------------------------------------------------- tool calls
+_WEATHER_TOOL = {
+    "type": "function",
+    "function": {
+        "name": "get_weather",
+        "description": "Get the weather forecast for a city.",
+        "parameters": {
+            "type": "object",
+            "properties": {"city": {"type": "string"}, "days": {"type": "integer"}},
+            "required": ["city"],
+        },
+    },
+}
+
+
+def _post_json(body: dict, timeout: int = 300) -> dict:
+    req = _request.Request(
+        f"{_BASE_URL}/v1/chat/completions",
+        data=json.dumps({"model": _MODEL, **body}).encode("utf-8"),
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+    with _request.urlopen(req, timeout=timeout) as resp:
+        return json.loads(resp.read().decode("utf-8"))
+
+
+def test_models_endpoint_lists_the_served_model():
+    _require_server()
+    with _request.urlopen(f"{_BASE_URL}/v1/models", timeout=5) as resp:
+        data = json.loads(resp.read().decode("utf-8"))
+    assert data["object"] == "list" and data["data"][0]["id"]
+
+
+def test_tool_call_round_trip():
+    """Model proposes a call; the client runs it and sends the result back."""
+    _require_server()
+    question = {"role": "user", "content": "What's the weather in Paris for 2 days?"}
+    data = _post_json({"messages": [question], "tools": [_WEATHER_TOOL],
+                       "tool_choice": "required"})
+    choice = data["choices"][0]
+    assert choice["finish_reason"] == "tool_calls"
+    [call] = choice["message"]["tool_calls"][:1]
+    assert call["function"]["name"] == "get_weather"
+    assert json.loads(call["function"]["arguments"])["city"].lower() == "paris"
+
+    follow_up = _post_json({"messages": [
+        question,
+        {"role": "assistant", "content": None, "tool_calls": [call]},
+        {"role": "tool", "tool_call_id": call["id"],
+         "content": json.dumps({"forecast": ["sunny 24C", "rain 18C"]})},
+    ], "tools": [_WEATHER_TOOL]})
+    answer = follow_up["choices"][0]
+    assert answer["finish_reason"] == "stop"
+    assert "sunny" in answer["message"]["content"].lower() \
+        or "24" in answer["message"]["content"]
+
+
 if __name__ == "__main__":
     _names = sorted(n for n in dir() if n.startswith("test_"))
     _passed = _skipped = 0

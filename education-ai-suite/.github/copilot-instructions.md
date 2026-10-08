@@ -47,9 +47,13 @@ Qwen3-VL-8B-Instruct (OpenVINO)
 ```
 
 **Key Points:**
-- VLM service runs on main backend (port 8000) at `/v1/chat/completions`
+- VLM service runs on main backend (port 8000) at `/v1/chat/completions` (OpenAI-compatible, incl. tool calls)
 - Content Search retrieves relevant chunks, then calls VLM to generate grounded answers
 - VLM model loads on first startup (takes 2-3 minutes)
+- Model selection in `smart-classroom/config.yaml` under `models.text_gen` (`vlm_name`, `weight_format`)
+- `models.text_gen.serving.mode`: `inprocess` (default) | `managed` | `external`; the model can also run
+  alone via `python -m model_serving` (package `smart-classroom/model_serving/`), see
+  `smart-classroom/docs/user-guide/model-serving.md`
 - Configuration in `smart-classroom/config.yaml` under `content_search.vlm`
 - **Multiple client types**: Flutter app (GUI), PowerShell scripts (automation/testing), React web UI
 

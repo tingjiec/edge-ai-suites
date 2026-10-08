@@ -85,6 +85,11 @@ def _kv_geometry(model_dir: Path):
     cfg = json.loads((model_dir / "config.json").read_text(encoding="utf-8"))
     cfg = cfg.get("text_config", cfg)  # VLMs nest the language model's config
     layers = int(cfg["num_hidden_layers"])
+    # Hybrid models (Qwen3.5+) keep a KV cache only on their full-attention
+    # layers; the linear-attention ones hold a fixed-size state instead.
+    layer_types = cfg.get("layer_types")
+    if isinstance(layer_types, list) and "full_attention" in layer_types:
+        layers = layer_types.count("full_attention")
     heads = int(cfg["num_attention_heads"])
     kv_heads = int(cfg.get("num_key_value_heads") or heads)  # no GQA: one per head
     head_dim = int(cfg.get("head_dim") or int(cfg["hidden_size"]) // heads)
