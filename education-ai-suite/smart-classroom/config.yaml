@@ -77,7 +77,7 @@ models:
     provider: vlm
     # Qwen/Qwen3-VL-8B-Instruct (default) | Qwen/Qwen3.6-35B-A3B | Qwen/Qwen3.8-27B (needs OpenVINO >= 2026.4)
     # IR is read from models/openvino/<name>/<weight_format>, downloaded/exported on first use.
-    vlm_name: Qwen/Qwen3-VL-8B-Instruct
+    vlm_name: Qwen/Qwen3.8-27B
     device: GPU # GPU or CPU
     weight_format: int4 # int4,int 8-- shared with content_search.vlm.weight_format
     max_new_tokens: 5120
